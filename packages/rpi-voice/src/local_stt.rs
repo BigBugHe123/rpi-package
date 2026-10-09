@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig};
 
 const SUBDIR: &str = "sense-voice";
 const MODEL_FILE: &str = "model.int8.onnx";
@@ -199,7 +199,7 @@ pub fn is_ready() -> bool {
 
 /// Loaded SenseVoice recognizer.
 pub struct SenseVoice {
-    inner: SenseVoiceRecognizer,
+    inner: OfflineRecognizer,
 }
 
 impl SenseVoice {
@@ -223,24 +223,34 @@ impl SenseVoice {
             .unwrap_or(2)
             .clamp(1, 8);
 
-        let config = SenseVoiceConfig {
-            model: model.to_string_lossy().into_owned(),
-            tokens: tokens.to_string_lossy().into_owned(),
-            language,
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
+            model: Some(model.to_string_lossy().into_owned()),
+            language: Some(language),
             use_itn: true,
-            provider: None,
-            num_threads: Some(num_threads),
-            debug: false,
         };
+        config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
+        config.model_config.provider = Some("cpu".to_owned());
+        config.model_config.num_threads = num_threads;
 
-        let inner =
-            SenseVoiceRecognizer::new(config).map_err(|e| format!("load SenseVoice: {e}"))?;
+        let inner = OfflineRecognizer::create(&config).ok_or_else(|| {
+            format!(
+                "load SenseVoice failed (model: {}, tokens: {})",
+                model.display(),
+                tokens.display()
+            )
+        })?;
         Ok(Self { inner })
     }
 
     /// Transcribe 16kHz mono f32 samples.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String, String> {
-        let result = self.inner.transcribe(16_000, samples);
+        let stream = self.inner.create_stream();
+        stream.accept_waveform(16_000, samples);
+        self.inner.decode(&stream);
+        let result = stream
+            .get_result()
+            .ok_or("SenseVoice returned no recognition result")?;
         Ok(strip_tags(result.text.trim()))
     }
 }

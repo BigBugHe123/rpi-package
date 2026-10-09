@@ -126,7 +126,7 @@ Select another backend with `RPI_STT_ENGINE`:
 #### Embedded offline model — SenseVoice (recommended)
 
 The default build includes the embedded engine and runs entirely on-device via
-[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) + **SenseVoice** (中文/英/日/韩/粤,
+[the official sherpa-onnx Rust bindings](https://crates.io/crates/sherpa-onnx) + **SenseVoice** (中文/英/日/韩/粤,
 auto language detection, punctuation). No key, no server, no network, no runtime
 DLL (the native libs are linked statically).
 
@@ -139,26 +139,13 @@ if set) and are downloaded automatically on first use — or up front with
 cargo build -p rpi-voice --release --features local-stt
 ```
 
-Building needs a C++ toolchain with **cmake** and **libclang** (bindgen) — build-time
-only, nothing at runtime. Cheapest way to get libclang without installing full LLVM:
-
-```bash
-pip install libclang
-# then point LIBCLANG_PATH at clang/native in site-packages
-```
-
-The `sherpa-rs` cdylib also needs the Windows system lib at link time:
-
-```bash
-# Windows
-export LIBCLANG_PATH="$(python -c 'import clang,os;print(os.path.dirname(clang.__file__))')/native"
-export RUSTFLAGS="-C link-arg=advapi32.lib"
-cargo build -p rpi-voice --release --features local-stt
-
-# Linux (static sherpa also needs this)
-export RUSTFLAGS="-C relocation-model=dynamic-no-pic"
-cargo build -p rpi-voice --release --features local-stt
-```
+The `sherpa-onnx` crate and its `sherpa-onnx-sys` dependency are maintained in
+the upstream repository. Building requires Rust 1.88 or later with the current
+locked dependencies. The static build downloads matching native libraries
+automatically. The project no longer uses the deprecated `sherpa-rs` wrapper;
+its old libclang/bindgen setup is unnecessary for this prebuilt-library path.
+For custom native libraries, set `SHERPA_ONNX_LIB_DIR` to their directory;
+see the [official linking instructions](https://k2-fsa.github.io/sherpa/onnx/rust-api/advanced-install.html).
 
 `RPI_STT_MODEL_DIR` overrides the model directory (must contain `model.int8.onnx`
 and `tokens.txt`).

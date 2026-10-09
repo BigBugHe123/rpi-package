@@ -1,8 +1,8 @@
 [package]
 name = "rpi-voice"
-version = "0.3.7"
+version = "0.3.8"
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -15,7 +15,7 @@ categories = ["development-tools"]
 # Embedded offline STT is enabled by default. The model is downloaded on first
 # use into ~/.rpi/agent/models/sense-voice (or RPI_STT_MODEL_DIR).
 default = ["local-stt"]
-local-stt = ["dep:sherpa-rs"]
+local-stt = ["dep:sherpa-onnx"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -37,7 +37,7 @@ unicode-width = "0.2"
 
 # Embedded offline STT (optional): sherpa-onnx, statically linked, prebuilt
 # binaries auto-downloaded at build time.
-sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "static"], optional = true }
+sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"], optional = true }
 
 # Audio I/O
 cpal = "0.15"
