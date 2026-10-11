@@ -27,6 +27,7 @@
 
 // `pub` so the standalone `rpi-acp` binary (`src/main.rs`) can run the same ACP
 // server the extension embeds.
+pub mod diag;
 pub mod protocol;
 pub mod session;
 pub mod zed;
@@ -42,6 +43,10 @@ use std::thread;
 
 /// The CLI flag that turns an ordinary `rpi` invocation into an ACP agent.
 const ACP_FLAG: &str = "acp";
+/// One-shot: register rpi in Zed's settings, then exit.
+const INSTALL_ZED_FLAG: &str = "install-zed";
+/// One-shot: print the Zed settings snippet, then exit.
+const PRINT_ZED_FLAG: &str = "print-zed";
 
 // Host callbacks captured during `register`. The `PluginApi` pointer is only
 // valid for that call, so the function pointers + the opaque `user_data` (the
@@ -54,6 +59,10 @@ static HOST_FREE_STRING: OnceLock<FreeStringFn> = OnceLock::new();
 
 /// Set once `--acp` was seen during register.
 static ACP_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Set once `--install-zed` was seen: register and exit instead of serving.
+static INSTALL_ZED: AtomicBool = AtomicBool::new(false);
+/// Set once `--print-zed` was seen: print the snippet and exit.
+static PRINT_ZED: AtomicBool = AtomicBool::new(false);
 /// Guards against starting the server twice (SessionStart can fire on reload).
 static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 static SERVER_STOP: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
@@ -129,9 +138,11 @@ fn flag_is_on(value: Option<&Value>) -> bool {
     }
 }
 
-/// `SessionStart`: bring up the ACP server. Dispatched by the host after it has
-/// loaded extensions and (because of the `ownsStdio` claim) decided to run the
-/// headless lifecycle with stdio left to us.
+/// `SessionStart`: run the one-shot Zed actions, or bring up the ACP server.
+///
+/// Dispatched by the host after it has loaded extensions and (because of the
+/// `ownsStdio` claim) decided to run the headless lifecycle with stdio left to us.
+///
 /// Make Zed able to launch rpi without the user hand-editing `settings.json`.
 ///
 /// Only reached under `--acp`, i.e. when the user has explicitly asked for Zed
@@ -151,7 +162,7 @@ fn ensure_zed_registration() {
             .map(|text| matches!(zed::ensure_registered(&text, &registration), Ok(None)))
             .unwrap_or(true);
         if !registered {
-            eprintln!(
+            diagln!(
                 "[rpi-acp] rpi is not registered in {}. Add this to that file:\n{}",
                 path.display(),
                 registration.snippet()
@@ -162,17 +173,25 @@ fn ensure_zed_registration() {
     match zed::register_file(&path, &registration, false) {
         Ok(zed::Outcome::AlreadyPresent) => {}
         Ok(zed::Outcome::Created) => {
-            eprintln!("[rpi-acp] registered rpi in {}", path.display());
+            diagln!("[rpi-acp] registered rpi in {}", path.display());
         }
         Ok(zed::Outcome::Updated { .. }) => {
-            eprintln!(
+            diagln!(
                 "[rpi-acp] added rpi to {} (backup: settings.json.rpi-bak)",
                 path.display()
             );
         }
         // Never fail an ACP start over this: a user can always edit by hand.
-        Err(error) => eprintln!("[rpi-acp] could not update {}: {error}", path.display()),
+        Err(error) => diagln!("[rpi-acp] could not update {}: {error}", path.display()),
     }
+}
+
+/// Report a one-shot action's status to the host, which then exits with it.
+fn finish_with(code: i32) -> i32 {
+    if !lifecycle_action("finish", code) {
+        diagln!("[rpi-acp] failed to finish the host stdio lifecycle");
+    }
+    0
 }
 
 /// Treat unset/empty/`0`/`false` as off, anything else as on.
@@ -186,14 +205,51 @@ fn env_flag(name: &str) -> bool {
 }
 
 extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    if event.tag != EventTag::SessionStart || !ACP_ENABLED.load(Ordering::Acquire) {
+    if event.tag != EventTag::SessionStart {
+        return 0;
+    }
+    // `--install-zed` / `--print-zed` are one-shot: do the work, hand the host a
+    // status code, and let it exit. They take precedence over `--acp`.
+    if INSTALL_ZED.load(Ordering::Acquire) || PRINT_ZED.load(Ordering::Acquire) {
+        let write = INSTALL_ZED.load(Ordering::Acquire);
+        return finish_with(zed::run_default_action(write));
+    }
+    if !ACP_ENABLED.load(Ordering::Acquire) {
         return 0;
     }
     if SERVER_STARTED.swap(true, Ordering::AcqRel) {
         return 0;
     }
 
-    eprintln!("[rpi-acp] ACP stdio server starting");
+    // Take stdin *here*, synchronously, before spawning the server: a terminal
+    // cannot carry ACP, and the host has already parked in its headless
+    // lifecycle by now. Failing later (inside the server thread) would print the
+    // host's "running in headless mode; Ctrl+C to stop" line and look like a
+    // hang; failing here prints one actionable message and exits.
+    let (input, pending) = match protocol::acp_stdin() {
+        Ok(taken) => taken,
+        Err(error) => {
+            diagln!("[rpi-acp] {error}");
+            diagln!(
+                "[rpi-acp] --acp speaks ACP on stdin, so it needs a client (Zed) on the \
+                 other end of a pipe."
+            );
+            diagln!("[rpi-acp] To register rpi in Zed from a terminal, run: rpi --install-zed");
+            return finish_with(2);
+        }
+    };
+
+    diagln!("[rpi-acp] ACP stdio server starting");
+    diagln!(
+        "[rpi-acp] pid {} = {} (cwd {})",
+        std::process::id(),
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "?".into()),
+        std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "?".into()),
+    );
     ensure_zed_registration();
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let _ = SERVER_STOP.set(stop);
@@ -205,15 +261,15 @@ extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_voi
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("[rpi-acp] failed to create tokio runtime: {error}");
+                diagln!("[rpi-acp] failed to create tokio runtime: {error}");
                 lifecycle_action("finish", 2);
                 return;
             }
         };
 
-        let code = runtime.block_on(protocol::run(receiver));
+        let code = runtime.block_on(protocol::run(receiver, input, pending));
         if !lifecycle_action("finish", code) {
-            eprintln!("[rpi-acp] failed to finish the host stdio lifecycle");
+            diagln!("[rpi-acp] failed to finish the host stdio lifecycle");
         }
     });
     *SERVER_THREAD.lock().unwrap() = Some(server);
@@ -225,41 +281,55 @@ rpi_plugin_sdk::export_plugin!(|api| {
     RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
     let _ = HOST_FREE_STRING.set(api.free_string);
 
-    // Document the flag. `--acp` is always readable via `GetCliFlag`
-    // (unknown long flags are retained by the parser), but registering
-    // it puts it in the host's flag list/help.
+    // Document the flags. They are always readable via `GetCliFlag` (unknown
+    // long flags are retained by the parser), but registering them puts them in
+    // the host's flag list/help.
     if let Some(register_flag) = api.register_flag {
         let _ = register_flag(
             StbStringRef::from_str(ACP_FLAG),
             StbStringRef::from_str("Run as an ACP (Agent Client Protocol) stdio agent (for Zed)"),
         );
+        let _ = register_flag(
+            StbStringRef::from_str(INSTALL_ZED_FLAG),
+            StbStringRef::from_str("Register rpi in Zed's settings.json, then exit"),
+        );
+        let _ = register_flag(
+            StbStringRef::from_str(PRINT_ZED_FLAG),
+            StbStringRef::from_str("Print the Zed settings snippet, then exit"),
+        );
     }
 
-    // Decide NOW, during register: the host only learns whether to
-    // defer `read_piped_stdin` from the `ownsStdio` declaration, which
-    // must be in the registry before `build()` returns.
-    if !flag_is_on(get_cli_flag(ACP_FLAG).as_ref()) {
+    // Decide NOW, during register: the host only learns whether to defer
+    // `read_piped_stdin` from the `ownsStdio` declaration, which must be in the
+    // registry before `build()` returns.
+    let acp = flag_is_on(get_cli_flag(ACP_FLAG).as_ref());
+    let install = flag_is_on(get_cli_flag(INSTALL_ZED_FLAG).as_ref());
+    let print = flag_is_on(get_cli_flag(PRINT_ZED_FLAG).as_ref());
+    if !acp && !install && !print {
         return 0;
     }
 
     if !lifecycle_action("status", 0) {
-        eprintln!("[rpi-acp] host must support the StdioLifecycle runtime action");
+        diagln!("[rpi-acp] host must support the StdioLifecycle runtime action");
         return 1;
     }
     let Some(declare) = api.declare else {
-        eprintln!(
+        diagln!(
             "[rpi-acp] this rpi host does not support the `declare` ABI; \
-             cannot claim stdio for --acp (upgrade rpi)"
+             cannot claim stdio (upgrade rpi)"
         );
         return 1;
     };
     let payload = json!({"ownsStdio": true}).to_string();
     if declare(StbStringRef::from_str(&payload)) != 0 {
-        eprintln!("[rpi-acp] host rejected the `ownsStdio` declaration");
+        diagln!("[rpi-acp] host rejected the `ownsStdio` declaration");
         return 1;
     }
 
-    ACP_ENABLED.store(true, Ordering::Release);
+    // The one-shot Zed actions take precedence: they never start the server.
+    INSTALL_ZED.store(install, Ordering::Release);
+    PRINT_ZED.store(print, Ordering::Release);
+    ACP_ENABLED.store(acp && !install && !print, Ordering::Release);
 
     if let Some(register) = api.register_event_handler {
         let rc = register(

@@ -34,12 +34,13 @@ Protocol client) over stdio, backing each ACP session with a child
 `rpi --mode rpc` process. It claims the process stdio via the plugin ABI's
 `ownsStdio` declaration, so see
 [`packages/rpi-acp/README.md`](packages/rpi-acp/README.md) for the host
-requirement and Zed configuration. Starting `rpi --acp` also **registers rpi in
-Zed's `settings.json` automatically** (idempotent, comment-preserving; opt out
-with `RPI_ACP_NO_AUTO_REGISTER_ZED=1`), and the standalone `rpi-acp-bridge`
-binary does the same with `--install-zed`, so no hand-editing is required. That
-binary (`task pack-acp`) also covers clients that launch an ACP agent directly,
-and is what an eventual
+requirement and Zed configuration. **No hand-editing of Zed's `settings.json`
+is needed**: `rpi --install-zed` registers it (`rpi --print-zed` just prints the
+snippet), and starting `rpi --acp` registers it automatically — idempotent,
+comment-preserving; opt out with `RPI_ACP_NO_AUTO_REGISTER_ZED=1`. The same
+crate builds a standalone `rpi-acp-bridge` binary (`task pack-acp`) with the same
+commands, for clients that launch an ACP agent directly, and as the artifact for
+an eventual
 [ACP Registry](https://github.com/agentclientprotocol/registry) entry
 ([`registry/`](registry/README.md)); the bridge owns stdio itself, so it needs
 no host support and works with a stock `rpi`.

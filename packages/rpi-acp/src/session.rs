@@ -16,6 +16,7 @@
 //! We spawn one child per ACP session with `current_dir = session/new.cwd`, so
 //! the agent's tools run in the client's workspace.
 
+use crate::diagln;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,13 @@ impl Session {
         let mut child = command
             .spawn()
             .map_err(|e| format!("spawn `rpi --mode rpc`: {e}"))?;
+        // One line per session: the most common Zed-side failure is this path
+        // pointing at a binary that no longer exists (e.g. a cleaned target dir).
+        diagln!(
+            "[rpi-acp] session {id}: child pid {} = {} --mode rpc",
+            child.id().unwrap_or(0),
+            executable.display()
+        );
 
         let stdin = child.stdin.take().ok_or("child stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("child stdout unavailable")?;
@@ -93,7 +101,7 @@ impl Session {
                     Ok(value) => {
                         let _ = tx.send(value);
                     }
-                    Err(error) => eprintln!("[rpi-acp] child produced invalid json: {error}"),
+                    Err(error) => diagln!("[rpi-acp] child produced invalid json: {error}"),
                 }
             }
             // Terminal marker so a pending prompt can finish if the child dies.
@@ -105,7 +113,7 @@ impl Session {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("[rpi-acp:{session}] {line}");
+                    diagln!("[rpi-acp:{session}] {line}");
                 }
             });
         }
@@ -254,7 +262,7 @@ impl Session {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("[rpi-acp] dropped {skipped} child events (reader lagged)");
+                    diagln!("[rpi-acp] dropped {skipped} child events (reader lagged)");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break 'prompt "end_turn",

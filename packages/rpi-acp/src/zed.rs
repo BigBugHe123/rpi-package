@@ -346,6 +346,50 @@ fn skip_value(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// One-line description of an [`Outcome`], for the CLI frontends. `dry_run`
+/// switches to the conditional verbs, because nothing was written.
+pub fn describe(outcome: &Outcome, path: &Path, dry_run: bool) -> String {
+    let display = path.display();
+    match outcome {
+        Outcome::AlreadyPresent => format!("already registered in {display}"),
+        Outcome::Created if dry_run => format!("would create {display} with agent_servers.rpi"),
+        Outcome::Created => format!("created {display} with agent_servers.rpi"),
+        Outcome::Updated { .. } if dry_run => format!("would add rpi to {display}"),
+        Outcome::Updated { .. } => format!("added rpi to {display}"),
+    }
+}
+
+/// Back `rpi --install-zed` (`write`) and `rpi --print-zed` (`!write`).
+///
+/// Returns the process exit code the frontend should report.
+pub fn run_default_action(write: bool) -> i32 {
+    let Some(path) = settings_path() else {
+        eprintln!("error: cannot locate Zed's settings.json (set ZED_SETTINGS)");
+        return 1;
+    };
+    let registration = Registration::detect();
+    if !write {
+        println!("{}", registration.snippet());
+        return 0;
+    }
+    match register_file(&path, &registration, false) {
+        Ok(outcome) => {
+            println!("{}", describe(&outcome, &path, false));
+            if let Outcome::Updated {
+                backup: Some(backup),
+            } = &outcome
+            {
+                println!("backup: {}", backup.display());
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
 /// Ensure the file at `path` registers rpi; create it if missing.
 ///
 /// Writes atomically (temp + rename) and keeps the pre-change file as
@@ -583,6 +627,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explicit, PathBuf::from("/tmp/z.json"));
+    }
+
+    #[test]
+    fn describe_names_each_outcome() {
+        let path = Path::new("/tmp/settings.json");
+        assert!(describe(&Outcome::AlreadyPresent, path, false).starts_with("already registered"));
+        assert!(describe(&Outcome::Created, path, false).starts_with("created"));
+        assert!(describe(&Outcome::Created, path, true).starts_with("would create"));
+        assert!(describe(&Outcome::Updated { backup: None }, path, false).starts_with("added rpi"));
+        assert!(describe(&Outcome::Updated { backup: None }, path, true).starts_with("would add"));
     }
 
     #[test]

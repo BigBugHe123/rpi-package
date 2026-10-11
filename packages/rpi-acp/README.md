@@ -52,6 +52,11 @@ interactive `rpi` session.
 * A configured rpi provider/model. The ACP host process resolves the default
   model at startup (like `rpi --server`); a missing credential is reported on
   stderr and the process exits before the ACP server starts.
+* An ACP client on stdin. `--acp` speaks ACP over stdin, so it must be launched
+  by a client (Zed) through a pipe. Started from a terminal it fails fast — one
+  message plus exit code 2 — instead of leaving the host parked in its headless
+  lifecycle with a dead server. To register rpi from a terminal, use
+  `rpi --install-zed`.
 
 ## Install
 
@@ -119,19 +124,25 @@ Point Zed straight at the binary if you would rather not load the extension:
 ### Registering with Zed
 
 Zed learns about external agents from the `agent_servers` key in its
-`settings.json`. You do not have to edit that by hand:
+`settings.json`. You never have to edit that by hand:
 
-```bash
-rpi-acp-bridge --install-zed     # add agent_servers.rpi
-rpi-acp-bridge --print-zed       # print the snippet instead of writing it
-```
+| Command | Registers |
+| --- | --- |
+| `rpi --install-zed` | `rpi --acp` — the extension form, no extra binary needed |
+| `rpi-acp-bridge --install-zed` | the standalone bridge |
+| `rpi --print-zed` / `rpi-acp-bridge --print-zed` | nothing — prints the snippet |
 
-`--install-zed` is idempotent, writes atomically, keeps a `settings.json.rpi-bak`
-copy the first time it changes the file, and **preserves the file's comments and
-formatting**: Zed's `settings.json` is JSONC (it allows `//` comments and
-trailing commas), so the merge splices in one member rather than reparsing and
-re-emitting the document. `--settings <FILE>`, `--command <FILE>` and
-`--dry-run` are also accepted.
+Both frontends share one implementation, and it is idempotent, writes
+atomically, keeps a `settings.json.rpi-bak` copy the first time it changes the
+file, and **preserves the file's comments and formatting**: Zed's
+`settings.json` is JSONC (it allows `//` comments and trailing commas), so the
+merge splices in one member rather than reparsing and re-emitting the document.
+
+`rpi --install-zed` is a one-shot: the extension claims the process stdio like
+`--acp` does, performs the merge, and reports the result through the
+`StdioLifecycle` action so the host exits with `0` (registered) or `1` (could
+not write). The bridge additionally accepts `--settings <FILE>`,
+`--command <FILE>` and `--dry-run`.
 
 Running **`rpi --acp` does this automatically**: the extension calls the same
 merge at startup, because `--acp` is exactly the signal that the user wants Zed
@@ -182,8 +193,37 @@ It prints the sha256 and a ready-to-paste `distribution.binary` stanza; see
   `available_commands_update`: `--mode rpc` does not expand prompt templates
   (only the host TUI does), so a client-side command list would be misleading.
 
-## Manual smoke test
+## Diagnosing a failed connection
 
+Everything the server says goes to **stderr**, and Zed forwards agent stderr into
+its own log (`agent stderr:` lines in `%LOCALAPPDATA%\Zed\logs\Zed.log`). So
+a client-side "incoming transport closed" always has a matching line:
+
+```
+[rpi-acp] server stopping (stdin closed (client hung up), exit 0)
+```
+
+that line names the cause: stdin EOF, a read error, or a host shutdown. One more
+line per session records the child that session spawned — the usual breakage is
+that path naming a deleted binary (a cleaned `target/`):
+
+```
+[rpi-acp] session rpi-1234-1: child pid 4242 = C:\...\rpi.exe --mode rpc
+```
+
+Set `RPI_ACP_DEBUG=1` to also trace the request stream, which shows exactly how
+far a client got before giving up:
+
+```
+[rpi-acp] <- initialize 0
+[rpi-acp] <- session/new 1
+```
+
+On Windows the variable must be set for Zed's own environment (`setx
+RPI_ACP_DEBUG 1`, then restart Zed); setting it in a terminal only affects runs
+started from that terminal.
+
+## Manual smoke test
 ```powershell
 $ext = "target\debug"   # dir containing rpi_acp.dll / librpi_acp.so
 '{ "jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}} }' |

@@ -14,6 +14,7 @@
 //! editor's. That keeps the surface small and the behavior identical to the
 //! terminal agent.
 
+use crate::diagln;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -26,6 +27,28 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::session::Session;
+
+/// The pollable stdin reader, re-exported so the frontends can build one.
+pub use rpi_plugin_sdk::stdio::StdinLines;
+
+/// Take stdin for ACP, failing when it cannot carry a protocol.
+///
+/// A terminal cannot be an ACP channel — Zed (or any other client) spawns us with
+/// a pipe. Checking once, before the server starts, turns a first-read failure
+/// into an actionable error.
+///
+/// A successful probe may already have read a line (a client is free to send
+/// `initialize` immediately), so it is returned alongside the reader and must be
+/// passed on to [`run`] — dropping it would lose the first message.
+pub fn acp_stdin() -> Result<(StdinLines, Option<String>), String> {
+    let mut input = StdinLines::default();
+    let pending = match input.poll_line() {
+        Ok(rpi_plugin_sdk::stdio::InputLine::Line(line)) => Some(line),
+        Ok(_) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok((input, pending))
+}
 
 /// ACP protocol major version we speak. Stable v1.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -213,18 +236,28 @@ pub fn initialize_result() -> Value {
 ///
 /// The owner reports the returned code to the host's stdio lifecycle. The
 /// stop receiver also lets SessionShutdown end an idle server without input.
-pub async fn run(mut stop: watch::Receiver<bool>) -> i32 {
+pub async fn run(
+    mut stop: watch::Receiver<bool>,
+    mut input: StdinLines,
+    mut pending: Option<String>,
+) -> i32 {
     let writer = Arc::new(Writer::new());
     let sessions: Arc<Mutex<HashMap<String, Arc<Session>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut next_session: u64 = 0;
 
-    let mut input = rpi_plugin_sdk::stdio::StdinLines::default();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut exit_code = 0;
+    // Why the loop ended, reported once at the bottom. Zed forwards agent stderr
+    // into its own log, so this is what turns "transport closed" into a cause.
+    let mut reason = "stdin closed (client hung up)";
     'input: loop {
         let line = loop {
+            if let Some(line) = pending.take() {
+                break line;
+            }
             if *stop.borrow() {
+                reason = "stopped by the host (session shutdown)";
                 break 'input;
             }
             match input.poll_line() {
@@ -233,12 +266,16 @@ pub async fn run(mut stop: watch::Receiver<bool>) -> i32 {
                 Ok(rpi_plugin_sdk::stdio::InputLine::Pending) => {
                     tokio::select! {
                         biased;
-                        _ = stop.changed() => break 'input,
+                        _ = stop.changed() => {
+                            reason = "stopped by the host (session shutdown)";
+                            break 'input;
+                        }
                         _ = tick.tick() => {},
                     }
                 }
                 Err(error) => {
-                    eprintln!("[rpi-acp] stdin read error: {error}");
+                    diagln!("[rpi-acp] stdin read error: {error}");
+                    reason = "stdin read error";
                     exit_code = 2;
                     break 'input;
                 }
@@ -251,7 +288,7 @@ pub async fn run(mut stop: watch::Receiver<bool>) -> i32 {
         let message: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("[rpi-acp] invalid json from client: {error}");
+                diagln!("[rpi-acp] invalid json from client: {error}");
                 continue;
             }
         };
@@ -261,6 +298,21 @@ pub async fn run(mut stop: watch::Receiver<bool>) -> i32 {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let id = message.get("id").cloned();
+
+        // `RPI_ACP_DEBUG=1` traces the method stream. It costs a line per
+        // request, which is how we find out where a client gave up.
+        if crate::diag::debug_enabled() {
+            match &id {
+                Some(id) => diagln!(
+                    "[rpi-acp] <- {} {id}",
+                    method.as_deref().unwrap_or("(response)")
+                ),
+                None => diagln!(
+                    "[rpi-acp] <- {} (notification)",
+                    method.as_deref().unwrap_or("?")
+                ),
+            }
+        }
 
         match (id, method.as_deref()) {
             (Some(id), Some("initialize")) => writer.respond(&id, initialize_result()).await,
@@ -352,6 +404,9 @@ pub async fn run(mut stop: watch::Receiver<bool>) -> i32 {
     for (_, session) in sessions.lock().await.drain() {
         session.kill().await;
     }
+    // One line, always: with Zed this lands in its log as `agent stderr`, and it
+    // is what a client's "transport closed" actually corresponds to.
+    diagln!("[rpi-acp] server stopping ({reason}, exit {exit_code})");
     exit_code
 }
 

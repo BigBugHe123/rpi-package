@@ -25,6 +25,8 @@
 //! { "agent_servers": { "rpi": { "type": "custom", "command": "rpi-acp-bridge", "args": [] } } }
 //! ```
 
+use rpi_acp::diagln;
+
 const USAGE: &str = "\
 rpi-acp-bridge - ACP stdio agent for rpi
 
@@ -117,20 +119,13 @@ fn install_zed(rest: &[String]) -> i32 {
     }
 
     match rpi_acp::zed::register_file(&path, &registration, dry_run) {
-        Ok(rpi_acp::zed::Outcome::AlreadyPresent) => {
-            println!("already registered in {}", path.display());
-            0
-        }
-        Ok(rpi_acp::zed::Outcome::Created) => {
-            let verb = if dry_run { "would create" } else { "created" };
-            println!("{verb} {} with agent_servers.rpi", path.display());
-            0
-        }
-        Ok(rpi_acp::zed::Outcome::Updated { backup }) => {
-            let verb = if dry_run { "would add" } else { "added" };
-            println!("{verb} rpi to {}", path.display());
+        Ok(outcome) => {
+            println!("{}", rpi_acp::zed::describe(&outcome, &path, dry_run));
             if !dry_run {
-                if let Some(backup) = backup {
+                if let rpi_acp::zed::Outcome::Updated {
+                    backup: Some(backup),
+                } = &outcome
+                {
                     println!("backup: {}", backup.display());
                 }
             }
@@ -141,11 +136,25 @@ fn install_zed(rest: &[String]) -> i32 {
 }
 
 fn fail(message: &str) -> i32 {
-    eprintln!("error: {message}");
+    diagln!("error: {message}");
     1
 }
 
 fn serve() {
+    // Fail fast when there is no ACP client on stdin, with a hint instead of the
+    // bare OS error: running the bridge from a terminal is a common mistake.
+    let (input, pending) = match rpi_acp::protocol::acp_stdin() {
+        Ok(taken) => taken,
+        Err(error) => {
+            diagln!("error: {error}");
+            diagln!(
+                "hint: the bridge speaks ACP on stdin, so it must be started by an ACP \
+                 client (Zed). To register it in Zed, run: rpi-acp-bridge --install-zed"
+            );
+            std::process::exit(2);
+        }
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
@@ -153,7 +162,7 @@ fn serve() {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("[rpi-acp] failed to create tokio runtime: {error}");
+            diagln!("[rpi-acp] failed to create tokio runtime: {error}");
             std::process::exit(2);
         }
     };
@@ -162,5 +171,5 @@ fn serve() {
     // The standalone bridge has no host to signal shutdown, so keep the sender
     // alive: EOF on stdin is the only stop condition.
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    std::process::exit(runtime.block_on(rpi_acp::protocol::run(stop_rx)));
+    std::process::exit(runtime.block_on(rpi_acp::protocol::run(stop_rx, input, pending)));
 }
