@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 description = "Agent Client Protocol (ACP) stdio server extension for rpi — use rpi as an external agent in Zed"
 readme = "README.md"
-keywords = ["rpi", "acp", "agent-client-protocol", "zed", "stdio"]
+keywords = ["rpi", "acp", "agent-protocol", "zed", "stdio"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
