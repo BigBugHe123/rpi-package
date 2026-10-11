@@ -4,7 +4,7 @@
 //! 2.0 with one message per line on stdin/stdout:
 //!
 //! * client → agent requests we implement: `initialize`, `session/new`,
-//!   `session/prompt`; notification `session/cancel`.
+//!   `session/prompt`, `session/load`, `session/resume`; notification `session/cancel`.
 //! * agent → client: `session/update` notifications (streamed text, thinking,
 //!   tool calls) and one JSON-RPC response per request.
 //!
@@ -212,8 +212,8 @@ pub fn initialize_result() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            // We cannot replay rpi session history as ACP updates yet.
-            "loadSession": false,
+            "loadSession": true,
+            "sessionCapabilities": {"resume": {}},
             "promptCapabilities": {
                 // `--mode rpc` takes a single text prompt; no multimodal input.
                 "image": false,
@@ -243,7 +243,6 @@ pub async fn run(
 ) -> i32 {
     let writer = Arc::new(Writer::new());
     let sessions: Arc<Mutex<HashMap<String, Arc<Session>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut next_session: u64 = 0;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -324,10 +323,9 @@ pub async fn run(
                     .and_then(Value::as_str)
                     .unwrap_or(".")
                     .to_string();
-                next_session += 1;
-                let session_id = format!("rpi-{}-{}", std::process::id(), next_session);
-                match Session::spawn(session_id.clone(), PathBuf::from(&cwd)) {
-                    Ok(session) => {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                match open_session(&session_id, PathBuf::from(&cwd), None).await {
+                    Ok((session, _)) => {
                         sessions.lock().await.insert(session_id.clone(), session);
                         writer.respond(&id, json!({"sessionId": session_id})).await;
                     }
@@ -364,10 +362,57 @@ pub async fn run(
                     None => writer.respond_error(&id, -32602, "unknown sessionId").await,
                 }
             }
-            (Some(id), Some("session/load")) | (Some(id), Some("session/resume")) => {
-                writer
-                    .respond_error(&id, -32601, "session resumption is not supported")
-                    .await
+            (Some(id), Some(method @ ("session/load" | "session/resume"))) => {
+                let session_id = message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let cwd = message
+                    .pointer("/params/cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".");
+                let existing = sessions.lock().await.get(session_id).cloned();
+                let opened = if let Some(session) = existing {
+                    session.state().await.map(|state| (session, state))
+                } else {
+                    match crate::history::saved_session(session_id) {
+                        Ok(path) => open_session(session_id, PathBuf::from(cwd), Some(&path)).await,
+                        Err(error) => Err(error),
+                    }
+                };
+                match opened {
+                    Ok((session, state)) => {
+                        let updates = if method == "session/load" {
+                            crate::history::saved_session(session_id).and_then(|path| {
+                                crate::history::replay(&path, state["leafId"].as_str())
+                            })
+                        } else {
+                            Ok(Vec::new())
+                        };
+                        match updates {
+                            Ok(updates) => {
+                                sessions.lock().await.insert(session_id.to_owned(), session);
+                                for update in updates {
+                                    writer
+                                        .notify(
+                                            "session/update",
+                                            json!({"sessionId":session_id,"update":update}),
+                                        )
+                                        .await;
+                                }
+                                writer.respond(&id, json!({})).await;
+                            }
+                            Err(error) => {
+                                // Keep an already attached backend alive on a replay error.
+                                if !sessions.lock().await.contains_key(session_id) {
+                                    session.kill().await;
+                                }
+                                writer.respond_error(&id, -32000, &error).await;
+                            }
+                        }
+                    }
+                    Err(error) => writer.respond_error(&id, -32000, &error).await,
+                }
             }
             (Some(id), Some(other)) => {
                 writer
@@ -410,6 +455,26 @@ pub async fn run(
     exit_code
 }
 
+async fn open_session(
+    id: &str,
+    cwd: PathBuf,
+    saved: Option<&std::path::Path>,
+) -> Result<(Arc<Session>, Value), String> {
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return Err("cwd must be an existing absolute directory".into());
+    }
+    let session = Session::spawn(id.to_owned(), cwd, saved)?;
+    match session.state().await {
+        Ok(state) if state["sessionId"] == id => Ok((session, state)),
+        result => {
+            session.kill().await;
+            Err(result
+                .err()
+                .unwrap_or_else(|| "backend opened a different sessionId".into()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,7 +500,11 @@ mod tests {
     fn initialize_advertises_v1_and_embedded_context() {
         let result = initialize_result();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["resume"],
+            json!({})
+        );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
             true

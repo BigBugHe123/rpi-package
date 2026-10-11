@@ -20,7 +20,7 @@ Zed  ──ACP (JSON-RPC over stdio)──▶  rpi --acp  ──spawn──▶  
    extension. This is what makes an ACP stdio server possible inside an `rpi`
    process at all — see *Requirements* below.
 2. **Serves ACP v1** on stdio (`initialize`, `session/new`, `session/prompt`,
-   `session/cancel`). See `src/protocol.rs`.
+   `session/cancel`, `session/load`, `session/resume`). See `src/protocol.rs`.
 3. **Backs each ACP session with a child `rpi --mode rpc` process** rooted at
    the session's `cwd`, translating its event stream into ACP `session/update`
    notifications (streamed text, thinking, tool calls). See `src/session.rs`.
@@ -28,6 +28,19 @@ Zed  ──ACP (JSON-RPC over stdio)──▶  rpi --acp  ──spawn──▶  
 The host process itself runs no model call: every prompt is served by the child,
 so tools, models, auth, skills and extensions behave exactly as in an
 interactive `rpi` session.
+
+### Session persistence
+
+New ACP sessions use stable UUIDs and persist native rpi JSONL history under
+`~/.rpi/agent/acp/sessions`. `RPI_ACP_SESSION_DIR` can override this with an
+absolute directory. The files remain when Zed or the ACP process exits.
+
+`session/load` restores the backend context and replays the active branch's user
+messages, assistant text/thinking, and tool calls/results before responding.
+`session/resume` restores context without replay, for clients that already have
+the transcript. An unknown or missing session returns an error rather than
+silently opening an empty conversation. Sessions created by ACP 0.1.1 and older
+were temporary (`--no-session`) and cannot be restored after their backend exits.
 
 ### Event mapping
 

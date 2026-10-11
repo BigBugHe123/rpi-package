@@ -47,22 +47,26 @@ pub struct Session {
 
 impl Session {
     /// Spawn `rpi --mode rpc` rooted at `cwd`.
-    pub fn spawn(id: String, cwd: PathBuf) -> Result<Arc<Self>, String> {
+    pub fn spawn(id: String, cwd: PathBuf, saved: Option<&Path>) -> Result<Arc<Self>, String> {
         let executable = resolve_rpi_executable();
 
         let mut command = Command::new(&executable);
         command
             .arg("--mode")
             .arg("rpc")
-            // Each ACP session is a fresh in-memory conversation: the child
-            // lives for the whole ACP session, so it keeps history across
-            // prompts without writing a session file (and without racing the
-            // host process's own session on the same cwd).
-            .arg("--no-session")
             .current_dir(&cwd)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let directory = crate::history::session_directory(&id)?;
+        command.arg("--session-dir").arg(&directory);
+        if let Some(path) = saved {
+            // An exact file restore fails if missing rather than creating an empty session.
+            command.arg("--session").arg(path);
+        } else {
+            command.arg("--session-id").arg(&id);
+        }
         // Ask the child to load the (optional) permission-gate extension so the
         // ACP client's approval UI is used for dangerous tools. Harmless when
         // the extension is not installed; `RPI_ACP_NO_PERMISSION_GATE=1` opts
@@ -140,6 +144,38 @@ impl Session {
             .flush()
             .await
             .map_err(|e| format!("flush child stdin: {e}"))
+    }
+
+    /// Wait for backend startup and obtain the authoritative active branch.
+    pub async fn state(&self) -> Result<Value, String> {
+        let _prompt = self
+            .prompt_lock
+            .try_lock()
+            .map_err(|_| "a prompt is already running")?;
+        let mut events = self.events.subscribe();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send(json!({"id": id, "type": "get_state"})).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .map_err(|e| format!("backend disconnected: {e}"))?;
+                if event["type"] == "session_end" {
+                    return Err(
+                        "rpi exited while opening the session; check the agent stderr log".into(),
+                    );
+                }
+                if event["type"] == "response" && event["id"] == id {
+                    if event["status"] != "ok" {
+                        return Err(format!("open session: {}", event["error"]));
+                    }
+                    return Ok(event["result"].clone());
+                }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for rpi session startup".to_string())?
     }
 
     /// Ask the child to abort the current run (`session/cancel`).

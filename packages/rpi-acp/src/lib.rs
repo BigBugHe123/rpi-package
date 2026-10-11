@@ -9,7 +9,7 @@
 //!    its headless `Rpc` lifecycle, leaving this process's stdio to us.
 //! 2. On `SessionStart` it starts the ACP server ([`protocol::run`]) on a
 //!    dedicated thread. The server handles `initialize` / `session/new` /
-//!    `session/prompt` / `session/cancel`.
+//!    `session/prompt` / `session/cancel` / `session/load` / `session/resume`.
 //! 3. Each ACP session is backed by a child `rpi --mode rpc` process rooted at
 //!    the session's `cwd`; its event stream is translated into ACP
 //!    `session/update` notifications (see [`session`]).
@@ -28,6 +28,7 @@
 // `pub` so the standalone `rpi-acp` binary (`src/main.rs`) can run the same ACP
 // server the extension embeds.
 pub mod diag;
+mod history;
 pub mod protocol;
 pub mod session;
 pub mod zed;
