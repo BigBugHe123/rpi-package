@@ -4,6 +4,8 @@
 //! Supports cancellation via a stop flag, and publishes a live loudness level
 //! so the host UI can animate a music-style equalizer while speech plays.
 
+#![deny(unsafe_code)]
+
 use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
@@ -158,6 +160,38 @@ mod tests {
             "meter ignored stop for {:?}",
             start.elapsed()
         );
+        assert_eq!(level.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn scoped_meter_is_joined_on_early_return() {
+        let level = AtomicU32::new(1);
+        let stop = AtomicBool::new(false);
+        let result: Result<(), &str> = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _meter = spawn_level_meter(scope, rx, &level, &stop).unwrap();
+            tx.send((2, 1_000)).unwrap();
+            // Like a decoder error: the sender is dropped and the scope joins
+            // the meter even though normal playback cleanup is skipped.
+            Err("decode failed")
+        });
+        assert_eq!(result, Err("decode failed"));
+        assert_eq!(level.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn scoped_meter_is_joined_on_panic() {
+        let level = AtomicU32::new(1);
+        let stop = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _meter = spawn_level_meter(scope, rx, &level, &stop).unwrap();
+                tx.send((2, 1_000)).unwrap();
+                panic!("decode panicked");
+            });
+        });
+        assert!(result.is_err());
         assert_eq!(level.load(Ordering::Relaxed), 0);
     }
 }
@@ -491,6 +525,15 @@ fn decode_and_play(
     stop: &AtomicBool,
     level: &AtomicU32,
 ) -> Result<bool, String> {
+    std::thread::scope(|scope| decode_and_play_scoped(rx, stop, level, scope))
+}
+
+fn decode_and_play_scoped<'scope, 'env>(
+    rx: Receiver<Vec<u8>>,
+    stop: &'scope AtomicBool,
+    level: &'scope AtomicU32,
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+) -> Result<bool, String> {
     let device = output_device().map_err(|e| format!("Audio output error: {e}"))?;
     // The stream is opened once and kept for the process; only the queue is
     // per-utterance. See [`PlaybackSession`] for why reopening it per sentence
@@ -502,7 +545,7 @@ fn decode_and_play(
     // them is what lets the feed below run flat out — see the module note on
     // `play_mp3_stream` for why that matters.
     let (level_tx, level_rx) = std::sync::mpsc::channel::<(u32, u64)>();
-    let meter = spawn_level_meter(level_rx, level, stop);
+    let meter = spawn_level_meter(scope, level_rx, level, stop);
 
     let source = ChunkSource::new(rx);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
@@ -641,19 +684,17 @@ fn format_next_packet(
 }
 
 /// Start the meter thread, returning its handle when it could be spawned.
-fn spawn_level_meter(
+fn spawn_level_meter<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     rx: Receiver<(u32, u64)>,
-    level: &AtomicU32,
-    stop: &AtomicBool,
-) -> Option<std::thread::JoinHandle<()>> {
-    // SAFETY: both references outlive the utterance — they belong to the
-    // caller's stack frame, which does not return until this thread is joined
-    // (see the `drop(level_tx)`/`join` pair above).
-    let level: &'static AtomicU32 = unsafe { std::mem::transmute(level) };
-    let stop: &'static AtomicBool = unsafe { std::mem::transmute(stop) };
+    level: &'scope AtomicU32,
+    stop: &'scope AtomicBool,
+) -> Option<std::thread::ScopedJoinHandle<'scope, ()>> {
+    // The scope joins the meter on every exit path, including decoder errors
+    // and panics, so borrowed atomics cannot outlive their owners.
     std::thread::Builder::new()
         .name("rpi-voice-meter".to_string())
-        .spawn(move || run_level_meter(rx, level, stop))
+        .spawn_scoped(scope, move || run_level_meter(rx, level, stop))
         .ok()
 }
 

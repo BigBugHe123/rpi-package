@@ -40,7 +40,7 @@ fn installed_monitor_loads_commands_and_events_and_shuts_down_cleanly() {
         .expect("stats command registered");
     for (args, needle) in [
         ("on", "已打开"),
-        ("position bottom-left", "已更新"),
+        ("position bottom-left", "固定显示"),
         ("off", "已关闭"),
     ] {
         let input = json!({"command":"stats","args":args}).to_string();

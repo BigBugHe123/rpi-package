@@ -1,5 +1,6 @@
 //! Nonblocking tool ABI bridge. Workers are cancelled and joined before destroy.
 use crate::control::Control;
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{FreeStringFn, StbString, StepHandle, StepResult, ToolPartialCb};
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -15,6 +16,8 @@ struct State {
     worker: Option<JoinHandle<()>>,
     completed: bool,
 }
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     control: Control,
     state: Mutex<State>,
@@ -43,21 +46,26 @@ pub fn execute(
         .unwrap_or_else(|_| Err("MCP worker panicked".into()));
         let _ = sender.send(result);
     });
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         control,
         state: Mutex::new(State {
             receiver,
             worker: Some(worker),
             completed: false,
         }),
-    })) as StepHandle
+    })
 }
 
-pub unsafe fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
+pub fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null MCP tool handle".into()));
     }
-    let drive = unsafe { &*(handle as *const Drive) };
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let drive = entry.lock();
     let mut state = match drive.state.lock() {
         Ok(state) => state,
         Err(_) => return StepResult::err(StbString::from_string("MCP tool state poisoned".into())),
@@ -84,14 +92,15 @@ pub unsafe fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         }
     }
 }
-pub unsafe fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe { &*(handle as *const Drive) }.control.cancel();
+pub fn cancel(handle: StepHandle) {
+    if let Some(entry) = HANDLES.get(handle) {
+        entry.cancel();
+        entry.lock().control.cancel();
     }
 }
-pub unsafe fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        let drive = unsafe { Box::from_raw(handle as *mut Drive) };
+pub fn destroy(handle: StepHandle) {
+    if let Some(entry) = HANDLES.remove(handle) {
+        let drive = entry.lock();
         drive.control.cancel();
         if let Ok(mut state) = drive.state.lock() {
             if let Some(worker) = state.worker.take() {
@@ -110,13 +119,7 @@ pub fn schema(name: &str, description: &str, parameters: &str) -> rpi_plugin_sdk
         parameters: StbString::from_string(parameters.into()),
     }
 }
-pub extern "C" fn plugin_free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(s.ptr as *mut u8, s.len));
-        }
-    }
-}
+pub use rpi_plugin_sdk::callbacks::free_string as plugin_free_string;
 pub fn string_param(params: &Value, name: &str) -> Result<String, String> {
     params
         .get(name)
@@ -143,25 +146,24 @@ mod tests {
             wait,
         );
         let start = Instant::now();
-        let result = unsafe { poll(handle, None, std::ptr::null_mut()) };
+        let result = poll(handle, None, std::ptr::null_mut());
         assert_eq!(result.tag, rpi_plugin_sdk::StepResultTag::Pending);
         assert!(start.elapsed() < Duration::from_millis(100));
-        unsafe {
-            cancel(handle);
-        }
+        cancel(handle);
         loop {
-            let result = unsafe { poll(handle, None, std::ptr::null_mut()) };
+            let result = poll(handle, None, std::ptr::null_mut());
             if result.tag == rpi_plugin_sdk::StepResultTag::Err {
-                let error = unsafe { result.err_payload().message };
-                assert!(error.to_string_lossy().contains("cancelled"));
-                plugin_free_string(error);
+                let rpi_plugin_sdk::callbacks::Step::Err(error) =
+                    rpi_plugin_sdk::take_step_result!(result)
+                else {
+                    unreachable!()
+                };
+                assert!(error.contains("cancelled"));
                 break;
             }
             assert!(start.elapsed() < Duration::from_secs(2));
             std::thread::sleep(Duration::from_millis(5));
         }
-        unsafe {
-            destroy(handle);
-        }
+        destroy(handle);
     }
 }

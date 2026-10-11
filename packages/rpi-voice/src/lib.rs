@@ -113,21 +113,21 @@
 //! - `RPI_VOICE_INPUT_GAIN`    Software input gain for a very quiet mic
 //!   (default 1.0 = off, capped at 100)
 
+#![forbid(unsafe_code)]
+
 mod edge_tts;
 #[cfg(feature = "local-stt")]
 mod local_stt;
-mod player;
 mod pet;
+mod player;
 mod recorder;
 mod spoken_style;
 mod whisper;
 
-use rpi_plugin_sdk::{
-    register_entrypoint, EventTag, FreeStringFn, PluginApi, RuntimeActionFn, RuntimeActionId,
-    StablePluginEvent, StbString, StbStringRef,
-};
+#[cfg(test)]
+use rpi_plugin_sdk::StablePluginEvent;
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
 use serde_json::{json, Value};
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
@@ -135,17 +135,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 // Runtime context (captured at registration, used by event/command handlers)
 // ---------------------------------------------------------------------------
 
+// Reuse the SDK's host-context lifetime and thread-safety contract.
 #[derive(Clone, Copy)]
 struct RuntimeContext {
-    runtime_action: RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
+    api: PluginApi,
 }
-
-// SAFETY: user_data is valid for the session lifetime; the fn pointers have no
-// thread affinity. The host may call handlers from any thread.
-unsafe impl Send for RuntimeContext {}
-unsafe impl Sync for RuntimeContext {}
 
 static RUNTIME_CTX: OnceLock<RuntimeContext> = OnceLock::new();
 
@@ -154,14 +148,14 @@ impl RuntimeContext {
     fn action(&self, id: RuntimeActionId, args: Value) -> Result<String, String> {
         let args_json = args.to_string();
         let mut output = StbString::empty();
-        let rc = (self.runtime_action)(
+        let rc = (self.api.runtime_action)(
             id as u32,
             StbStringRef::from_str(&args_json),
             &mut output,
-            self.user_data,
+            self.api.user_data,
         );
         let out_text = output.to_string_lossy();
-        (self.free_string)(output);
+        (self.api.free_string)(output);
         if rc != 0 {
             return Err(out_text);
         }
@@ -789,8 +783,9 @@ fn flush_text_delta_buffer() {
     }
 }
 
-extern "C" fn on_message_start(event: StablePluginEvent, _user_data: *mut c_void) -> i32 {
-    let payload = unsafe { event.payload.message.message.to_string_lossy() };
+rpi_plugin_sdk::event_handler! {
+fn on_message_start(event, _user_data) {
+    let payload = event.message_text().unwrap_or_default();
     let is_assistant = serde_json::from_str::<Value>(&payload)
         .ok()
         .and_then(|message| {
@@ -810,6 +805,7 @@ extern "C" fn on_message_start(event: StablePluginEvent, _user_data: *mut c_void
         stream_mark("message_start (assistant)");
     }
     0
+}
 }
 
 /// Keep the accepted snapshot at its high-water mark. A transient rollback or
@@ -845,12 +841,13 @@ fn stream_event_from_payload(message_update: &Value) -> Option<&Value> {
         })
 }
 
-extern "C" fn on_message_update(event: StablePluginEvent, _user_data: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_message_update(event, _user_data) {
     if !AUTO_TTS_ENABLED.load(Ordering::Relaxed) {
         return 0;
     }
 
-    let payload = unsafe { event.payload.message.message.to_string_lossy() };
+    let payload = event.message_text().unwrap_or_default();
     let Ok(message_update) = serde_json::from_str::<Value>(&payload) else {
         debug_log(&format!("message_update: invalid JSON payload: {payload}"));
         return 0;
@@ -902,10 +899,12 @@ extern "C" fn on_message_update(event: StablePluginEvent, _user_data: *mut c_voi
     }
     0
 }
+}
 
-extern "C" fn on_message_end(event: StablePluginEvent, _user_data: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_message_end(event, _user_data) {
     if pet::enabled() {
-        let payload = unsafe { event.payload.message.message.to_string_lossy() };
+        let payload = event.message_text().unwrap_or_default();
         if let Ok(message) = serde_json::from_str::<Value>(&payload) {
             pet::message_end(&message);
         }
@@ -939,7 +938,7 @@ extern "C" fn on_message_end(event: StablePluginEvent, _user_data: *mut c_void) 
 
     // Compatibility fallback for hosts/providers that expose only the final
     // assistant message and no text_delta updates.
-    let payload = unsafe { event.payload.message.message.to_string_lossy() };
+    let payload = event.message_text().unwrap_or_default();
     let Ok(message) = serde_json::from_str::<Value>(&payload) else {
         return 0;
     };
@@ -955,11 +954,13 @@ extern "C" fn on_message_end(event: StablePluginEvent, _user_data: *mut c_void) 
     *STREAM_STARTED_AT.lock().unwrap() = None;
     0
 }
+}
 
 // ---------------------------------------------------------------------------
 // Push-to-talk: Input event handler
 // ---------------------------------------------------------------------------
 
+rpi_plugin_sdk::event_handler! {
 /// Handle a key event routed by the host. Only fires for keys this extension
 /// declared via `register_shortcut`, and only while the input box is empty.
 ///
@@ -977,17 +978,19 @@ extern "C" fn on_message_end(event: StablePluginEvent, _user_data: *mut c_void) 
 ///
 /// Recording runs on its own thread: the host calls this on the TUI key thread,
 /// which must return promptly to stay responsive.
-extern "C" fn on_input_key(event: StablePluginEvent, _user_data: *mut c_void) -> i32 {
+fn on_input_key(event, _user_data) {
     const CONTINUE: i32 = rpi_plugin_sdk::EVENT_HANDLER_CONTINUE;
 
     if !PTT_ENABLED.load(Ordering::Relaxed) && !AUTO_MODE_ENABLED.load(Ordering::Relaxed) {
         return CONTINUE;
     }
     // Payload lives in the `data` union arm for Input events.
-    let raw = unsafe { event.payload.data.data.to_string_lossy() };
+    let raw = event.data_text().unwrap_or_default();
     handle_ptt_key(&raw, &ptt_key())
 }
+}
 
+rpi_plugin_sdk::event_handler! {
 /// The user is composing ⇒ stop reading the previous answer aloud (barge-in);
 /// in hands-free mode, stand down entirely — they have taken the keyboard, so
 /// the mic must stop opening on its own.
@@ -996,9 +999,10 @@ extern "C" fn on_input_key(event: StablePluginEvent, _user_data: *mut c_void) ->
 /// injected transcription, or the host clearing the draft after auto-sending
 /// it) is deliberately *not* treated as the user taking over — otherwise the
 /// hands-free loop would cancel itself on every single turn.
-extern "C" fn on_editor_change(event: StablePluginEvent, _user_data: *mut c_void) -> i32 {
-    let raw = unsafe { event.payload.data.data.to_string_lossy() };
+fn on_editor_change(event, _user_data) {
+    let raw = event.data_text().unwrap_or_default();
     handle_editor_change(&raw)
+}
 }
 
 /// Pure `EditorChange` policy (parses the payload, so it is unit-testable
@@ -1897,12 +1901,14 @@ fn synthesize_and_play(text: &str) -> Result<(), String> {
 // Command handler: /voice → record → STT → editor draft (or direct send)
 // ---------------------------------------------------------------------------
 
-extern "C" fn voice_command(
-    args_json: StbStringRef,
-    out: *mut StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    let args_str = unsafe { args_json.as_str() };
+rpi_plugin_sdk::string_handler! {
+fn voice_command(args_json, out, _user_data) {
+    handle_voice_command(args_json, out)
+}
+}
+
+fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Output<'_>) -> i32 {
+    let args_str = args_json;
     let args: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
     let action = args
         .get("args")
@@ -2707,114 +2713,103 @@ fn help_text() -> String {
 }
 
 /// Helper to set command output (host reclaims it via `free_string`).
-fn set_output(out: *mut StbString, value: Value) {
-    if !out.is_null() {
-        unsafe {
-            *out = StbString::from_string(value.to_string());
-        }
+fn set_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
+    if out.is_available() {
+        out.write(value.to_string());
     }
 }
 
 // ---------------------------------------------------------------------------
 // Plugin registration
 // ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let ctx = RuntimeContext {
-                runtime_action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            };
-            let _ = RUNTIME_CTX.set(ctx);
-            let rc = pet::register(api);
-            if rc != 0 {
-                return rc;
-            }
-
-            // Auto-TTS is opt-in. Set `RPI_VOICE_AUTO_TTS=on` to enable it
-            // for the whole session, or use `/voice on` interactively.
-            if let Ok(v) = std::env::var("RPI_VOICE_AUTO_TTS") {
-                let on = matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "on" | "1" | "true" | "yes"
-                );
-                AUTO_TTS_ENABLED.store(on, Ordering::Relaxed);
-            }
-
-            // Auto-TTS consumes native Pi's real text deltas. MessageEnd only
-            // flushes the final buffered text; it never reads a message snapshot.
-            if let Some(register_event) = api.register_event_handler {
-                let rc = register_event(EventTag::MessageStart, on_message_start, api.user_data);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register MessageStart handler: {rc}");
-                }
-                let rc = register_event(EventTag::MessageUpdate, on_message_update, api.user_data);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register MessageUpdate handler: {rc}");
-                }
-                let rc = register_event(EventTag::MessageEnd, on_message_end, api.user_data);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register MessageEnd flush handler: {rc}");
-                }
-                // Push-to-talk: key events routed by the host. Subscribing is
-                // harmless while PTT is off — the handler declines (CONTINUE)
-                // and the key reaches the editor normally.
-                let rc = register_event(EventTag::Input, on_input_key, api.user_data);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register Input handler: {rc}");
-                }
-                // Barge-in: the user started typing, so stop the current
-                // utterance. Harmless (and silent) when nothing is playing.
-                let rc = register_event(EventTag::EditorChange, on_editor_change, api.user_data);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register EditorChange handler: {rc}");
-                }
-            }
-
-            // /voice command (record + settings).
-            if let Some(register_command) = api.register_command {
-                let name = StbStringRef::from_str("voice");
-                let description = StbStringRef::from_str(
-                    "Voice mode: record & transcribe (default), or auto|ptt|input|gain|stop|on|off|status|set <voice>|model [load|download]|output|help",
-                );
-                let rc = register_command(name, description, voice_command);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register /voice command: {rc}");
-                }
-            }
-
-            // Spoken-style prompt: while replies are being read aloud, ask the
-            // model to write for the ear. Registered only when the host offers
-            // the slot; a host without it simply never gets the style, which is
-            // the behaviour it had before this existed.
-            if spoken_style::register(api) {
-                debug_log("spoken style: registered before_agent_start transformer");
-            } else {
-                debug_log(
-                    "spoken style: host has no before_agent_start slot —                      spoken replies get no style section",
-                );
-            }
-
-            // Claim the push-to-talk key so the host routes it to this plugin
-            // (instead of the editor) once `/voice ptt` turns the mode on. The
-            // host only honors the claim while the input box is empty.
-            if let Some(register_shortcut) = api.register_shortcut {
-                let key = StbStringRef::from_str(&ptt_key());
-                let description =
-                    StbStringRef::from_str("rpi-voice: hold to talk, release to send");
-                let rc = register_shortcut(key, description);
-                if rc != 0 {
-                    eprintln!("[rpi-voice] Failed to register PTT shortcut: {rc}");
-                }
-            }
-
-            0 // Success
-        })
+rpi_plugin_sdk::export_plugin!(|api| {
+    let ctx = RuntimeContext { api: *api };
+    let _ = RUNTIME_CTX.set(ctx);
+    let rc = pet::register(api);
+    if rc != 0 {
+        return rc;
     }
-}
+
+    // Auto-TTS is opt-in. Set `RPI_VOICE_AUTO_TTS=on` to enable it
+    // for the whole session, or use `/voice on` interactively.
+    if let Ok(v) = std::env::var("RPI_VOICE_AUTO_TTS") {
+        let on = matches!(
+            v.trim().to_lowercase().as_str(),
+            "on" | "1" | "true" | "yes"
+        );
+        AUTO_TTS_ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    // Auto-TTS consumes native Pi's real text deltas. MessageEnd only
+    // flushes the final buffered text; it never reads a message snapshot.
+    if let Some(register_event) = api.register_event_handler {
+        let rc = register_event(EventTag::MessageStart, on_message_start, api.user_data);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register MessageStart handler: {rc}");
+        }
+        let rc = register_event(EventTag::MessageUpdate, on_message_update, api.user_data);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register MessageUpdate handler: {rc}");
+        }
+        let rc = register_event(EventTag::MessageEnd, on_message_end, api.user_data);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register MessageEnd flush handler: {rc}");
+        }
+        // Push-to-talk: key events routed by the host. Subscribing is
+        // harmless while PTT is off — the handler declines (CONTINUE)
+        // and the key reaches the editor normally.
+        let rc = register_event(EventTag::Input, on_input_key, api.user_data);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register Input handler: {rc}");
+        }
+        // Barge-in: the user started typing, so stop the current
+        // utterance. Harmless (and silent) when nothing is playing.
+        let rc = register_event(EventTag::EditorChange, on_editor_change, api.user_data);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register EditorChange handler: {rc}");
+        }
+    }
+
+    // /voice command (record + settings).
+    if let Some(register_command) = api.register_command {
+        let name = StbStringRef::from_str("voice");
+        let description = StbStringRef::from_str(
+            "Voice mode: record & transcribe (default), or auto|ptt|input|gain|stop|on|off|status|set <voice>|model [load|download]|output|help",
+        );
+        let rc = register_command(name, description, voice_command);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register /voice command: {rc}");
+        }
+    }
+
+    // Spoken-style prompt: while replies are being read aloud, ask the
+    // model to write for the ear. Registered only when the host offers
+    // the slot; a host without it simply never gets the style, which is
+    // the behaviour it had before this existed.
+    if spoken_style::register(api) {
+        debug_log("spoken style: registered before_agent_start transformer");
+    } else {
+        debug_log(
+            "spoken style: host has no before_agent_start slot —                      spoken replies get no style section",
+        );
+    }
+
+    // Claim the push-to-talk key so the host routes it to this plugin
+    // (instead of the editor) once `/voice ptt` turns the mode on. The
+    // host only honors the claim while the input box is empty.
+    if let Some(register_shortcut) = api.register_shortcut {
+        // Keep the owned string alive until the host has copied the borrowed ref.
+        let key_name = ptt_key();
+        let key = StbStringRef::from_str(&key_name);
+        let description = StbStringRef::from_str("rpi-voice: hold to talk, release to send");
+        let rc = register_shortcut(key, description);
+        if rc != 0 {
+            eprintln!("[rpi-voice] Failed to register PTT shortcut: {rc}");
+        }
+    }
+
+    0 // Success
+});
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3622,7 +3617,7 @@ mod tests {
             &mut out,
             std::ptr::null_mut(),
         );
-        (rc, unsafe { out.to_string_lossy() })
+        (rc, out.to_string_lossy())
     }
 
     #[test]

@@ -1,7 +1,10 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, PluginApi,
-    RuntimeActionId, StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle,
-    StepResult, ToolPartialCb,
+    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId,
+    StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
+    ToolPartialCb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,14 +19,8 @@ const GOAL_CUSTOM_TYPE: &str = "goal";
 const MAX_TITLE_CHARS: usize = 500;
 const MAX_NOTES_CHARS: usize = 20_000;
 
-#[derive(Clone, Copy)]
-struct Runtime {
-    action: rpi_plugin_sdk::RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
-}
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type Runtime = PluginApi;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// Last injected goal-state fingerprint (title + status + notes). Prevents
@@ -40,7 +37,7 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     let runtime = *RUNTIME.get().ok_or("goal runtime is unavailable")?;
     let input = args.to_string();
     let mut output = StbString::empty();
-    let rc = (runtime.action)(
+    let rc = (runtime.runtime_action)(
         id as u32,
         StbStringRef::from_str(&input),
         &mut output,
@@ -692,9 +689,10 @@ fn goal(params: &Value) -> Result<String, String> {
 // Tool drive (ABI)
 // ---------------------------------------------------------------------------
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
-    cancelled: bool,
     done: bool,
 }
 
@@ -705,19 +703,23 @@ extern "C" fn execute(
 ) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
-        cancelled: false,
         done: false,
-    })) as StepHandle
+    })
 }
 
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null goal handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
-    if drive.cancelled {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
+    if entry.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
         drive.done = true;
         return StepResult::err(StbString::from_string("goal cancelled".into()));
     }
@@ -734,29 +736,14 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
 }
 
 extern "C" fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            (&mut *(handle as *mut Drive)).cancelled = true;
-        }
-    }
+    HANDLES.cancel(handle);
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(handle));
 }
 
-extern "C" fn free_string(value: StbString) {
-    if !value.is_empty() && !value.ptr.is_null() {
-        unsafe {
-            let slice = std::slice::from_raw_parts(value.ptr as *const u8, value.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
 // ---------------------------------------------------------------------------
 // TurnEnd handler — count turns, enforce budgets, inject the active goal
@@ -819,11 +806,11 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
 // `/goal` slash command
 // ---------------------------------------------------------------------------
 
-fn command_output(out: *mut StbString, value: Value) -> i32 {
-    if out.is_null() {
+fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) -> i32 {
+    if !out.is_available() {
         return 1;
     }
-    unsafe { *out = StbString::from_string(value.to_string()) };
+    out.write(value.to_string());
     0
 }
 
@@ -947,8 +934,9 @@ fn run_command(args: &str) -> String {
     }
 }
 
-extern "C" fn goal_command(args_json: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
-    let raw = unsafe { args_json.as_str().to_owned() };
+rpi_plugin_sdk::string_handler! {
+fn goal_command(args_json, out, _user_data) {
+    let raw = args_json.to_owned();
     let envelope: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let args = envelope
         .get("args")
@@ -958,54 +946,45 @@ extern "C" fn goal_command(args_json: StbStringRef, out: *mut StbString, _: *mut
     let text = run_command(args);
     command_output(out, json!({"kind": "message", "text": text}))
 }
+}
 
 // ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let _ = RUNTIME.set(Runtime {
-                action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            });
-            if let Some(register_event) = api.register_event_handler {
-                let rc = register_event(
-                    EventTag::TurnEnd,
-                    on_turn_end as EventHandlerFn,
-                    std::ptr::null_mut(),
-                );
-                if rc != 0 {
-                    return rc;
-                }
-            }
-            if let Some(register_command) = api.register_command {
-                let name = StbStringRef::from_str("goal");
-                let description =
-                    StbStringRef::from_str("Show, start, pause, stop, or budget the active goal");
-                let _ = register_command(name, description, goal_command as CommandHandlerFn);
-            }
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let schema = Box::new(StableToolSchema {
-                name: StbString::from_string("goal".into()),
-                description: StbString::from_string(
-                    "Codex-style goal mode: record one persistent, context-injected objective per project and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
-                ),
-                parameters: StbString::from_string(
-                    r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","update","pause","resume","complete","limit","show","list"]},"title":{"type":"string","description":"Goal title (required for start)"},"notes":{"type":"string","description":"Goal notes or progress update (start/update)"},"status":{"type":"string","enum":["active","paused"],"description":"Explicit status change (update)"},"maxTurns":{"type":"integer","minimum":1,"description":"Optional turn budget (start/limit)"},"maxMinutes":{"type":"integer","minimum":1,"description":"Optional wall-clock budget in minutes (start/limit)"}},"required":["action"]}"#.into(),
-                ),
-            });
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            rc
-        })
+rpi_plugin_sdk::export_plugin!(|api| {
+    let _ = RUNTIME.set(*api);
+    if let Some(register_event) = api.register_event_handler {
+        let rc = register_event(
+            EventTag::TurnEnd,
+            on_turn_end as EventHandlerFn,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return rc;
+        }
     }
-}
+    if let Some(register_command) = api.register_command {
+        let name = StbStringRef::from_str("goal");
+        let description =
+            StbStringRef::from_str("Show, start, pause, stop, or budget the active goal");
+        let _ = register_command(name, description, goal_command as CommandHandlerFn);
+    }
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let schema = Box::new(StableToolSchema {
+        name: StbString::from_string("goal".into()),
+        description: StbString::from_string(
+            "Codex-style goal mode: record one persistent, context-injected objective per project and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
+        ),
+        parameters: StbString::from_string(
+            r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","update","pause","resume","complete","limit","show","list"]},"title":{"type":"string","description":"Goal title (required for start)"},"notes":{"type":"string","description":"Goal notes or progress update (start/update)"},"status":{"type":"string","enum":["active","paused"],"description":"Explicit status change (update)"},"maxTurns":{"type":"integer","minimum":1,"description":"Optional turn budget (start/limit)"},"maxMinutes":{"type":"integer","minimum":1,"description":"Optional wall-clock budget in minutes (start/limit)"}},"required":["action"]}"#.into(),
+        ),
+    });
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    rc
+});
 
 #[cfg(test)]
 mod tests {

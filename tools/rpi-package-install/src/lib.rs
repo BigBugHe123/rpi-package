@@ -11,6 +11,7 @@
 //! * standalone (release bundle) -> every `*.dll`/`*.so`/`*.dylib` next to the
 //!   installer.
 
+pub mod acp;
 pub mod archive;
 pub mod catalog;
 pub mod install;

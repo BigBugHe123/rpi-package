@@ -1,25 +1,16 @@
-use rpi_plugin_sdk::{
-    register_entrypoint, EventTag, FreeStringFn, PluginApi, RuntimeActionFn, RuntimeActionId,
-    StablePluginEvent, StbString, StbStringRef,
-};
-use serde_json::{json, Value};
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
+use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    ffi::c_void,
     sync::{Mutex, OnceLock},
     time::Instant,
 };
 
 const KEY: &str = "rpi.run-stats";
-#[derive(Clone, Copy)]
-struct Runtime {
-    action: RuntimeActionFn,
-    free: FreeStringFn,
-    data: *mut c_void,
-}
-// The host callbacks and context remain valid for the loaded plugin lifetime.
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type Runtime = PluginApi;
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static STATE: OnceLock<Mutex<Stats>> = OnceLock::new();
 static TIMER: Mutex<Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>> =
@@ -29,6 +20,7 @@ fn state() -> &'static Mutex<Stats> {
 }
 
 struct Stats {
+    last_publication: Option<String>,
     enabled: bool,
     anchor: String,
     running: bool,
@@ -50,6 +42,7 @@ struct Stats {
 impl Default for Stats {
     fn default() -> Self {
         Self {
+            last_publication: None,
             enabled: false,
             anchor: "top-right".into(),
             running: false,
@@ -190,39 +183,13 @@ fn metric(v: &Value, key: &str, precision: usize, suffix: &str) -> String {
         .map(|n| format!("{n:.precision$}{suffix}"))
         .unwrap_or_else(|| "—".into())
 }
-fn valid_anchor(anchor: &str) -> bool {
-    matches!(
-        anchor,
-        "top-left"
-            | "top-center"
-            | "top-right"
-            | "left-center"
-            | "center"
-            | "right-center"
-            | "bottom-left"
-            | "bottom-center"
-            | "bottom-right"
-    )
-}
-fn panel(snapshot: &Value, anchor: &str) -> Value {
-    let status = if snapshot["running"] == true {
-        "ACTIVE"
-    } else {
-        "IDLE"
-    };
-    json!({"version":1,"layout":"sidebar","anchor":anchor,"width":24,"maxHeight":11,"minScreenWidth":80,"border":false,
-    "title":format!("RUN STATS · {status}"),"lines":[
-        format!("Turns {} · Steps {}",compact(count(snapshot,"rounds")),compact(count(snapshot,"steps"))),
-        format!("TPS       {} tok/s",metric(snapshot,"speed",0,"")),
-        format!("TTFT      {} s",metric(snapshot,"ttft",2,"")),
-        format!("Latency   {} s",metric(snapshot,"latency",2,"")),
-        format!("TPM       {}",compact(count(snapshot,"tpm"))),
-        format!("In/Out    {}/{}",compact(count(snapshot,"input")),compact(count(snapshot,"output"))),
-        format!("Cache R/W {}/{}",compact(count(snapshot,"cacheRead")),compact(count(snapshot,"cacheWrite"))),
-        format!("Errors    {}",compact(count(snapshot,"errors"))),
-        format!("Cost USD  {}",metric(snapshot,"cost",4,"")),
-        format!("Elapsed   {} s",metric(snapshot,"waiting",2,""))
-    ]})
+fn panel(snapshot: &Value, _anchor: &str) -> Value {
+    json!({"version":1,"layout":"footer","width":240,"maxHeight":1,"border":false,
+        "lines":[format!("Turns {} · Steps {} · TPS {} · TTFT {} · Latency {} · TPM {} · Err {} · USD {}",
+            compact(count(snapshot,"rounds")),compact(count(snapshot,"steps")),
+            metric(snapshot,"speed",0,""),metric(snapshot,"ttft",2,"s"),
+            metric(snapshot,"latency",2,"s"),compact(count(snapshot,"tpm")),
+            compact(count(snapshot,"errors")),metric(snapshot,"cost",4,""))]})
 }
 fn compact(n: u64) -> String {
     if n >= 1_000_000 {
@@ -233,27 +200,54 @@ fn compact(n: u64) -> String {
         n.to_string()
     }
 }
+fn component_action(runtime: &rpi_plugin_sdk::PluginApi, args: Value) -> bool {
+    let args = args.to_string();
+    let mut out = StbString::empty();
+    let rc = (runtime.runtime_action)(
+        RuntimeActionId::UiComponent as u32,
+        StbStringRef::from_str(&args),
+        &mut out,
+        runtime.user_data,
+    );
+    (runtime.free_string)(out);
+    rc == 0
+}
 fn publish(stats: &mut Stats) {
     let Some(runtime) = RUNTIME.get() else {
         return;
     };
-    let value = if stats.enabled {
-        panel(&stats.snapshot(Instant::now()), &stats.anchor)
-    } else {
-        Value::Null
-    };
-    let args = json!({"key":KEY,"panel":value}).to_string();
+    if stats.last_publication.is_none() {
+        if !component_action(
+            runtime,
+            json!({"op":"register","id":KEY,"type":"text","slot":"footer.after","width":240,"maxHeight":1,"border":false,"visible":false}),
+        ) {
+            return;
+        }
+    }
+    let value = panel(&stats.snapshot(Instant::now()), &stats.anchor);
+    let args = json!({"op":"update","id":KEY,"text":value["lines"][0]}).to_string();
+    let _ = component_action(
+        runtime,
+        json!({"op":if stats.enabled {"show"} else {"hide"},"id":KEY}),
+    );
+    if stats.last_publication.as_deref() == Some(args.as_str()) {
+        return;
+    }
     let mut out = StbString::empty();
-    (runtime.action)(
-        RuntimeActionId::SetStatus as u32,
+    let rc = (runtime.runtime_action)(
+        RuntimeActionId::UiComponent as u32,
         StbStringRef::from_str(&args),
         &mut out,
-        runtime.data,
+        runtime.user_data,
     );
-    (runtime.free)(out);
+    (runtime.free_string)(out);
+    if rc == 0 {
+        stats.last_publication = Some(args);
+    }
 }
-extern "C" fn event(event: StablePluginEvent, _: *mut c_void) -> i32 {
-    if event.tag == EventTag::SessionShutdown {
+rpi_plugin_sdk::event_handler! {
+fn event(event, _user_data) {
+    if event.tag() == EventTag::SessionShutdown {
         if let Some((stop, thread)) = TIMER.lock().unwrap_or_else(|p| p.into_inner()).take() {
             let _ = stop.send(());
             let _ = thread.join();
@@ -268,23 +262,28 @@ extern "C" fn event(event: StablePluginEvent, _: *mut c_void) -> i32 {
     };
     // Events are borrowed during host fan-out; the host frees their payloads
     // once all subscribers have returned (dispatch_to_handlers contract).
-    let payload = match event.tag {
+    let payload = match event.tag() {
         EventTag::MessageUpdate | EventTag::MessageEnd => {
-            Some(unsafe { event.payload.message.message })
+            event.message_text()
         }
-        EventTag::BeforeProviderRequest => Some(unsafe { event.payload.data.data }),
+        EventTag::BeforeProviderRequest => event.data_text(),
         _ => None,
     };
     let value = payload
         .map(|s| {
-            let parsed = serde_json::from_str(&s.to_string_lossy()).unwrap_or(Value::Null);
+            let parsed = serde_json::from_str(&s).unwrap_or(Value::Null);
             parsed
         })
         .unwrap_or(Value::Null);
     let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
-    stats.update(event.tag, &value, Instant::now());
-    publish(&mut stats);
+    stats.update(event.tag(), &value, Instant::now());
+    // Stream deltas only latch TTFT. The one-second timer publishes ongoing
+    // timing; request/lifecycle boundaries still publish immediately.
+    if event.tag() != EventTag::MessageUpdate {
+        publish(&mut stats);
+    }
     0
+}
 }
 fn shortcut(stats: &mut Stats, value: &Value) -> i32 {
     use rpi_plugin_sdk::{EVENT_HANDLER_CLAIMED, EVENT_HANDLER_CONTINUE};
@@ -305,8 +304,9 @@ fn shortcut(stats: &mut Stats, value: &Value) -> i32 {
         _ => EVENT_HANDLER_CONTINUE,
     }
 }
-extern "C" fn input(event: StablePluginEvent, _: *mut c_void) -> i32 {
-    let raw = unsafe { event.payload.data.data.to_string_lossy() };
+rpi_plugin_sdk::event_handler! {
+fn input(event, _user_data) {
+    let raw = event.data_text().unwrap_or_default();
     let value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
     let enabled = stats.enabled;
@@ -316,12 +316,14 @@ extern "C" fn input(event: StablePluginEvent, _: *mut c_void) -> i32 {
     }
     result
 }
-extern "C" fn command(args: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
-    if out.is_null() {
+}
+rpi_plugin_sdk::string_handler! {
+fn command(args, out, _user_data) {
+    if !out.is_available() {
         return 1;
     }
     let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
-    let envelope: Value = serde_json::from_str(unsafe { args.as_str() }).unwrap_or(Value::Null);
+    let envelope: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let text = match envelope
         .get("args")
         .and_then(Value::as_str)
@@ -345,92 +347,74 @@ extern "C" fn command(args: StbStringRef, out: *mut StbString, _: *mut c_void) -
             }
         }
         position if position.starts_with("position ") => {
-            let anchor = position.trim_start_matches("position ").trim();
-            if valid_anchor(anchor) {
-                stats.anchor = anchor.into();
-                "监控位置已更新"
-            } else {
-                "位置：top-left|top-center|top-right|left-center|center|right-center|bottom-left|bottom-center|bottom-right"
-            }
+            "监控固定显示在用量统计下方，无需设置位置。"
         }
-        _ => "用法：/stats [on|off|toggle|position <位置>]",
+        _ => "用法：/stats [on|off|toggle]，也可使用 F8 切换",
     };
     publish(&mut stats);
-    unsafe {
-        *out = StbString::from_string(json!({"kind":"message","text":text}).to_string());
-    }
+    out.write(json!({"kind":"message","text":text}).to_string());
     0
 }
-#[no_mangle]
-/// # Safety
-/// The host must provide a valid ABI-compatible API for the plugin lifetime.
-pub unsafe extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let _ = RUNTIME.set(Runtime {
-                action: api.runtime_action,
-                free: api.free_string,
-                data: api.user_data,
-            });
-            let Some(register) = api.register_event_handler else {
-                return 1;
-            };
-            for tag in [
-                EventTag::SessionStart,
-                EventTag::SessionShutdown,
-                EventTag::AgentStart,
-                EventTag::AgentEnd,
-                EventTag::BeforeProviderRequest,
-                EventTag::MessageUpdate,
-                EventTag::MessageEnd,
-            ] {
-                if register(tag, event, std::ptr::null_mut()) != 0 {
-                    return 1;
-                }
-            }
-            if register(EventTag::Input, input, std::ptr::null_mut()) != 0 {
-                return 1;
-            }
-            let Some(register_shortcut) = api.register_shortcut else {
-                return 1;
-            };
-            if register_shortcut(
-                StbStringRef::from_str("f8"),
-                StbStringRef::from_str("Toggle runtime monitor (F8)"),
-            ) != 0
-            {
-                return 1;
-            }
-            let Some(register) = api.register_command else {
-                return 1;
-            };
-            if register(
-                StbStringRef::from_str("stats"),
-                StbStringRef::from_str("Runtime monitor: /stats on|off|toggle|position <anchor>"),
-                command,
-            ) != 0
-            {
-                return 1;
-            }
-            publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
-            // Keep waiting time and the rolling TPM window fresh even without streaming events.
-            let mut timer = TIMER.lock().unwrap_or_else(|p| p.into_inner());
-            if timer.is_none() {
-                let (stop, receiver) = std::sync::mpsc::channel();
-                let thread = std::thread::spawn(move || {
-                    while matches!(
-                        receiver.recv_timeout(std::time::Duration::from_secs(1)),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    ) {
-                        publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
-                    }
-                });
-                *timer = Some((stop, thread));
-            }
-            0
-        })
-    }
 }
+rpi_plugin_sdk::export_plugin!(|api| {
+    let _ = RUNTIME.set(*api);
+    let Some(register) = api.register_event_handler else {
+        return 1;
+    };
+    for tag in [
+        EventTag::SessionStart,
+        EventTag::SessionShutdown,
+        EventTag::AgentStart,
+        EventTag::AgentEnd,
+        EventTag::BeforeProviderRequest,
+        EventTag::MessageUpdate,
+        EventTag::MessageEnd,
+    ] {
+        if register(tag, event, std::ptr::null_mut()) != 0 {
+            return 1;
+        }
+    }
+    if register(EventTag::Input, input, std::ptr::null_mut()) != 0 {
+        return 1;
+    }
+    let Some(register_shortcut) = api.register_shortcut else {
+        return 1;
+    };
+    if register_shortcut(
+        StbStringRef::from_str("f8"),
+        StbStringRef::from_str("Toggle runtime monitor (F8)"),
+    ) != 0
+    {
+        return 1;
+    }
+    let Some(register) = api.register_command else {
+        return 1;
+    };
+    if register(
+        StbStringRef::from_str("stats"),
+        StbStringRef::from_str("Footer runtime monitor: /stats on|off|toggle (F8)"),
+        command,
+    ) != 0
+    {
+        return 1;
+    }
+    publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
+    // Keep waiting time and the rolling TPM window fresh even without streaming events.
+    let mut timer = TIMER.lock().unwrap_or_else(|p| p.into_inner());
+    if timer.is_none() {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while matches!(
+                receiver.recv_timeout(std::time::Duration::from_secs(1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
+            }
+        });
+        *timer = Some((stop, thread));
+    }
+    0
+});
 
 #[cfg(test)]
 mod tests {
@@ -465,15 +449,10 @@ mod tests {
         let mut stats = Stats::default();
         assert!(!stats.enabled);
         let view = panel(&stats.snapshot(Instant::now()), "top-right");
-        assert_eq!(view["layout"], "sidebar");
-        assert_eq!(view["width"], 24);
-        assert!(view["lines"].as_array().unwrap().iter().all(|line| line
-            .as_str()
-            .unwrap()
-            .chars()
-            .count()
-            <= 24));
-        assert!(view["lines"][2].as_str().unwrap().starts_with("TTFT"));
+        assert_eq!(view["layout"], "footer");
+        assert_eq!(view["maxHeight"], 1);
+        assert_eq!(view["lines"].as_array().unwrap().len(), 1);
+        assert!(view["lines"][0].as_str().unwrap().contains("TTFT"));
     }
     #[test]
     fn command_accepts_host_envelope_and_rejects_unknown_arguments() {
@@ -498,7 +477,7 @@ mod tests {
             );
             assert_eq!(state().lock().unwrap().enabled, enabled);
             if args.starts_with("position ") {
-                assert_eq!(state().lock().unwrap().anchor, "bottom-left");
+                assert_eq!(state().lock().unwrap().anchor, "top-right");
             }
             let response: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
             assert_eq!(response["kind"], "message");
@@ -506,12 +485,7 @@ mod tests {
                 assert!(response["text"].as_str().unwrap().contains("用法"));
             }
             // The command output uses the SDK boxed-slice allocation contract.
-            unsafe {
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    out.ptr as *mut u8,
-                    out.len,
-                )));
-            }
+            rpi_plugin_sdk::callbacks::free_string(out);
         }
     }
     #[test]

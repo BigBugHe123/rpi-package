@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,8 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rpi_plugin_sdk::{
-    register_entrypoint, FreeStringFn, PluginApi, StbString, StbStringRef, StepHandle, StepResult,
-    ToolPartialCb,
+    FreeStringFn, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 
@@ -18,10 +20,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_OUTPUT_CHARS: usize = 25_000;
 const MAX_DIAGNOSTIC_CHARS: usize = 1_000;
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     tool: &'static str,
     params: Value,
-    cancelled: AtomicBool,
     completed: bool,
 }
 
@@ -394,12 +397,11 @@ fn call_codegraph(tool: &str, params: &Value, cancelled: &AtomicBool) -> Result<
 fn execute_tool(tool: &'static str, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         tool,
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
-        cancelled: AtomicBool::new(false),
         completed: false,
-    })) as StepHandle
+    })
 }
 
 macro_rules! tool_execute {
@@ -427,8 +429,13 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null codegraph handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
-    if drive.cancelled.load(Ordering::SeqCst) {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
+    if entry.cancelled.load(Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("codegraph request cancelled".into()));
     }
     if drive.completed {
@@ -437,7 +444,7 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     }
     drive.completed = true;
-    match call_codegraph(drive.tool, &drive.params, &drive.cancelled) {
+    match call_codegraph(drive.tool, &drive.params, &entry.cancelled) {
         Ok(text) => StepResult::done(StbString::from_string(
             json!({"content":[{"type":"text","text":text}]}).to_string(),
         )),
@@ -446,27 +453,14 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
 }
 
 extern "C" fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe { &*(handle as *mut Drive) }
-            .cancelled
-            .store(true, Ordering::SeqCst);
-    }
+    HANDLES.cancel(handle);
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe { drop(Box::from_raw(handle as *mut Drive)) };
-    }
+    drop(HANDLES.remove(handle));
 }
 
-extern "C" fn free_string(value: StbString) {
-    if !value.is_empty() && !value.ptr.is_null() {
-        unsafe {
-            let slice = std::slice::from_raw_parts(value.ptr as *const u8, value.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
 fn parameters(mut properties: serde_json::Map<String, Value>, required: &[&str]) -> String {
     properties.insert(
@@ -558,30 +552,24 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
     ]
 }
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            for spec in tool_specs() {
-                let schema = Box::new(rpi_plugin_sdk::StableToolSchema {
-                    name: StbString::from_string(spec.name.into()),
-                    description: StbString::from_string(spec.description.into()),
-                    parameters: StbString::from_string(spec.parameters),
-                });
-                let rc = register(&*schema, spec.execute, poll, cancel, destroy, free_string);
-                drop(schema);
-                if rc != 0 {
-                    return rc;
-                }
-            }
-            0
-        })
+rpi_plugin_sdk::export_plugin!(|api| {
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    for spec in tool_specs() {
+        let schema = Box::new(rpi_plugin_sdk::StableToolSchema {
+            name: StbString::from_string(spec.name.into()),
+            description: StbString::from_string(spec.description.into()),
+            parameters: StbString::from_string(spec.parameters),
+        });
+        let rc = register(&*schema, spec.execute, poll, cancel, destroy, free_string);
+        drop(schema);
+        if rc != 0 {
+            return rc;
+        }
     }
-}
+    0
+});
 
 #[cfg(test)]
 mod tests {

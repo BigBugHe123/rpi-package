@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod kit;
 
 use crate::kit::{optional_string, string_param};

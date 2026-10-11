@@ -3,19 +3,21 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rpi_package_install::{install, metadata, pack, platform};
+use rpi_package_install::{acp, install, metadata, pack, platform};
 
 const USAGE: &str = "\
 rpi-package-install - install/pack the rpi extension cdylibs (cross-platform)
 
 USAGE:
-    rpi-package-install install [OPTIONS]
-    rpi-package-install pack    [OPTIONS]
-    rpi-package-install bundle  --archive <FILE> [OPTIONS]
+    rpi-package-install install  [OPTIONS]
+    rpi-package-install pack     [OPTIONS]
+    rpi-package-install pack-acp [OPTIONS]
+    rpi-package-install bundle   --archive <FILE> [OPTIONS]
 
 COMMANDS:
     install   Copy the built extension libraries into the rpi extension dir
     pack      Stage a distributable bundle under dist/ and archive it
+    pack-acp  Package the standalone rpi-acp bridge binary for the ACP Registry
     bundle    Install from a bundle produced by `pack`
 
 OPTIONS:
@@ -27,7 +29,7 @@ OPTIONS:
     --out <DIR>              Output directory for pack (default: dist/)
     --exclude <NAME>         Skip a package (repeatable, comma-separated allowed)
     --all                    Ignore catalog/packages.json and take every cdylib
-    --no-archive             pack: stop after staging, do not create the archive
+    --no-archive             pack/pack-acp: stop after staging, do not archive
     -n, --dry-run            Show what would be copied, write nothing
     -q, --quiet              Only report errors
     -h, --help               Show this help
@@ -126,6 +128,17 @@ fn run() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("`bundle` requires --archive <FILE>"))?;
             let installed = pack::install_bundle(&archive, args.target_dir.clone())?;
             println!("installed {} extension(s)", installed.len());
+            Ok(())
+        }
+        "pack-acp" => {
+            let manifest = resolve_manifest(&args)?.ok_or_else(|| {
+                anyhow::anyhow!("`pack-acp` must run inside the rpi-package workspace")
+            })?;
+            acp::run(&acp::Options {
+                manifest: Some(manifest),
+                out_dir: args.out.clone(),
+                skip_archive: args.no_archive,
+            })?;
             Ok(())
         }
         other => anyhow::bail!("unknown command `{other}` (try --help)"),

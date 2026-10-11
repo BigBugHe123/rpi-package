@@ -31,6 +31,7 @@
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
 use rpi_plugin_sdk::{StbString, StbStringRef};
 
 /// Heading the section is introduced by. Distinctive so a reader who sees it in
@@ -97,6 +98,7 @@ pub fn prompt_for_turn(base: &str, enabled: bool) -> Option<String> {
 pub fn has_spoken_style(prompt: &str) -> bool {
     prompt.contains(SECTION_HEADING)
 }
+rpi_plugin_sdk::string_handler! {
 
 /// `before_agent_start` handler: append the spoken-style section while speech is
 /// on.
@@ -110,12 +112,8 @@ pub fn has_spoken_style(prompt: &str) -> bool {
 /// itself. A malformed or missing envelope is treated as an empty base rather
 /// than a failure: losing the host's base prompt is worse than not appending, so
 /// in that case this returns "no change".
-extern "C" fn on_before_agent_start(
-    event_json: StbStringRef,
-    out: *mut StbString,
-    _user_data: *mut std::ffi::c_void,
-) -> i32 {
-    let raw = unsafe { event_json.as_str() };
+fn on_before_agent_start(event_json, out, _user_data) {
+    let raw = event_json;
     let enabled = super::AUTO_TTS_ENABLED.load(Ordering::Relaxed);
 
     // Nothing to say, and the cheapest exit — most turns in a typed session.
@@ -155,31 +153,21 @@ extern "C" fn on_before_agent_start(
     }
     0
 }
+}
 
 /// Write the handler's payload into the host's out-slot.
-fn write_out(out: *mut StbString, value: Value) {
-    if !out.is_null() {
-        unsafe {
-            *out = StbString::from_string(value.to_string());
-        }
+fn write_out(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
+    if out.is_available() {
+        out.write(value.to_string());
     }
 }
 
-/// Reclaim a [`StbString`] this plugin produced.
-///
-/// The host calls this to free the `{"systemPrompt": ...}` payload we hand back
-/// — it is the plugin's allocation, so only the plugin can release it. The same
-/// function [`crate::set_output`] relies on via the SDK's own free slot.
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        // SAFETY: produced by `StbString::from_string` (a `Box<[u8]>`); ptr+len
-        // reconstruct that same allocation.
-        unsafe {
-            let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+// Reclaim a [`StbString`] this plugin produced.
+//
+// The host calls this to free the `{"systemPrompt": ...}` payload we hand back
+// — it is the plugin's allocation, so only the plugin can release it. The same
+// function [`crate::set_output`] relies on via the SDK's own free slot.
+use rpi_plugin_sdk::callbacks::free_string;
 
 /// Register the `before_agent_start` transformer, if the host offers the slot.
 ///

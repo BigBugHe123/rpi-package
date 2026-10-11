@@ -1,7 +1,9 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId,
-    StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    ToolPartialCb,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId, StablePluginEvent,
+    StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -12,15 +14,8 @@ const PLAN_TOOL: &str = "plan_mode_complete";
 const START_TOOL: &str = "plan_mode_start";
 const PLAN_ENTRY: &str = "plan-mode";
 
-#[derive(Clone, Copy)]
-struct Runtime {
-    action: rpi_plugin_sdk::RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
-}
-
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type Runtime = PluginApi;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static STATE: OnceLock<Mutex<PlanState>> = OnceLock::new();
@@ -45,7 +40,7 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     let runtime = *RUNTIME.get().ok_or("plan mode runtime is unavailable")?;
     let input = args.to_string();
     let mut output = StbString::empty();
-    let rc = (runtime.action)(
+    let rc = (runtime.runtime_action)(
         id as u32,
         StbStringRef::from_str(&input),
         &mut output,
@@ -331,9 +326,10 @@ fn complete_plan(raw: &Value) -> Result<String, String> {
     .to_string())
 }
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
-    cancelled: bool,
     done: bool,
 }
 
@@ -344,19 +340,23 @@ extern "C" fn execute(
 ) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
-        cancelled: false,
         done: false,
-    })) as StepHandle
+    })
 }
 
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null plan handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
-    if drive.cancelled {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
+    if entry.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
         drive.done = true;
         return StepResult::err(StbString::from_string("plan cancelled".into()));
     }
@@ -378,40 +378,26 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
 }
 
 extern "C" fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            (&mut *(handle as *mut Drive)).cancelled = true;
-        }
-    }
+    HANDLES.cancel(handle);
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(handle));
 }
 
-extern "C" fn free_string(value: StbString) {
-    if !value.is_empty() && !value.ptr.is_null() {
-        unsafe {
-            let slice = std::slice::from_raw_parts(value.ptr as *const u8, value.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
-fn command_output(out: *mut StbString, value: Value) -> i32 {
-    if out.is_null() {
+fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) -> i32 {
+    if !out.is_available() {
         return 1;
     }
-    unsafe { *out = StbString::from_string(value.to_string()) };
+    out.write(value.to_string());
     0
 }
 
-extern "C" fn plan_command(args_json: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
-    let raw = unsafe { args_json.as_str().to_owned() };
+rpi_plugin_sdk::string_handler! {
+fn plan_command(args_json, out, _user_data) {
+    let raw = args_json.to_owned();
     let envelope: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let args = envelope
         .get("args")
@@ -470,68 +456,54 @@ extern "C" fn plan_command(args_json: StbStringRef, out: *mut StbString, _: *mut
     }
     command_output(out, output)
 }
-
-#[no_mangle]
-/// # Safety
-/// The host must provide a valid ABI-compatible API during registration.
-pub unsafe extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            if let Some(register_event) = api.register_event_handler {
-                for tag in [EventTag::SessionStart, EventTag::SessionTree] {
-                    if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut())
-                        != 0
-                    {
-                        return 1;
-                    }
-                }
-            }
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let _ = RUNTIME.set(Runtime {
-                action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            });
-            let schema = Box::new(StableToolSchema {
-                name: StbString::from_string(PLAN_TOOL.into()),
-                description: StbString::from_string(
-                    "Submit a complete implementation-ready plan and leave plan mode. Only available while /plan mode is active.".into(),
-                ),
-                parameters: StbString::from_string(format!(
-                    r#"{{"type":"object","required":["plan"],"properties":{{"plan":{{"type":"string","minLength":1,"maxLength":{MAX_PLAN_CHARS},"description":"The complete decision-ready implementation plan in Markdown."}}}}}}"#
-                )),
-            });
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            if rc != 0 {
-                return rc;
-            }
-            let start_schema = Box::new(StableToolSchema {
-                name: StbString::from_string(START_TOOL.into()),
-                description: StbString::from_string(
-                    "Enter Plan mode before making a complex change. Use this when the request needs repository exploration and an implementation plan.".into(),
-                ),
-                parameters: StbString::from_string(
-                    r#"{"type":"object","properties":{"request":{"type":"string","description":"Optional user request to plan."}}}"#.into(),
-                ),
-            });
-            let start_rc = register(&*start_schema, execute, poll, cancel, destroy, free_string);
-            drop(start_schema);
-            if start_rc != 0 {
-                return start_rc;
-            }
-            if let Some(register_command) = api.register_command {
-                let name = StbStringRef::from_str("plan");
-                let description =
-                    StbStringRef::from_str("Enter, inspect, or exit CodeX-like plan mode");
-                let _ = register_command(name, description, plan_command);
-            }
-            0
-        })
-    }
 }
+rpi_plugin_sdk::export_plugin!(|api| {
+    if let Some(register_event) = api.register_event_handler {
+        for tag in [EventTag::SessionStart, EventTag::SessionTree] {
+            if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut()) != 0 {
+                return 1;
+            }
+        }
+    }
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let _ = RUNTIME.set(*api);
+    let schema = Box::new(StableToolSchema {
+        name: StbString::from_string(PLAN_TOOL.into()),
+        description: StbString::from_string(
+            "Submit a complete implementation-ready plan and leave plan mode. Only available while /plan mode is active.".into(),
+        ),
+        parameters: StbString::from_string(format!(
+            r#"{{"type":"object","required":["plan"],"properties":{{"plan":{{"type":"string","minLength":1,"maxLength":{MAX_PLAN_CHARS},"description":"The complete decision-ready implementation plan in Markdown."}}}}}}"#
+        )),
+    });
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    if rc != 0 {
+        return rc;
+    }
+    let start_schema = Box::new(StableToolSchema {
+        name: StbString::from_string(START_TOOL.into()),
+        description: StbString::from_string(
+            "Enter Plan mode before making a complex change. Use this when the request needs repository exploration and an implementation plan.".into(),
+        ),
+        parameters: StbString::from_string(
+            r#"{"type":"object","properties":{"request":{"type":"string","description":"Optional user request to plan."}}}"#.into(),
+        ),
+    });
+    let start_rc = register(&*start_schema, execute, poll, cancel, destroy, free_string);
+    drop(start_schema);
+    if start_rc != 0 {
+        return start_rc;
+    }
+    if let Some(register_command) = api.register_command {
+        let name = StbStringRef::from_str("plan");
+        let description = StbStringRef::from_str("Enter, inspect, or exit CodeX-like plan mode");
+        let _ = register_command(name, description, plan_command);
+    }
+    0
+});
 
 #[cfg(test)]
 mod tests {

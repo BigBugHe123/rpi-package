@@ -3,16 +3,18 @@
 //! 1:1 Rust implementation based on pi-observability-plugin TypeScript reference
 //! Uses OpenTelemetry-style observation hierarchy with Langfuse HTTP ingestion API
 
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionFn,
-    StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    ToolPartialCb,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApi, StablePluginEvent, StableToolSchema,
+    StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -251,17 +253,8 @@ const RUNTIME_ACTION_SET_STATUS: u32 = 18;
 
 /// Host fn pointers captured once at register time. `runtime_action` drives the
 /// host's status line; `user_data` is the host's opaque context.
-#[derive(Clone, Copy)]
-struct HostRuntime {
-    runtime_action: RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
-}
-
-// SAFETY: the host guarantees `user_data` is valid for the session lifetime and
-// the fn pointers are `extern "C"` with no thread affinity.
-unsafe impl Send for HostRuntime {}
-unsafe impl Sync for HostRuntime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type HostRuntime = PluginApi;
 
 static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
 
@@ -1965,13 +1958,14 @@ extern "C" fn on_session_start(_event: StablePluginEvent, _: *mut c_void) -> i32
     0
 }
 
-extern "C" fn on_before_agent_start(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_before_agent_start(event, _user_data) {
     debug_log("event: BeforeAgentStart");
     if !is_enabled() {
         return 0;
     }
 
-    let data_str = unsafe { event.payload.data.data.to_string_lossy() };
+    let data_str = event.data_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     // Finalize previous state if exists
@@ -2100,6 +2094,7 @@ extern "C" fn on_before_agent_start(event: StablePluginEvent, _: *mut c_void) ->
 
     0
 }
+}
 
 fn resolve_turn_number(session_id: &str, _prompt: &str) -> u32 {
     // Simple implementation: use turn number from state or default to 1
@@ -2136,7 +2131,8 @@ extern "C" fn on_agent_start(event: StablePluginEvent, _: *mut c_void) -> i32 {
     0
 }
 
-extern "C" fn on_before_provider_request(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_before_provider_request(event, _user_data) {
     debug_log("event: BeforeProviderRequest");
     if !is_enabled() {
         return 0;
@@ -2162,7 +2158,7 @@ extern "C" fn on_before_provider_request(event: StablePluginEvent, _: *mut c_voi
         }
     }
 
-    let data_str = unsafe { event.payload.data.data.to_string_lossy() };
+    let data_str = event.data_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     let index = state.generation_count + 1;
@@ -2226,8 +2222,10 @@ extern "C" fn on_before_provider_request(event: StablePluginEvent, _: *mut c_voi
 
     0
 }
+}
 
-extern "C" fn on_message_update(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_message_update(event, _user_data) {
     if !is_enabled() {
         return 0;
     }
@@ -2245,7 +2243,7 @@ extern "C" fn on_message_update(event: StablePluginEvent, _: *mut c_void) -> i32
         return 0;
     }
 
-    let data_str = unsafe { event.payload.message.message.to_string_lossy() };
+    let data_str = event.message_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     let content = data.get("content").unwrap_or(&Value::Null);
@@ -2263,8 +2261,10 @@ extern "C" fn on_message_update(event: StablePluginEvent, _: *mut c_void) -> i32
 
     0
 }
+}
 
-extern "C" fn on_message_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_message_end(event, _user_data) {
     debug_log("event: MessageEnd");
     if !is_enabled() {
         return 0;
@@ -2275,7 +2275,7 @@ extern "C" fn on_message_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         return 0;
     };
 
-    let data_str = unsafe { event.payload.message.message.to_string_lossy() };
+    let data_str = event.message_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     // Check if this is an assistant message (new protocol uses "role", old uses "kind")
@@ -2406,15 +2406,18 @@ extern "C" fn on_message_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
 
     0
 }
+}
 
-extern "C" fn on_tool_execution_start(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_tool_execution_start(event, _user_data) {
     if !is_enabled() {
         return 0;
     }
 
-    let tool_call_id = unsafe { event.payload.tool_call.tool_call_id.to_string_lossy() };
-    let tool_name = unsafe { event.payload.tool_call.tool_name.to_string_lossy() };
-    let params = unsafe { event.payload.tool_call.params.to_string_lossy() };
+    let Some(payload) = event.tool_call() else { return 0; };
+    let tool_call_id = payload.tool_call_id.clone();
+    let tool_name = payload.tool_name.clone();
+    let params = payload.params.clone();
 
     let input: Value = serde_json::from_str(&params).unwrap_or(Value::Null);
     // Read the host's `__rpi.sessionId` off the *raw* args: this is the only
@@ -2462,15 +2465,18 @@ extern "C" fn on_tool_execution_start(event: StablePluginEvent, _: *mut c_void) 
 
     0
 }
+}
 
-extern "C" fn on_tool_execution_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_tool_execution_end(event, _user_data) {
     if !is_enabled() {
         return 0;
     }
 
-    let tool_call_id = unsafe { event.payload.tool_result.tool_call_id.to_string_lossy() };
-    let result = unsafe { event.payload.tool_result.result.to_string_lossy() };
-    let is_error = unsafe { event.payload.tool_result.is_error } != 0;
+    let Some(payload) = event.tool_result() else { return 0; };
+    let tool_call_id = payload.tool_call_id.clone();
+    let result = payload.result.clone();
+    let is_error = payload.is_error;
 
     let mut state_guard = prompt_state().lock().unwrap();
     let Some(state) = state_guard.as_mut() else {
@@ -2553,6 +2559,7 @@ extern "C" fn on_tool_execution_end(event: StablePluginEvent, _: *mut c_void) ->
 
     0
 }
+}
 
 extern "C" fn on_session_before_compact(event: StablePluginEvent, _: *mut c_void) -> i32 {
     if !is_enabled() {
@@ -2563,12 +2570,13 @@ extern "C" fn on_session_before_compact(event: StablePluginEvent, _: *mut c_void
     0
 }
 
-extern "C" fn on_session_compact(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_session_compact(event, _user_data) {
     if !is_enabled() {
         return 0;
     }
 
-    let data_str = unsafe { event.payload.data.data.to_string_lossy() };
+    let data_str = event.data_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     let entry = data.get("compactionEntry");
@@ -2629,13 +2637,15 @@ extern "C" fn on_session_compact(event: StablePluginEvent, _: *mut c_void) -> i3
 
     0
 }
+}
 
-extern "C" fn on_session_tree(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_session_tree(event, _user_data) {
     if !is_enabled() {
         return 0;
     }
 
-    let data_str = unsafe { event.payload.data.data.to_string_lossy() };
+    let data_str = event.data_text().unwrap_or_default();
     let data: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
 
     let entry = data.get("summaryEntry");
@@ -2690,6 +2700,7 @@ extern "C" fn on_session_tree(event: StablePluginEvent, _: *mut c_void) -> i32 {
     end_observation(&obs_id);
 
     0
+}
 }
 
 extern "C" fn on_agent_settled(_event: StablePluginEvent, _: *mut c_void) -> i32 {
@@ -2805,10 +2816,11 @@ extern "C" fn on_session_shutdown(_event: StablePluginEvent, _: *mut c_void) -> 
 
 type Builder = fn(&Value) -> Result<String, String>;
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
     builder: Builder,
-    cancelled: AtomicBool,
     done: bool,
 }
 
@@ -3027,12 +3039,11 @@ fn start(params: StbString, free: Option<FreeStringFn>, builder: Builder) -> Ste
     let t = params.to_string_lossy();
     params.free_with(free);
     let params = serde_json::from_str(&t).unwrap_or(Value::Null);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params,
         builder,
-        cancelled: AtomicBool::new(false),
         done: false,
-    })) as StepHandle
+    })
 }
 
 extern "C" fn execute_score(
@@ -3063,8 +3074,13 @@ extern "C" fn poll(h: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> S
     if h.is_null() {
         return StepResult::err(StbString::from_string("null langfuse handle".into()));
     }
-    let d = unsafe { &mut *(h as *mut Drive) };
-    if d.cancelled.load(Ordering::SeqCst) {
+    let Some(entry) = HANDLES.get(h) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut d = entry.lock();
+    if entry.cancelled.load(Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("langfuse cancelled".into()));
     }
     if d.done {
@@ -3083,115 +3099,88 @@ extern "C" fn poll(h: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> S
 }
 
 extern "C" fn cancel(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            (&*(h as *mut Drive))
-                .cancelled
-                .store(true, Ordering::SeqCst);
-        }
-    }
+    HANDLES.cancel(h);
 }
 
 extern "C" fn destroy(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            drop(Box::from_raw(h as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(h));
 }
 
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let b = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(b as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
 // ---------------------------------------------------------------------------
 // Plugin registration
 // ---------------------------------------------------------------------------
+rpi_plugin_sdk::export_plugin!(|api| {
+    // Capture the host's action trampoline before anything else can run:
+    // event handlers and the flush path both publish status through it.
+    let _ = HOST_RUNTIME.set(*api);
 
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            // Capture the host's action trampoline before anything else can run:
-            // event handlers and the flush path both publish status through it.
-            let _ = HOST_RUNTIME.set(HostRuntime {
-                runtime_action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            });
-
-            if let Some(register_event) = api.register_event_handler {
-                let handlers: &[(EventTag, EventHandlerFn)] = &[
-                    (EventTag::SessionStart, on_session_start),
-                    (EventTag::BeforeAgentStart, on_before_agent_start),
-                    (EventTag::Context, on_context),
-                    (EventTag::AgentStart, on_agent_start),
-                    (EventTag::BeforeProviderRequest, on_before_provider_request),
-                    (EventTag::MessageUpdate, on_message_update),
-                    (EventTag::MessageEnd, on_message_end),
-                    (EventTag::ToolExecutionStart, on_tool_execution_start),
-                    (EventTag::ToolExecutionEnd, on_tool_execution_end),
-                    (EventTag::SessionBeforeCompact, on_session_before_compact),
-                    (EventTag::SessionCompact, on_session_compact),
-                    (EventTag::SessionTree, on_session_tree),
-                    (EventTag::AgentSettled, on_agent_settled),
-                    (EventTag::SessionShutdown, on_session_shutdown),
-                ];
-                for &(tag, handler) in handlers {
-                    let rc = register_event(tag, handler, std::ptr::null_mut());
-                    if rc != 0 {
-                        return rc;
-                    }
-                }
-            }
-
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let schemas = [
-            (
-                "langfuse_score",
-                "Create or list Langfuse scores",
-                r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","list"]},"name":{"type":"string"},"value":{"type":["number","string","object"]},"traceId":{"type":"string"},"observationId":{"type":"string"},"comment":{"type":"string"},"userId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1}}}"#,
-            ),
-            (
-                "langfuse_prompt",
-                "Create, get, or list Langfuse prompts",
-                r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","get","list"]},"name":{"type":"string"},"prompt":{"type":"string"},"config":{"type":"object"},"version":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1}}}"#,
-            ),
-            (
-                "langfuse_trace",
-                "Query Langfuse traces (Langfuse v4 Observations API v2). 'get' returns every observation of one trace; 'list' returns one root observation per trace. 'update' is gone in v4.",
-                r#"{"type":"object","properties":{"action":{"type":"string","enum":["get","list"]},"id":{"type":"string","description":"trace id (action=get)"},"userId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}}"#,
-            ),
+    if let Some(register_event) = api.register_event_handler {
+        let handlers: &[(EventTag, EventHandlerFn)] = &[
+            (EventTag::SessionStart, on_session_start),
+            (EventTag::BeforeAgentStart, on_before_agent_start),
+            (EventTag::Context, on_context),
+            (EventTag::AgentStart, on_agent_start),
+            (EventTag::BeforeProviderRequest, on_before_provider_request),
+            (EventTag::MessageUpdate, on_message_update),
+            (EventTag::MessageEnd, on_message_end),
+            (EventTag::ToolExecutionStart, on_tool_execution_start),
+            (EventTag::ToolExecutionEnd, on_tool_execution_end),
+            (EventTag::SessionBeforeCompact, on_session_before_compact),
+            (EventTag::SessionCompact, on_session_compact),
+            (EventTag::SessionTree, on_session_tree),
+            (EventTag::AgentSettled, on_agent_settled),
+            (EventTag::SessionShutdown, on_session_shutdown),
         ];
-            for (name, desc, params) in schemas {
-                let schema = Box::new(StableToolSchema {
-                    name: StbString::from_string(name.into()),
-                    description: StbString::from_string(desc.into()),
-                    parameters: StbString::from_string(params.into()),
-                });
-                let execute = match name {
-                    "langfuse_score" => execute_score,
-                    "langfuse_prompt" => execute_prompt,
-                    "langfuse_trace" => execute_trace,
-                    _ => unreachable!(),
-                };
-                let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-                drop(schema);
-                if rc != 0 {
-                    return rc;
-                }
+        for &(tag, handler) in handlers {
+            let rc = register_event(tag, handler, std::ptr::null_mut());
+            if rc != 0 {
+                return rc;
             }
-            0
-        })
+        }
     }
-}
+
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let schemas = [
+    (
+        "langfuse_score",
+        "Create or list Langfuse scores",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","list"]},"name":{"type":"string"},"value":{"type":["number","string","object"]},"traceId":{"type":"string"},"observationId":{"type":"string"},"comment":{"type":"string"},"userId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1}}}"#,
+    ),
+    (
+        "langfuse_prompt",
+        "Create, get, or list Langfuse prompts",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["create","get","list"]},"name":{"type":"string"},"prompt":{"type":"string"},"config":{"type":"object"},"version":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1}}}"#,
+    ),
+    (
+        "langfuse_trace",
+        "Query Langfuse traces (Langfuse v4 Observations API v2). 'get' returns every observation of one trace; 'list' returns one root observation per trace. 'update' is gone in v4.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["get","list"]},"id":{"type":"string","description":"trace id (action=get)"},"userId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}}"#,
+    ),
+];
+    for (name, desc, params) in schemas {
+        let schema = Box::new(StableToolSchema {
+            name: StbString::from_string(name.into()),
+            description: StbString::from_string(desc.into()),
+            parameters: StbString::from_string(params.into()),
+        });
+        let execute = match name {
+            "langfuse_score" => execute_score,
+            "langfuse_prompt" => execute_prompt,
+            "langfuse_trace" => execute_trace,
+            _ => unreachable!(),
+        };
+        let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+        drop(schema);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
+});
 
 #[cfg(test)]
 mod tests {
@@ -3223,22 +3212,19 @@ mod tests {
     /// action. Capture what the plugin actually sends.
     static CAPTURED_STATUS: Mutex<Option<String>> = Mutex::new(None);
 
-    extern "C" fn mock_runtime_action(
-        action: u32,
-        args: StbStringRef,
-        out: *mut StbString,
-        _user_data: *mut c_void,
-    ) -> i32 {
+    rpi_plugin_sdk::string_handler! {
+    fn mock_runtime_action(action, args, out, _user_data) {
         if action == RUNTIME_ACTION_SET_STATUS {
             // SAFETY: the host's trampoline guarantees the borrow is valid for
             // the duration of this call, and we copy out of it immediately.
-            let text = unsafe { args.as_str() }.to_string();
+            let text = args.to_string();
             *CAPTURED_STATUS.lock().unwrap() = Some(text);
         }
-        if !out.is_null() {
-            unsafe { *out = StbString::empty() };
+        if out.is_available() {
+            out.clear();
         }
         0
+    }
     }
 
     extern "C" fn mock_free_string(_s: StbString) {}
@@ -3246,10 +3232,26 @@ mod tests {
     #[test]
     fn set_status_sends_the_host_action() {
         // Only this test installs the host runtime, so `set` is uncontended.
-        let _ = HOST_RUNTIME.set(HostRuntime {
+        let _ = HOST_RUNTIME.set(PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<PluginApi>() as u32,
             runtime_action: mock_runtime_action,
             free_string: mock_free_string,
             user_data: std::ptr::null_mut(),
+            register_tool: None,
+            register_command: None,
+            register_shortcut: None,
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: None,
+            register_resources_discover: None,
+            dispatch_event: None,
+            declare: None,
+            register_before_agent_start: None,
+            register_oauth_provider: None,
         });
         set_status("langfuse ✓ (trace sent)");
         let captured = CAPTURED_STATUS

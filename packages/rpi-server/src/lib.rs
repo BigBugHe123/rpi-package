@@ -1,10 +1,12 @@
+#![forbid(unsafe_code)]
+
 mod server;
 mod transport;
 
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, EventTag, FreeStringFn, PluginApi, RuntimeActionFn, RuntimeActionId,
-    StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    ToolPartialCb,
+    EventTag, FreeStringFn, RuntimeActionFn, RuntimeActionId, StablePluginEvent, StableToolSchema,
+    StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use server::{generate_token, launch_args, run_server, TcpServerHandle};
@@ -71,9 +73,10 @@ fn get_cli_flag(name: &str) -> Option<Value> {
     result.get("value").cloned()
 }
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     receiver: mpsc::Receiver<Result<String, String>>,
-    cancelled: Arc<AtomicBool>,
     done: bool,
 }
 
@@ -553,11 +556,13 @@ extern "C" fn execute_server(
             });
         let _ = tx.send(result);
     });
-    Box::into_raw(Box::new(Drive {
-        receiver: rx,
+    HANDLES.insert_with_cancel(
+        Drive {
+            receiver: rx,
+            done: false,
+        },
         cancelled,
-        done: false,
-    })) as StepHandle
+    )
 }
 
 extern "C" fn execute_client(
@@ -577,11 +582,13 @@ extern "C" fn execute_client(
             .and_then(|p| client_tool(&p, &cancelled_clone));
         let _ = tx.send(result);
     });
-    Box::into_raw(Box::new(Drive {
-        receiver: rx,
+    HANDLES.insert_with_cancel(
+        Drive {
+            receiver: rx,
+            done: false,
+        },
         cancelled,
-        done: false,
-    })) as StepHandle
+    )
 }
 
 extern "C" fn poll(
@@ -592,13 +599,18 @@ extern "C" fn poll(
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
     if drive.done {
         return StepResult::err(StbString::from_string(
             "handle polled after completion".into(),
         ));
     }
-    if drive.cancelled.load(Ordering::Acquire) {
+    if entry.cancelled.load(Ordering::Acquire) {
         drive.done = true;
         return StepResult::err(StbString::from_string("request cancelled".into()));
     }
@@ -624,32 +636,14 @@ extern "C" fn poll(
 }
 
 extern "C" fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            (&*(handle as *mut Drive))
-                .cancelled
-                .store(true, Ordering::Release);
-        }
-    }
+    HANDLES.cancel(handle);
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            let drive = Box::from_raw(handle as *mut Drive);
-            drive.cancelled.store(true, Ordering::Release);
-        }
-    }
+    drop(HANDLES.remove(handle));
 }
 
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let bytes = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(bytes as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -703,93 +697,87 @@ const CLIENT_PARAMETERS: &str = r#"{
 }"#;
 
 // ── Plugin entry ──────────────────────────────────────────────────────────────
+rpi_plugin_sdk::export_plugin!(|api| {
+    // Copy the host function pointers/handles OUT of the vtable during
+    // register — the `api` pointer is only valid for this call.
+    let _ = RUNTIME_ACTION.set(api.runtime_action);
+    RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
+    let _ = HOST_FREE_STRING.set(api.free_string);
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
 
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            // Copy the host function pointers/handles OUT of the vtable during
-            // register — the `api` pointer is only valid for this call.
-            let _ = RUNTIME_ACTION.set(api.runtime_action);
-            RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
-            let _ = HOST_FREE_STRING.set(api.free_string);
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
+    let server_schema = Box::new(StableToolSchema {
+        name: StbString::from_string("rpc_server".into()),
+        description: StbString::from_string(
+            "Start and manage a TCP JSONL server with streaming subscriptions.".into(),
+        ),
+        parameters: StbString::from_string(SERVER_PARAMETERS.into()),
+    });
 
-            let server_schema = Box::new(StableToolSchema {
-                name: StbString::from_string("rpc_server".into()),
-                description: StbString::from_string(
-                    "Start and manage a TCP JSONL server with streaming subscriptions.".into(),
-                ),
-                parameters: StbString::from_string(SERVER_PARAMETERS.into()),
-            });
+    let client_schema = Box::new(StableToolSchema {
+    name: StbString::from_string("rpc_client".into()),
+    description: StbString::from_string(
+        "Send a JSON-RPC request to a running TCP server. Set subscribe=true for streaming responses.".into(),
+    ),
+    parameters: StbString::from_string(CLIENT_PARAMETERS.into()),
+});
 
-            let client_schema = Box::new(StableToolSchema {
-            name: StbString::from_string("rpc_client".into()),
-            description: StbString::from_string(
-                "Send a JSON-RPC request to a running TCP server. Set subscribe=true for streaming responses.".into(),
-            ),
-            parameters: StbString::from_string(CLIENT_PARAMETERS.into()),
-        });
+    let first = register(
+        &*server_schema,
+        execute_server,
+        poll,
+        cancel,
+        destroy,
+        free_string,
+    );
 
-            let first = register(
-                &*server_schema,
-                execute_server,
-                poll,
-                cancel,
-                destroy,
-                free_string,
-            );
+    let second = if first == 0 {
+        register(
+            &*client_schema,
+            execute_client,
+            poll,
+            cancel,
+            destroy,
+            free_string,
+        )
+    } else {
+        first
+    };
 
-            let second = if first == 0 {
+    let third = if second == 0 {
+        api.register_event_handler
+            .map(|register| {
                 register(
-                    &*client_schema,
-                    execute_client,
-                    poll,
-                    cancel,
-                    destroy,
-                    free_string,
+                    EventTag::SessionShutdown,
+                    on_session_shutdown,
+                    std::ptr::null_mut(),
                 )
-            } else {
-                first
-            };
+            })
+            .unwrap_or(0)
+    } else {
+        second
+    };
 
-            let third = if second == 0 {
-                api.register_event_handler
-                    .map(|register| {
-                        register(
-                            EventTag::SessionShutdown,
-                            on_session_shutdown,
-                            std::ptr::null_mut(),
-                        )
-                    })
-                    .unwrap_or(0)
-            } else {
-                second
-            };
+    // Register SessionStart handler to auto-start server when --server flag is passed
+    let fourth = if third == 0 {
+        api.register_event_handler
+            .map(|register| {
+                register(
+                    EventTag::SessionStart,
+                    on_session_start,
+                    std::ptr::null_mut(),
+                )
+            })
+            .unwrap_or(0)
+    } else {
+        third
+    };
 
-            // Register SessionStart handler to auto-start server when --server flag is passed
-            let fourth = if third == 0 {
-                api.register_event_handler
-                    .map(|register| {
-                        register(
-                            EventTag::SessionStart,
-                            on_session_start,
-                            std::ptr::null_mut(),
-                        )
-                    })
-                    .unwrap_or(0)
-            } else {
-                third
-            };
-
-            drop(server_schema);
-            drop(client_schema);
-            fourth
-        })
-    }
-}
+    drop(server_schema);
+    drop(client_schema);
+    fourth
+});
 
 #[cfg(test)]
 mod tests {

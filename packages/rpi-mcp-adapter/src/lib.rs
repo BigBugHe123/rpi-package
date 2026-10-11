@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod config;
 mod connection;
 mod control;
@@ -80,13 +82,13 @@ extern "C" fn tool_poll(
     callback: Option<rpi_plugin_sdk::ToolPartialCb>,
     data: *mut std::ffi::c_void,
 ) -> rpi_plugin_sdk::StepResult {
-    unsafe { kit::poll(handle, callback, data) }
+    kit::poll(handle, callback, data)
 }
 extern "C" fn tool_cancel(handle: rpi_plugin_sdk::StepHandle) {
-    unsafe { kit::cancel(handle) }
+    kit::cancel(handle)
 }
 extern "C" fn tool_destroy(handle: rpi_plugin_sdk::StepHandle) {
-    unsafe { kit::destroy(handle) }
+    kit::destroy(handle)
 }
 extern "C" fn session_shutdown(
     _: rpi_plugin_sdk::StablePluginEvent,
@@ -96,54 +98,48 @@ extern "C" fn session_shutdown(
         .map(|_| 0)
         .unwrap_or(1)
 }
-/// # Safety
-/// The host must pass a valid PluginApi pointer for this ABI version.
-#[no_mangle]
-pub unsafe extern "C" fn rpi_plugin_register(api: *const rpi_plugin_sdk::PluginApi) -> i32 {
-    unsafe {
-        rpi_plugin_sdk::register_entrypoint(api, |api| {
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            // A reload must not leave old workers or sessions owned by this DLL.
-            shutdown_connections();
-            let tools: [(&str, &str, &str, rpi_plugin_sdk::ToolExecuteFn); 3] = [
-            ("mcp_request", "Send a raw HTTP JSON-RPC request. For managed MCP sessions use mcp_call or mcp_list.",
-             r#"{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"},"params":{},"id":{"type":["string","integer"]},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"required":["url","method"]}"#, request_execute),
-            ("mcp_call", "Call a tool using a persistent stdio or HTTP MCP connection. Use mcp_list to discover tool names and argument schemas. Supply configPath and server, or url.",
-             r#"{"type":"object","properties":{"url":{"type":"string"},"configPath":{"type":"string"},"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"required":["tool"],"oneOf":[{"required":["configPath","server"],"not":{"required":["url"]}},{"required":["url"],"not":{"anyOf":[{"required":["configPath"]},{"required":["server"]}]}}]}"#, call_execute),
-            ("mcp_list", "List configured MCP servers, or discover a server's tools and argument schemas. Set action=close to release a server connection. Supply configPath, configPath/server, or url.",
-             r#"{"type":"object","properties":{"url":{"type":"string"},"configPath":{"type":"string"},"server":{"type":"string"},"action":{"type":"string","enum":["list","close"]},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"oneOf":[{"required":["configPath"],"not":{"required":["url"]}},{"required":["url"],"not":{"anyOf":[{"required":["configPath"]},{"required":["server"]}]}}]}"#, list_execute),
-        ];
-            for (name, description, parameters, execute) in tools {
-                let schema = kit::schema(name, description, parameters);
-                let rc = register(
-                    &schema,
-                    execute,
-                    tool_poll,
-                    tool_cancel,
-                    tool_destroy,
-                    kit::plugin_free_string,
-                );
-                // The registrar consumes schema strings via plugin_free_string.
-                // Only the stack schema container remains ours after this call.
-                if rc != 0 {
-                    return rc;
-                }
-            }
-            // SessionShutdown is a marker without session identity: release all connections
-            // in this extension instance, including library-scope fallback connections.
-            if let Some(register) = api.register_event_handler {
-                return register(
-                    rpi_plugin_sdk::EventTag::SessionShutdown,
-                    session_shutdown,
-                    std::ptr::null_mut(),
-                );
-            }
-            0
-        })
+// The SDK entrypoint validates the API and contains registration panics.
+rpi_plugin_sdk::export_plugin!(|api| {
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    // A reload must not leave old workers or sessions owned by this DLL.
+    shutdown_connections();
+    let tools: [(&str, &str, &str, rpi_plugin_sdk::ToolExecuteFn); 3] = [
+    ("mcp_request", "Send a raw HTTP JSON-RPC request. For managed MCP sessions use mcp_call or mcp_list.",
+     r#"{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"},"params":{},"id":{"type":["string","integer"]},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"required":["url","method"]}"#, request_execute),
+    ("mcp_call", "Call a tool using a persistent stdio or HTTP MCP connection. Use mcp_list to discover tool names and argument schemas. Supply configPath and server, or url.",
+     r#"{"type":"object","properties":{"url":{"type":"string"},"configPath":{"type":"string"},"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"required":["tool"],"oneOf":[{"required":["configPath","server"],"not":{"required":["url"]}},{"required":["url"],"not":{"anyOf":[{"required":["configPath"]},{"required":["server"]}]}}]}"#, call_execute),
+    ("mcp_list", "List configured MCP servers, or discover a server's tools and argument schemas. Set action=close to release a server connection. Supply configPath, configPath/server, or url.",
+     r#"{"type":"object","properties":{"url":{"type":"string"},"configPath":{"type":"string"},"server":{"type":"string"},"action":{"type":"string","enum":["list","close"]},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}},"oneOf":[{"required":["configPath"],"not":{"required":["url"]}},{"required":["url"],"not":{"anyOf":[{"required":["configPath"]},{"required":["server"]}]}}]}"#, list_execute),
+];
+    for (name, description, parameters, execute) in tools {
+        let schema = kit::schema(name, description, parameters);
+        let rc = register(
+            &schema,
+            execute,
+            tool_poll,
+            tool_cancel,
+            tool_destroy,
+            kit::plugin_free_string,
+        );
+        // The registrar consumes schema strings via plugin_free_string.
+        // Only the stack schema container remains ours after this call.
+        if rc != 0 {
+            return rc;
+        }
     }
-}
+    // SessionShutdown is a marker without session identity: release all connections
+    // in this extension instance, including library-scope fallback connections.
+    if let Some(register) = api.register_event_handler {
+        return register(
+            rpi_plugin_sdk::EventTag::SessionShutdown,
+            session_shutdown,
+            std::ptr::null_mut(),
+        );
+    }
+    0
+});
 
 #[cfg(test)]
 mod tests {

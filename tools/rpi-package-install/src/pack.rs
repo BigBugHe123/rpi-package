@@ -53,12 +53,9 @@ pub fn run(opts: &Options) -> Result<Outcome> {
         quiet: true,
     })?;
 
-    for extra in ["README.md"] {
-        let from = workspace_root.join(extra);
-        if from.is_file() {
-            std::fs::copy(&from, stage_dir.join(extra))
-                .with_context(|| format!("cannot stage {extra}"))?;
-        }
+    let readme = workspace_root.join("README.md");
+    if readme.is_file() {
+        std::fs::copy(&readme, stage_dir.join("README.md")).context("cannot stage README.md")?;
     }
     let catalog = crate::catalog::default_path(&workspace_root);
     if catalog.is_file() {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 fn main() {

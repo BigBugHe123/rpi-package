@@ -4,18 +4,20 @@
 //! This file is intentionally vendored so the crate can be published and built
 //! independently before any other package in this workspace exists on crates.io.
 
+use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use rpi_plugin_sdk::{FreeStringFn, StbString, StepHandle, StepResult, ToolPartialCb};
 use serde_json::Value;
 
 pub type Builder = fn(&Value) -> Result<String, String>;
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
     builder: Builder,
-    cancelled: AtomicBool,
     completed: bool,
 }
 
@@ -27,20 +29,24 @@ pub fn execute(
     let text = params.to_string_lossy();
     params.free_with(free_params);
     let params = serde_json::from_str(&text).unwrap_or(Value::Null);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params,
         builder,
-        cancelled: AtomicBool::new(false),
         completed: false,
-    })) as StepHandle
+    })
 }
 
-pub unsafe fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
+pub fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null package handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
-    if drive.cancelled.load(Ordering::SeqCst) {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
+    if entry.cancelled.load(Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("package tool cancelled".into()));
     }
     if drive.completed {
@@ -55,18 +61,12 @@ pub unsafe fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
     }
 }
 
-pub unsafe fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe { &*(handle as *mut Drive) }
-            .cancelled
-            .store(true, Ordering::SeqCst);
-    }
+pub fn cancel(handle: StepHandle) {
+    HANDLES.cancel(handle);
 }
 
-pub unsafe fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe { drop(Box::from_raw(handle as *mut Drive)) };
-    }
+pub fn destroy(handle: StepHandle) {
+    drop(HANDLES.remove(handle));
 }
 
 fn tool_result(text: &str) -> String {
@@ -81,15 +81,7 @@ pub fn schema(name: &str, description: &str, parameters: &str) -> rpi_plugin_sdk
     }
 }
 
-pub extern "C" fn plugin_free_string(s: StbString) {
-    if s.is_empty() || s.ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-        let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-    }
-}
+pub use rpi_plugin_sdk::callbacks::free_string as plugin_free_string;
 
 pub fn string_param(params: &Value, name: &str) -> Result<String, String> {
     params
@@ -123,37 +115,31 @@ macro_rules! export_single_tool_plugin {
             callback: Option<rpi_plugin_sdk::ToolPartialCb>,
             user_data: *mut std::ffi::c_void,
         ) -> rpi_plugin_sdk::StepResult {
-            unsafe { $crate::kit::poll(handle, callback, user_data) }
+            $crate::kit::poll(handle, callback, user_data)
         }
 
         extern "C" fn package_cancel(handle: rpi_plugin_sdk::StepHandle) {
-            unsafe { $crate::kit::cancel(handle) }
+            $crate::kit::cancel(handle)
         }
 
         extern "C" fn package_destroy(handle: rpi_plugin_sdk::StepHandle) {
-            unsafe { $crate::kit::destroy(handle) }
+            $crate::kit::destroy(handle)
         }
-
-        #[no_mangle]
-        pub extern "C" fn rpi_plugin_register(api: *const rpi_plugin_sdk::PluginApi) -> i32 {
-            unsafe {
-                rpi_plugin_sdk::register_entrypoint(api, |api| {
-                    let Some(register) = api.register_tool else {
-                        return 1;
-                    };
-                    let schema = Box::new($crate::kit::schema($name, $description, $parameters));
-                    let rc = register(
-                        &*schema,
-                        package_execute,
-                        package_poll,
-                        package_cancel,
-                        package_destroy,
-                        $crate::kit::plugin_free_string,
-                    );
-                    drop(schema);
-                    rc
-                })
-            }
-        }
+        rpi_plugin_sdk::export_plugin!(|api| {
+            let Some(register) = api.register_tool else {
+                return 1;
+            };
+            let schema = Box::new($crate::kit::schema($name, $description, $parameters));
+            let rc = register(
+                &*schema,
+                package_execute,
+                package_poll,
+                package_cancel,
+                package_destroy,
+                $crate::kit::plugin_free_string,
+            );
+            drop(schema);
+            rc
+        });
     };
 }

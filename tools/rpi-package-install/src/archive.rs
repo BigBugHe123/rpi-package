@@ -14,14 +14,27 @@ use crate::platform;
 ///
 /// The format follows the file extension: `.zip`, else gzip-compressed tar.
 pub fn create(stage: &Path, name: &str, out: &Path) -> Result<()> {
+    create_tree(stage, Some(name), out)
+}
+
+/// Create `out` from the *contents* of `stage`, with no wrapping directory.
+///
+/// The ACP Registry resolves an agent's `cmd` relative to the archive root
+/// (e.g. `./goose`), so agent archives keep the binary at the top level
+/// instead of under a `rpi-acp-<platform>/` directory.
+pub fn create_flat(stage: &Path, out: &Path) -> Result<()> {
+    create_tree(stage, None, out)
+}
+
+fn create_tree(stage: &Path, prefix: Option<&str>, out: &Path) -> Result<()> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
     if platform::is_zip(out) {
-        create_zip(stage, name, out)
+        create_zip(stage, prefix, out)
     } else {
-        create_tar_gz(stage, name, out)
+        create_tar_gz(stage, prefix, out)
     }
 }
 
@@ -38,7 +51,7 @@ pub fn extract(archive: &Path, dest: &Path) -> Result<()> {
     }
 }
 
-fn create_zip(stage: &Path, name: &str, out: &Path) -> Result<()> {
+fn create_zip(stage: &Path, prefix: Option<&str>, out: &Path) -> Result<()> {
     let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
     let mut writer = zip::ZipWriter::new(file);
     let mut entries = Vec::new();
@@ -46,7 +59,11 @@ fn create_zip(stage: &Path, name: &str, out: &Path) -> Result<()> {
     entries.sort();
     for relative in entries {
         let path = stage.join(&relative);
-        let stored = format!("{name}/{}", relative.to_string_lossy().replace('\\', "/"));
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let stored = match prefix {
+            Some(name) => format!("{name}/{relative}"),
+            None => relative,
+        };
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(unix_mode(&path));
@@ -79,13 +96,35 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_tar_gz(stage: &Path, name: &str, out: &Path) -> Result<()> {
+fn create_tar_gz(stage: &Path, prefix: Option<&str>, out: &Path) -> Result<()> {
     let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
-    builder
-        .append_dir_all(name, stage)
-        .with_context(|| format!("cannot add {} to the archive", stage.display()))?;
+    match prefix {
+        Some(name) => {
+            builder
+                .append_dir_all(name, stage)
+                .with_context(|| format!("cannot add {} to the archive", stage.display()))?;
+        }
+        None => {
+            let mut entries = Vec::new();
+            collect(stage, &mut entries)?;
+            entries.sort();
+            for relative in entries {
+                let path = stage.join(&relative);
+                let name = relative.to_string_lossy().replace('\\', "/");
+                if path.is_dir() {
+                    builder
+                        .append_dir(&name, &path)
+                        .with_context(|| format!("cannot add {name}"))?;
+                } else {
+                    builder
+                        .append_path_with_name(&path, &name)
+                        .with_context(|| format!("cannot add {name}"))?;
+                }
+            }
+        }
+    }
     builder
         .into_inner()
         .context("cannot finalize tar")?
@@ -186,6 +225,24 @@ mod tests {
     #[test]
     fn zip_round_trip() {
         round_trip("zip", "out.zip");
+    }
+
+    #[test]
+    fn flat_archive_keeps_entries_at_the_root() {
+        let (base, stage) = fixture("flat");
+        let archive = base.join("flat.tar.gz");
+        create_flat(&stage, &archive).unwrap();
+
+        // No `stage/` wrapper: `a.txt` is at the archive root, which is where
+        // the registry's `cmd` (e.g. `./rpi-acp-bridge`) expects the binary.
+        let dest = base.join("flat-out");
+        extract(&archive, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(dest.join("nested").join("b.txt")).unwrap(),
+            b"beta"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

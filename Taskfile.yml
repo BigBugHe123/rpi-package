@@ -45,6 +45,12 @@ tasks:
     cmds:
       - cargo run --release -p rpi-package-install -- pack --no-archive
 
+  pack-acp:
+    desc: Package the standalone rpi-acp bridge binary for the ACP Registry
+    cmds:
+      - cargo build --release -p rpi-acp --bin rpi-acp-bridge
+      - cargo run --release -p rpi-package-install -- pack-acp
+
   smoke:
     desc: Load all built packages through the pi-rust extension loader
     deps: [build]
@@ -69,6 +75,8 @@ tasks:
       - cargo publish --dry-run --allow-dirty -p rpi-webfetch
       - cargo publish --dry-run --allow-dirty -p rpi-im-message
       - cargo publish --dry-run --allow-dirty -p rpi-server
+      - cargo publish --dry-run --allow-dirty -p rpi-acp
+      - cargo publish --dry-run --allow-dirty -p rpi-permission-gate
       - cargo publish --dry-run --allow-dirty -p rpi-voice
       - cargo publish --dry-run --allow-dirty -p rpi-run-stats
 

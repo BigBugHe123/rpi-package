@@ -1,0 +1,45 @@
+{
+  "id": "rpi-acp",
+  "name": "rpi",
+  "version": "0.1.0",
+  "description": "Rust coding agent (rpi) exposed over the Agent Client Protocol",
+  "repository": "https://github.com/pi-rust/rpi-package",
+  "website": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-acp",
+  "authors": ["BigFish"],
+  "license": "MIT",
+  "license_url": "https://github.com/pi-rust/rpi-package/blob/main/LICENSE",
+  "distribution": {
+    "binary": {
+      "linux-x86_64": {
+        "archive": "<release-url>/rpi-acp-linux-x86_64.tar.gz",
+        "cmd": "./rpi-acp-bridge",
+        "args": [],
+        "sha256": "REPLACE_WITH_SHA256"
+      },
+      "linux-aarch64": {
+        "archive": "<release-url>/rpi-acp-linux-aarch64.tar.gz",
+        "cmd": "./rpi-acp-bridge",
+        "args": [],
+        "sha256": "REPLACE_WITH_SHA256"
+      },
+      "darwin-x86_64": {
+        "archive": "<release-url>/rpi-acp-macos-x86_64.tar.gz",
+        "cmd": "./rpi-acp-bridge",
+        "args": [],
+        "sha256": "REPLACE_WITH_SHA256"
+      },
+      "darwin-aarch64": {
+        "archive": "<release-url>/rpi-acp-macos-aarch64.tar.gz",
+        "cmd": "./rpi-acp-bridge",
+        "args": [],
+        "sha256": "REPLACE_WITH_SHA256"
+      },
+      "windows-x86_64": {
+        "archive": "<release-url>/rpi-acp-windows-x86_64.zip",
+        "cmd": "./rpi-acp-bridge.exe",
+        "args": [],
+        "sha256": "REPLACE_WITH_SHA256"
+      }
+    }
+  }
+}

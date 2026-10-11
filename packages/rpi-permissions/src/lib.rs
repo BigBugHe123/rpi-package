@@ -1,16 +1,19 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, FreeStringFn, PluginApi, StableToolSchema, StbString, StbStringRef,
-    StepHandle, StepResult, ToolPartialCb,
+    FreeStringFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
     params: Value,
-    cancelled: AtomicBool,
     done: bool,
 }
 #[derive(Default, Clone, Debug)]
@@ -232,18 +235,22 @@ extern "C" fn execute(
 ) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
-        cancelled: AtomicBool::new(false),
         done: false,
-    })) as StepHandle
+    })
 }
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null permissions handle".into()));
     }
-    let d = unsafe { &mut *(handle as *mut Drive) };
-    if d.cancelled.load(Ordering::SeqCst) {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut d = entry.lock();
+    if entry.cancelled.load(Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("permissions cancelled".into()));
     }
     if d.done {
@@ -260,43 +267,21 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
     }
 }
 extern "C" fn cancel(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            (&*(h as *mut Drive))
-                .cancelled
-                .store(true, Ordering::SeqCst);
-        }
-    }
+    HANDLES.cancel(h);
 }
 extern "C" fn destroy(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            drop(Box::from_raw(h as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(h));
 }
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let b = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(b as *const [u8] as *mut [u8]);
-        }
-    }
-}
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let schema=Box::new(StableToolSchema{name:StbString::from_string("permissions".into()),description:StbString::from_string("Check and manage native Pi allow/deny rules for tool calls.".into()),parameters:StbString::from_string(r#"{"type":"object","properties":{"action":{"type":"string","enum":["check","grant","revoke","list"]},"tool":{"type":"string","description":"Pi tool name, such as Bash, Read, Write, or Edit"},"value":{"type":"string","description":"Command or path to evaluate"},"rule":{"type":"string","description":"Rule such as Bash(git push *)"},"capability":{"type":"string","description":"Legacy alias for value/rule"},"effect":{"type":"string","enum":["allow","deny"]},"cwd":{"type":"string"}},"required":["action"]}"#.into())});
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            rc
-        })
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
+rpi_plugin_sdk::export_plugin!(|api| {
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let schema=Box::new(StableToolSchema{name:StbString::from_string("permissions".into()),description:StbString::from_string("Check and manage native Pi allow/deny rules for tool calls.".into()),parameters:StbString::from_string(r#"{"type":"object","properties":{"action":{"type":"string","enum":["check","grant","revoke","list"]},"tool":{"type":"string","description":"Pi tool name, such as Bash, Read, Write, or Edit"},"value":{"type":"string","description":"Command or path to evaluate"},"rule":{"type":"string","description":"Rule such as Bash(git push *)"},"capability":{"type":"string","description":"Legacy alias for value/rule"},"effect":{"type":"string","enum":["allow","deny"]},"cwd":{"type":"string"}},"required":["action"]}"#.into())});
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    rc
+});
 #[cfg(test)]
 mod tests {
     use super::*;

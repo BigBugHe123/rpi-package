@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use rpi_mcp_adapter::{call_from_config, discover_from_config};
 use serde_json::json;
 use std::fs;
@@ -229,10 +231,6 @@ fn timeout_error_includes_server_stderr() {
 #[cfg(windows)]
 #[test]
 fn timeout_kills_descendants_holding_inherited_pipes() {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
     let mut transport = rpi_mcp_adapter::StdioTransport::start(
         env!("CARGO_BIN_EXE_fake_mcp_server"),
         &["--spawn-child".into()],
@@ -256,13 +254,8 @@ fn timeout_kills_descendants_holding_inherited_pipes() {
         .trim()
         .parse()
         .unwrap();
-    unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if !process.is_null() {
-            let mut exit = 259; // STILL_ACTIVE
-            assert_ne!(GetExitCodeProcess(process, &mut exit), 0);
-            CloseHandle(process);
-            assert_ne!(exit, 259, "MCP descendant survived transport shutdown");
-        }
-    }
+    assert!(
+        !rpi_plugin_sdk::process::process_is_running(pid).unwrap(),
+        "MCP descendant survived transport shutdown"
+    );
 }

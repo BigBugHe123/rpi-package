@@ -1,7 +1,9 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId,
-    StablePluginEvent, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    ToolPartialCb,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId, StableToolSchema,
+    StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -9,14 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 const TOOL: &str = "todo";
 
-#[derive(Clone, Copy)]
-struct Runtime {
-    action: rpi_plugin_sdk::RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
-}
-unsafe impl Send for Runtime {}
-unsafe impl Sync for Runtime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type Runtime = PluginApi;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static TODOS: OnceLock<Mutex<TodoState>> = OnceLock::new();
@@ -44,7 +40,7 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     let mut out = StbString::empty();
     let input_json = args.to_string();
     let input = StbStringRef::from_str(&input_json);
-    let rc = (runtime.action)(id.into(), input, &mut out, runtime.user_data);
+    let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
     let text = out.to_string_lossy();
     (runtime.free_string)(out);
     if rc != 0 {
@@ -112,13 +108,14 @@ fn restore_from_branch() {
     *state().lock().unwrap_or_else(|p| p.into_inner()) = restored;
 }
 
-extern "C" fn handle_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
-    match event.tag {
+rpi_plugin_sdk::event_handler! {
+fn handle_event(event, _user_data) {
+    match event.tag() {
         EventTag::SessionStart | EventTag::SessionTree => restore_from_branch(),
-        EventTag::ToolResult => unsafe {
-            let payload = event.payload.tool_result;
-            if payload.tool_name.to_string_lossy() == TOOL {
-                if let Ok(result) = serde_json::from_str::<Value>(&payload.result.to_string_lossy())
+        EventTag::ToolResult => {
+            let Some(payload) = event.tool_result() else { return 0; };
+            if payload.tool_name == TOOL {
+                if let Ok(result) = serde_json::from_str::<Value>(&payload.result)
                 {
                     if let Some(next) = parse_todos(result.get("details").unwrap_or(&Value::Null)) {
                         *state().lock().unwrap_or_else(|p| p.into_inner()) = next;
@@ -129,6 +126,7 @@ extern "C" fn handle_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
         _ => {}
     }
     0
+}
 }
 
 fn render(state: &TodoState, include_done: bool) -> String {
@@ -253,10 +251,11 @@ fn todo(params: &Value) -> Result<String, String> {
     }
 }
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
     done: bool,
-    cancelled: bool,
 }
 extern "C" fn execute(
     _: StbStringRef,
@@ -265,18 +264,22 @@ extern "C" fn execute(
 ) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
-        cancelled: false,
-    })) as StepHandle
+    })
 }
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null todo handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
-    if drive.cancelled {
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
+    if entry.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("todo cancelled".into()));
     }
     if drive.done {
@@ -291,85 +294,56 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
     }
 }
 extern "C" fn cancel(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            (*(handle as *mut Drive)).cancelled = true;
-        }
-    }
+    HANDLES.cancel(handle);
 }
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(handle));
 }
-extern "C" fn free_string(value: StbString) {
-    if !value.is_empty() && !value.ptr.is_null() {
-        unsafe {
-            let slice = std::slice::from_raw_parts(value.ptr as *const u8, value.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
-extern "C" fn command(args: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::string_handler! {
+fn command(args, out, _user_data) {
     let text = render(&state().lock().unwrap_or_else(|p| p.into_inner()), true);
-    if out.is_null() {
+    if !out.is_available() {
         return 1;
     }
     let _ = args;
-    unsafe {
-        *out = StbString::from_string(json!({"kind":"message","text":text}).to_string());
-    }
+    out.write(json!({"kind":"message","text":text}).to_string());
     0
 }
-
-#[no_mangle]
-/// # Safety
-/// The host must provide a valid ABI-compatible API for the duration of registration.
-pub unsafe extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let _ = RUNTIME.set(Runtime {
-                action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            });
-            if let Some(register_event) = api.register_event_handler {
-                for tag in [
-                    EventTag::SessionStart,
-                    EventTag::SessionTree,
-                    EventTag::ToolResult,
-                ] {
-                    if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut())
-                        != 0
-                    {
-                        return 1;
-                    }
-                }
-            }
-            if let Some(register_command) = api.register_command {
-                let _ = register_command(
-                    StbStringRef::from_str("todos"),
-                    StbStringRef::from_str("Show todos on the current session branch"),
-                    command,
-                );
-            }
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let schema = Box::new(StableToolSchema {
-            name: StbString::from_string(TOOL.into()),
-            description: StbString::from_string("Manage one session task list. Actions: list, add (text), update (id, status: pending/in_progress/completed), toggle (id), clear. Mark the task you are working on in_progress and completed when finished.".into()),
-            parameters: StbString::from_string(r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","add","update","toggle","clear"]},"text":{"type":"string"},"id":{"type":"integer"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"includeDone":{"type":"boolean"}},"required":["action"]}"#.into()),
-        });
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            rc
-        })
-    }
 }
+rpi_plugin_sdk::export_plugin!(|api| {
+    let _ = RUNTIME.set(*api);
+    if let Some(register_event) = api.register_event_handler {
+        for tag in [
+            EventTag::SessionStart,
+            EventTag::SessionTree,
+            EventTag::ToolResult,
+        ] {
+            if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut()) != 0 {
+                return 1;
+            }
+        }
+    }
+    if let Some(register_command) = api.register_command {
+        let _ = register_command(
+            StbStringRef::from_str("todos"),
+            StbStringRef::from_str("Show todos on the current session branch"),
+            command,
+        );
+    }
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let schema = Box::new(StableToolSchema {
+    name: StbString::from_string(TOOL.into()),
+    description: StbString::from_string("Manage one session task list. Actions: list, add (text), update (id, status: pending/in_progress/completed), toggle (id), clear. Mark the task you are working on in_progress and completed when finished.".into()),
+    parameters: StbString::from_string(r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","add","update","toggle","clear"]},"text":{"type":"string"},"id":{"type":"integer"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"includeDone":{"type":"boolean"}},"required":["action"]}"#.into()),
+});
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    rc
+});
 
 #[cfg(test)]
 mod tests {

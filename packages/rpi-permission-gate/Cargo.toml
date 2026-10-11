@@ -1,0 +1,18 @@
+[package]
+name = "rpi-permission-gate"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tool-call permission gate extension for rpi — confirm dangerous bash/write/edit calls via the host UI dialog"
+readme = "README.md"
+keywords = ["rpi", "permission", "tool-call", "extension", "approval"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-plugin-sdk = { workspace = true }
+serde_json = { workspace = true }

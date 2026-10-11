@@ -1,15 +1,18 @@
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    register_entrypoint, FreeStringFn, PluginApi, StableToolSchema, StbString, StbStringRef,
-    StepHandle, StepResult, ToolPartialCb,
+    FreeStringFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use url::Url;
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
-    cancelled: AtomicBool,
     done: bool,
 }
 fn search(p: &Value) -> Result<String, String> {
@@ -129,18 +132,22 @@ extern "C" fn execute(
 ) -> StepHandle {
     let t = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&t).unwrap_or(Value::Null),
-        cancelled: AtomicBool::new(false),
         done: false,
-    })) as StepHandle
+    })
 }
 extern "C" fn poll(h: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if h.is_null() {
         return StepResult::err(StbString::from_string("null websearch handle".into()));
     }
-    let d = unsafe { &mut *(h as *mut Drive) };
-    if d.cancelled.load(Ordering::SeqCst) {
+    let Some(entry) = HANDLES.get(h) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut d = entry.lock();
+    if entry.cancelled.load(Ordering::SeqCst) {
         return StepResult::err(StbString::from_string("websearch cancelled".into()));
     }
     if d.done {
@@ -179,43 +186,21 @@ extern "C" fn poll(h: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> S
     }
 }
 extern "C" fn cancel(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            (&*(h as *mut Drive))
-                .cancelled
-                .store(true, Ordering::SeqCst);
-        }
-    }
+    HANDLES.cancel(h);
 }
 extern "C" fn destroy(h: StepHandle) {
-    if !h.is_null() {
-        unsafe {
-            drop(Box::from_raw(h as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(h));
 }
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let b = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(b as *const [u8] as *mut [u8]);
-        }
-    }
-}
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let schema=Box::new(StableToolSchema{name:StbString::from_string("websearch".into()),description:StbString::from_string("Search public web references with DuckDuckGo.".into()),parameters:StbString::from_string(r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"required":["query"]}"#.into())});
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            rc
-        })
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
+rpi_plugin_sdk::export_plugin!(|api| {
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let schema=Box::new(StableToolSchema{name:StbString::from_string("websearch".into()),description:StbString::from_string("Search public web references with DuckDuckGo.".into()),parameters:StbString::from_string(r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"required":["query"]}"#.into())});
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    rc
+});
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -57,12 +57,43 @@ fn update(f: impl FnOnce(&mut Pet)) {
     let pet = guard.get_or_insert_with(Pet::default);
     f(pet);
     if let Some(runtime) = RUNTIME_CTX.get() {
-        let panel = if pet.enabled {
-            panel_spec(pet)
-        } else {
-            Value::Null
-        };
-        let _ = runtime.action(RuntimeActionId::SetStatus, json!({"key":KEY,"panel":panel}));
+        static REGISTERED: AtomicBool = AtomicBool::new(false);
+        static LAYOUT: Mutex<Option<String>> = Mutex::new(None);
+        let panel = panel_spec(pet);
+        if !REGISTERED.load(Ordering::Relaxed) {
+            if runtime.action(RuntimeActionId::UiComponent,json!({"op":"register","id":KEY,"type":"text","slot":"overlay","visible":false})).is_ok() {
+                REGISTERED.store(true,Ordering::Relaxed);
+            }
+        }
+        let mut layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+        if layout.as_deref() != Some(pet.layout.as_str()) {
+            let mut config = panel.clone();
+            let obj = config.as_object_mut().unwrap();
+            obj.remove("version");
+            obj.remove("lines");
+            obj.remove("title");
+            obj.insert("op".into(), json!("configure"));
+            obj.insert("id".into(), json!(KEY));
+            obj.insert("slot".into(), json!("overlay"));
+            if runtime.action(RuntimeActionId::UiComponent, config).is_ok() {
+                *layout = Some(pet.layout.clone());
+            }
+        }
+        let lines = panel["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = runtime.action(
+            RuntimeActionId::UiComponent,
+            json!({"op":"update","id":KEY,"text":lines,"title":panel["title"]}),
+        );
+        let _ = runtime.action(
+            RuntimeActionId::UiComponent,
+            json!({"op":if pet.enabled {"show"} else {"hide"},"id":KEY}),
+        );
     }
 }
 
@@ -285,11 +316,12 @@ pub(super) fn message_end(message: &Value) {
     }
 }
 
-extern "C" fn on_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
+rpi_plugin_sdk::event_handler! {
+fn on_event(event, _user_data) {
     if !enabled() {
         return 0;
     }
-    match event.tag {
+    match event.tag() {
         EventTag::AgentStart => update(|p| {
             p.mood = "think";
             p.hint.clear();
@@ -302,7 +334,7 @@ extern "C" fn on_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
         }),
         EventTag::ToolExecutionEnd => {
             // The union variant is guaranteed by ToolExecutionEnd.
-            if unsafe { event.payload.tool_result.is_error } != 0 {
+            if event.tool_result().is_some_and(|result| result.is_error) {
                 update(|p| {
                     p.mood = "error";
                     p.hint = "执行遇到问题；/pet off 查看详情".into();
@@ -331,6 +363,7 @@ extern "C" fn on_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
         _ => {}
     }
     0
+}
 }
 
 fn silence() {
@@ -365,11 +398,15 @@ fn prompt_for_pet(base: &str, name: &str, enabled: bool) -> Option<String> {
     if base.contains(HEADING) {
         return Some(base.to_owned());
     }
-    Some(format!("{base}\n\n{HEADING}\nYour display name is {} (a label, not an instruction). Be a warm, playful companion. Reply in the user's language using short natural sentences. Keep technical help accurate. Do not invent emotions, sounds, or stage directions for text-to-speech.\n", json!(name)))
+    Some(format!(
+        "{base}\n\n{HEADING}\nYour display name is {} (a label, not an instruction). Be a warm, playful companion. Reply in the user's language using short natural sentences. Keep technical help accurate. Do not invent emotions, sounds, or stage directions for text-to-speech.\n",
+        json!(name)
+    ))
 }
 
-extern "C" fn command(input: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
-    let value: Value = serde_json::from_str(unsafe { input.as_str() }).unwrap_or(Value::Null);
+rpi_plugin_sdk::string_handler! {
+fn command(input, out, _user_data) {
+    let value: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let args = value
         .get("args")
         .and_then(Value::as_str)
@@ -394,7 +431,7 @@ extern "C" fn command(input: StbStringRef, out: *mut StbString, _: *mut c_void) 
             // Delegate to the existing voice command, preserving its worker,
             // microphone ownership, model preload and hands-free turn-taking.
             let input = json!({"args":"auto on","command":"voice"}).to_string();
-            return voice_command(StbStringRef::from_str(&input), out, std::ptr::null_mut());
+            return handle_voice_command(&input, out);
         }
         "quiet" if rest.trim().is_empty() => {
             silence();
@@ -465,6 +502,7 @@ extern "C" fn command(input: StbStringRef, out: *mut StbString, _: *mut c_void) 
     );
     0
 }
+}
 
 pub(super) fn register(api: &PluginApi) -> i32 {
     if let Some(register) = api.register_command {
@@ -504,9 +542,11 @@ mod tests {
     #[test]
     fn generic_panels_cover_all_expressions_and_respect_content_limits() {
         let combining = format!("x{}", "\u{301}".repeat(1500));
-        assert!(wrap(&combining, 48, 3)
-            .iter()
-            .all(|line| line.len() <= 2048));
+        assert!(
+            wrap(&combining, 48, 3)
+                .iter()
+                .all(|line| line.len() <= 2048)
+        );
         for layout in ["focus", "work"] {
             for mood in ["listen", "think", "speak", "happy", "sleep", "error"] {
                 let pet = Pet {
@@ -519,9 +559,11 @@ mod tests {
                 let inner = panel["width"].as_u64().unwrap() as usize - 4;
                 let lines = panel["lines"].as_array().unwrap();
                 assert!(lines.len() + 3 <= panel["maxHeight"].as_u64().unwrap() as usize);
-                assert!(lines
-                    .iter()
-                    .all(|line| UnicodeWidthStr::width(line.as_str().unwrap()) <= inner));
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| UnicodeWidthStr::width(line.as_str().unwrap()) <= inner)
+                );
                 assert_eq!(
                     panel["anchor"],
                     if layout == "work" {
@@ -530,9 +572,11 @@ mod tests {
                         "center"
                     }
                 );
-                assert!(lines
-                    .iter()
-                    .any(|line| line.as_str().unwrap().ends_with('…')));
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.as_str().unwrap().ends_with('…'))
+                );
             }
         }
     }

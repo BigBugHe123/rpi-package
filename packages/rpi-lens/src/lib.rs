@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::process::{Command, Stdio};
 use std::time::Duration;
 

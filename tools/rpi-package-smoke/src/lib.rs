@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -127,9 +129,8 @@ mod tests {
         let handler = &handlers[0];
         let rc = (handler.handler)(event, handler.user_data);
         assert_eq!(rc, 0, "MessageEnd handler rc");
-        // SAFETY: tag == MessageEnd, so the `message` arm is the live variant.
-        let payload = unsafe { event.payload.message.message };
-        host_free_string(payload);
+        // The original allocation remains host-owned during handler fan-out.
+        host_free_string(message);
     }
 }
 

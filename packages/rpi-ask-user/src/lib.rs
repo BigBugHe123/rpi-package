@@ -13,14 +13,16 @@
 //! fails with the explicit `ask_user requires an interactive UI` error instead
 //! of returning a selector payload that the model could mistake for an answer.
 
+#![forbid(unsafe_code)]
+
+use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpi_plugin_sdk::{
-    register_entrypoint, FreeStringFn, PluginApi, RuntimeActionFn, StableToolSchema, StbString,
-    StbStringRef, StepHandle, StepResult, ToolPartialCb,
+    PluginApi, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 
@@ -35,17 +37,8 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Host fn pointers captured once at register time. `runtime_action` lets the
 /// tool drive the UI bridge; `user_data` is the host's opaque context.
-#[derive(Clone, Copy)]
-struct HostRuntime {
-    runtime_action: RuntimeActionFn,
-    free_string: FreeStringFn,
-    user_data: *mut c_void,
-}
-
-// SAFETY: the host guarantees `user_data` is valid for the session lifetime and
-// the fn pointers are `extern "C"` with no thread affinity.
-unsafe impl Send for HostRuntime {}
-unsafe impl Sync for HostRuntime {}
+// Reuse the SDK's host-context lifetime and thread-safety contract.
+type HostRuntime = PluginApi;
 
 static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
 
@@ -366,10 +359,11 @@ struct AskAnswer {
     confirmed: Option<bool>,
 }
 
+static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+
 struct Drive {
     params: Value,
     tool_call_id: String,
-    cancelled: AtomicBool,
     started: bool,
     finished: bool,
     pending: Option<PendingQuestion>,
@@ -606,38 +600,40 @@ fn start_drive(drive: &mut Drive, runtime: &HostRuntime) -> Result<Value, String
 // FFI lifecycle
 // ---------------------------------------------------------------------------
 
-extern "C" fn execute(
-    tool_call_id: StbStringRef,
-    params: StbString,
-    free: Option<FreeStringFn>,
-) -> StepHandle {
-    let tool_call_id = unsafe { tool_call_id.as_str().to_owned() };
+rpi_plugin_sdk::execute_handler! {
+fn execute(tool_call_id, params, free) {
+    let tool_call_id = tool_call_id.to_owned();
     let text = params.to_string_lossy();
     params.free_with(free);
-    Box::into_raw(Box::new(Drive {
+    HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         tool_call_id,
-        cancelled: AtomicBool::new(false),
         started: false,
         finished: false,
         pending: None,
         remaining: std::collections::VecDeque::new(),
         answers: Vec::new(),
         confirm: None,
-    })) as StepHandle
+    })
+}
 }
 
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
         return StepResult::err(StbString::from_string("null ask handle".into()));
     }
-    let drive = unsafe { &mut *(handle as *mut Drive) };
+    let Some(entry) = HANDLES.get(handle) else {
+        return StepResult::err(StbString::from_string(
+            "invalid or destroyed tool handle".into(),
+        ));
+    };
+    let mut drive = entry.lock();
     let Some(runtime) = HOST_RUNTIME.get().copied() else {
         return StepResult::err(StbString::from_string(
             "ask_user requires an interactive UI".into(),
         ));
     };
-    if drive.cancelled.load(Ordering::SeqCst) {
+    if entry.cancelled.load(Ordering::SeqCst) {
         if let Some(pending) = drive.pending.as_ref() {
             cancel_ui_dialog(&runtime, &pending.request_id);
         }
@@ -651,7 +647,7 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
 
     if !drive.started {
         drive.started = true;
-        return match start_drive(drive, &runtime) {
+        return match start_drive(&mut drive, &runtime) {
             Ok(done) if !done.is_null() => {
                 drive.finished = true;
                 StepResult::done(StbString::from_string(done.to_string()))
@@ -672,7 +668,7 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         };
     }
 
-    match poll_open_question(drive, &runtime) {
+    match poll_open_question(&mut drive, &runtime) {
         Ok(Some(done)) => {
             drive.finished = true;
             StepResult::done(StbString::from_string(done.to_string()))
@@ -680,7 +676,7 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         Ok(None) => {
             // Park briefly so the driver's spin loop does not burn a core.
             std::thread::sleep(POLL_INTERVAL);
-            if drive.cancelled.load(Ordering::SeqCst) {
+            if entry.cancelled.load(Ordering::SeqCst) {
                 if let Some(pending) = drive.pending.as_ref() {
                     cancel_ui_dialog(&runtime, &pending.request_id);
                 }
@@ -693,50 +689,37 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
 }
 
 extern "C" fn cancel(handle: StepHandle) {
-    if handle.is_null() {
-        return;
-    }
-    let drive = unsafe { &*(handle as *mut Drive) };
-    drive.cancelled.store(true, Ordering::SeqCst);
-    // The driver does not poll again after cancel, so retire the host UI
-    // request here; otherwise a cancelled tool would leave a stale prompt in
-    // the TUI mailbox.
-    if let Some(runtime) = HOST_RUNTIME.get().copied() {
-        if let Some(pending) = drive.pending.as_ref() {
-            cancel_ui_dialog(&runtime, &pending.request_id);
+    if let Some(entry) = HANDLES.get(handle) {
+        entry.cancel();
+        // Serialize access to pending UI state with poll, after signalling it.
+        let drive = entry.lock();
+        if let Some(runtime) = HOST_RUNTIME.get() {
+            if let Some(pending) = drive.pending.as_ref() {
+                cancel_ui_dialog(runtime, &pending.request_id);
+            }
         }
     }
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle as *mut Drive));
-        }
-    }
+    drop(HANDLES.remove(handle));
 }
 
-extern "C" fn free_string(s: StbString) {
-    if !s.is_empty() && !s.ptr.is_null() {
-        unsafe {
-            let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
-}
+use rpi_plugin_sdk::callbacks::free_string;
 
-fn command_output(out: *mut StbString, value: Value) -> i32 {
-    if out.is_null() {
+fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) -> i32 {
+    if !out.is_available() {
         return 1;
     }
-    unsafe { *out = StbString::from_string(value.to_string()) };
+    out.write(value.to_string());
     0
 }
+rpi_plugin_sdk::string_handler! {
 
 /// `/ask_user` command bridge. Keeps the command-level selector/editor path for
 /// hosts that drive UI through slash commands rather than tool calls.
-extern "C" fn ask_command(args_json: StbStringRef, out: *mut StbString, _: *mut c_void) -> i32 {
-    let request_text = unsafe { args_json.as_str().to_owned() };
+fn ask_command(args_json, out, _user_data) {
+    let request_text = args_json.to_owned();
     let request: Value = serde_json::from_str(&request_text).unwrap_or(Value::Null);
     let raw = request.get("args").and_then(Value::as_str).unwrap_or("");
     let params: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({"question": raw}));
@@ -789,33 +772,23 @@ extern "C" fn ask_command(args_json: StbStringRef, out: *mut StbString, _: *mut 
         }
     }
 }
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            let Some(register) = api.register_tool else {
-                return 1;
-            };
-            let runtime = HostRuntime {
-                runtime_action: api.runtime_action,
-                free_string: api.free_string,
-                user_data: api.user_data,
-            };
-            let _ = HOST_RUNTIME.set(runtime);
-            let schema = Box::new(StableToolSchema { name: StbString::from_string("ask_user".into()), description: StbString::from_string("Ask the user an interactive question with selectable options or freeform input.".into()), parameters: StbString::from_string(r#"{"type":"object","properties":{"question":{"type":"string"},"context":{"type":"string"},"options":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},"allowMultiple":{"type":"boolean"},"allowFreeform":{"type":"boolean"},"allowComment":{"type":"boolean"},"displayMode":{"type":"string","enum":["overlay","inline"]},"timeout":{"type":"integer","minimum":1},"type":{"type":"string","enum":["question","confirm"]},"questions":{"type":"array","minItems":1,"maxItems":3},"suggest":{"type":"string"},"summary":{"type":"string"}},"additionalProperties":false}"#.into()) });
-            let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-            drop(schema);
-            if let Some(register_command) = api.register_command {
-                let name = StbStringRef::from_str("ask_user");
-                let description =
-                    StbStringRef::from_str("Ask a question with the interactive Pi selector");
-                let _ = register_command(name, description, ask_command);
-            }
-            rc
-        })
-    }
 }
+rpi_plugin_sdk::export_plugin!(|api| {
+    let Some(register) = api.register_tool else {
+        return 1;
+    };
+    let runtime = *api;
+    let _ = HOST_RUNTIME.set(runtime);
+    let schema = Box::new(StableToolSchema { name: StbString::from_string("ask_user".into()), description: StbString::from_string("Ask the user an interactive question with selectable options or freeform input.".into()), parameters: StbString::from_string(r#"{"type":"object","properties":{"question":{"type":"string"},"context":{"type":"string"},"options":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},"allowMultiple":{"type":"boolean"},"allowFreeform":{"type":"boolean"},"allowComment":{"type":"boolean"},"displayMode":{"type":"string","enum":["overlay","inline"]},"timeout":{"type":"integer","minimum":1},"type":{"type":"string","enum":["question","confirm"]},"questions":{"type":"array","minItems":1,"maxItems":3},"suggest":{"type":"string"},"summary":{"type":"string"}},"additionalProperties":false}"#.into()) });
+    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
+    drop(schema);
+    if let Some(register_command) = api.register_command {
+        let name = StbStringRef::from_str("ask_user");
+        let description = StbStringRef::from_str("Ask a question with the interactive Pi selector");
+        let _ = register_command(name, description, ask_command);
+    }
+    rc
+});
 
 #[cfg(test)]
 mod tests {

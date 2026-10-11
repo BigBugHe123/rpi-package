@@ -22,17 +22,22 @@ pub const fn exe_extension() -> &'static str {
     }
 }
 
+/// File name for an executable called `stem` on this host, e.g. `foo` / `foo.exe`.
+pub fn exe_name(stem: &str) -> String {
+    let extension = exe_extension();
+    if extension.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{stem}.{extension}")
+    }
+}
+
 /// Stable slug baked into bundle/archive names.
 ///
 /// Matches the names the release workflow already publishes:
 /// `windows-x86_64`, `linux-x86_64`, `macos-x86_64`, `macos-aarch64`.
 pub fn slug() -> String {
-    let os = match std::env::consts::OS {
-        "windows" => "windows",
-        "macos" => "macos",
-        "linux" => "linux",
-        other => other,
-    };
+    let os = std::env::consts::OS;
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
@@ -43,14 +48,18 @@ pub fn slug() -> String {
     format!("{os}-{arch}")
 }
 
-/// Archive file name for this platform, e.g. `rpi-packages-linux-x86_64.tar.gz`.
-pub fn archive_name() -> String {
-    let ext = if cfg!(target_os = "windows") {
+/// Archive extension `pack` writes on this host: `zip` or `tar.gz`.
+pub const fn archive_extension() -> &'static str {
+    if cfg!(target_os = "windows") {
         "zip"
     } else {
         "tar.gz"
-    };
-    format!("rpi-packages-{}.{ext}", slug())
+    }
+}
+
+/// Archive file name for this platform, e.g. `rpi-packages-linux-x86_64.tar.gz`.
+pub fn archive_name() -> String {
+    format!("rpi-packages-{}.{}", slug(), archive_extension())
 }
 
 /// True when the path looks like a zip archive.
@@ -81,6 +90,16 @@ mod tests {
             assert!(name.ends_with(".zip"), "{name}");
         } else {
             assert!(name.ends_with(".tar.gz"), "{name}");
+        }
+    }
+
+    #[test]
+    fn exe_name_follows_the_host() {
+        let name = exe_name("rpi-acp-bridge");
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "rpi-acp-bridge.exe");
+        } else {
+            assert_eq!(name, "rpi-acp-bridge");
         }
     }
 

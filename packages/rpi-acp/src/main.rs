@@ -1,0 +1,166 @@
+//! Standalone `rpi-acp` bridge — run the ACP server in its own process.
+//!
+//! This is the same server the cdylib extension runs ([`rpi_acp::protocol::run`]),
+//! but launched directly by an ACP client (Zed, or anything else) instead of
+//! being embedded in an `rpi` host that has to yield its stdio.
+//!
+//! Practical consequences:
+//!
+//! * It owns stdin/stdout natively, so it does **not** need the host's
+//!   `ownsStdio` capability — it works with a stock `rpi`.
+//! * It drives child `rpi --mode rpc` processes for the actual agent work.
+//!   `rpi` is located via `RPI_BIN`, a sibling `rpi` next to this binary, or
+//!   `rpi` on `PATH` (see [`rpi_acp::session`]).
+//!
+//! Besides serving, it can register itself with Zed:
+//!
+//! ```text
+//! rpi-acp-bridge --install-zed     # add agent_servers.rpi, idempotent
+//! rpi-acp-bridge --print-zed       # print the settings snippet, write nothing
+//! ```
+//!
+//! Zed configuration (what `--install-zed` writes):
+//!
+//! ```jsonc
+//! { "agent_servers": { "rpi": { "type": "custom", "command": "rpi-acp-bridge", "args": [] } } }
+//! ```
+
+const USAGE: &str = "\
+rpi-acp-bridge - ACP stdio agent for rpi
+
+USAGE:
+    rpi-acp-bridge [--install-zed [OPTIONS]] [--print-zed]
+
+With no arguments it serves ACP on stdin/stdout (this is how Zed launches it).
+
+COMMANDS:
+    --install-zed   Register rpi under `agent_servers` in Zed's settings.json
+    --print-zed     Print the settings snippet instead of writing it
+    -h, --help      Show this help
+    -V, --version   Show the version
+
+OPTIONS (for --install-zed):
+    --settings <FILE>   Zed settings.json (default: Zed's per-OS location,
+                        or $ZED_SETTINGS)
+    --command <FILE>    Executable to register (default: this binary)
+    --dry-run           Report what would change, write nothing
+";
+
+fn main() {
+    match subcommand(std::env::args().skip(1).collect()) {
+        Some(code) => std::process::exit(code),
+        None => serve(),
+    }
+}
+
+/// Handle the non-server command surface.
+///
+/// `Some(code)` means a command ran and the process should exit with `code`;
+/// `None` falls through to the ACP server so an ACP client can spawn us bare.
+fn subcommand(args: Vec<String>) -> Option<i32> {
+    match args.first().map(String::as_str)? {
+        "--help" | "-h" | "help" => {
+            print!("{USAGE}");
+            Some(0)
+        }
+        "--version" | "-V" | "version" => {
+            println!("rpi-acp-bridge {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        "--print-zed" | "print-zed" => {
+            println!("{}", rpi_acp::zed::Registration::detect().snippet());
+            Some(0)
+        }
+        "--install-zed" | "install-zed" => Some(install_zed(&args[1..])),
+        _ => None,
+    }
+}
+
+fn install_zed(rest: &[String]) -> i32 {
+    let mut settings: Option<std::path::PathBuf> = None;
+    let mut command: Option<String> = None;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--dry-run" => dry_run = true,
+            "--settings" => match rest.get(index + 1) {
+                Some(value) => {
+                    settings = Some(std::path::PathBuf::from(value));
+                    index += 1;
+                }
+                None => return fail("--settings needs a path"),
+            },
+            "--command" => match rest.get(index + 1) {
+                Some(value) => {
+                    command = Some(value.clone());
+                    index += 1;
+                }
+                None => return fail("--command needs a path"),
+            },
+            other => return fail(&format!("unknown option `{other}` (try --help)")),
+        }
+        index += 1;
+    }
+
+    let path = match settings.or_else(rpi_acp::zed::settings_path) {
+        Some(path) => path,
+        None => return fail("cannot locate Zed's settings.json; pass --settings <FILE>"),
+    };
+
+    let mut registration = rpi_acp::zed::Registration::detect();
+    if let Some(command) = command {
+        registration = rpi_acp::zed::Registration {
+            command,
+            args: registration.args,
+        };
+    }
+
+    match rpi_acp::zed::register_file(&path, &registration, dry_run) {
+        Ok(rpi_acp::zed::Outcome::AlreadyPresent) => {
+            println!("already registered in {}", path.display());
+            0
+        }
+        Ok(rpi_acp::zed::Outcome::Created) => {
+            let verb = if dry_run { "would create" } else { "created" };
+            println!("{verb} {} with agent_servers.rpi", path.display());
+            0
+        }
+        Ok(rpi_acp::zed::Outcome::Updated { backup }) => {
+            let verb = if dry_run { "would add" } else { "added" };
+            println!("{verb} rpi to {}", path.display());
+            if !dry_run {
+                if let Some(backup) = backup {
+                    println!("backup: {}", backup.display());
+                }
+            }
+            0
+        }
+        Err(error) => fail(&error),
+    }
+}
+
+fn fail(message: &str) -> i32 {
+    eprintln!("error: {message}");
+    1
+}
+
+fn serve() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[rpi-acp] failed to create tokio runtime: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    // `run` returns when the client closes stdin; exit the process with its code.
+    // The standalone bridge has no host to signal shutdown, so keep the sender
+    // alive: EOF on stdin is the only stop condition.
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    std::process::exit(runtime.block_on(rpi_acp::protocol::run(stop_rx)));
+}
