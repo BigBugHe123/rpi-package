@@ -353,10 +353,17 @@ pub async fn run(
                     Some(session) => {
                         let writer = Arc::clone(&writer);
                         tokio::spawn(async move {
-                            let stop_reason = session.prompt(&writer, &session_id, &blocks).await;
-                            writer
-                                .respond(&id, json!({"stopReason": stop_reason}))
-                                .await;
+                            match session.prompt(&writer, &session_id, &blocks).await {
+                                Ok(stop_reason) => {
+                                    writer.respond(&id, json!({"stopReason":stop_reason})).await
+                                }
+                                Err(error) => {
+                                    diagln!(
+                                        "[rpi-acp] session {session_id}: prompt failed: {error}"
+                                    );
+                                    writer.respond_error(&id, -32603, &error).await;
+                                }
+                            }
                         });
                     }
                     None => writer.respond_error(&id, -32602, "unknown sessionId").await,

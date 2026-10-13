@@ -44,6 +44,11 @@ were temporary (`--no-session`) and cannot be restored after their backend exits
 
 ### Event mapping
 
+Streaming text is checked against cumulative message snapshots and the RPC
+completion's `finalText`. Missing text is sent before ACP reports completion,
+without duplicating chunks already delivered. Backend failures return an ACP
+request error; output length limits report `max_tokens` instead of `end_turn`.
+
 | rpi `--mode rpc` event | ACP `session/update` |
 | --- | --- |
 | `message_update` / `text_delta` | `agent_message_chunk` |

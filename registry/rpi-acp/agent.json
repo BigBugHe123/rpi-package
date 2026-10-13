@@ -1,7 +1,7 @@
 {
   "id": "rpi-acp",
   "name": "rpi",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Rust coding agent (rpi) exposed over the Agent Client Protocol",
   "repository": "https://github.com/pi-rust/rpi-package",
   "website": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-acp",
@@ -13,10 +13,10 @@
   "distribution": {
     "binary": {
       "windows-x86_64": {
-        "archive": "https://github.com/pi-rust/rpi-package/releases/download/rpi-acp-v0.1.2/rpi-acp-windows-x86_64.zip",
+        "archive": "https://github.com/pi-rust/rpi-package/releases/download/rpi-acp-v0.1.3/rpi-acp-windows-x86_64.zip",
         "cmd": "./rpi-acp-bridge.exe",
         "args": [],
-        "sha256": "6421b7307a4c919676bd9252456c07bd348572a7f4ab8e1b32f6af711819b6e5"
+        "sha256": "412ef9b50673c3b965be5c350deba9d1ba6f307749f1175cd1c65aa1893fd415"
       }
     }
   }

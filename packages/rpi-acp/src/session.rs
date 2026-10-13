@@ -186,30 +186,26 @@ impl Session {
     }
 
     /// Run one prompt turn to completion, streaming `session/update`
-    /// notifications to the client. Returns the ACP `stopReason`.
+    /// notifications to the client. Returns the ACP `stopReason` or a run error.
     pub async fn prompt(
         self: &Arc<Self>,
         writer: &Arc<Writer>,
         acp_session_id: &str,
         blocks: &[ContentBlock],
-    ) -> &'static str {
+    ) -> Result<&'static str, String> {
         let Ok(_prompt) = self.prompt_lock.try_lock() else {
-            emit_error_update(writer, acp_session_id, "a prompt is already running").await;
-            return "end_turn";
+            return Err("a prompt is already running".into());
         };
         let mut cancellation = self.cancellation.subscribe();
         let mut cancelled = false;
         let mut dialogs = DialogTasks::default();
+        let mut text = StreamText::default();
+        let mut stream_error = None;
         let mut rx = self.events.subscribe();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let content = prompt_text(blocks);
-        if let Err(error) = self
-            .send(json!({"id": id, "type": "prompt", "content": content}))
-            .await
-        {
-            emit_error_update(writer, acp_session_id, &error).await;
-            return "end_turn";
-        }
+        self.send(json!({"id": id, "type": "prompt", "content": content}))
+            .await?;
 
         let stop_reason = 'prompt: loop {
             let event = tokio::select! {
@@ -235,26 +231,45 @@ impl Session {
                                 .get("error")
                                 .and_then(Value::as_str)
                                 .unwrap_or("agent run failed");
-                            emit_error_update(writer, acp_session_id, message).await;
-                            break 'prompt "end_turn";
+                            break 'prompt if cancelled {
+                                Ok("cancelled")
+                            } else {
+                                Err(message.into())
+                            };
                         }
                         let outcome = value
                             .pointer("/result/outcome")
                             .and_then(Value::as_str)
                             .unwrap_or("completed");
+                        if let Some(error) = stream_error {
+                            break 'prompt Err(error);
+                        }
+                        if let Some(final_text) =
+                            value.pointer("/result/finalText").and_then(Value::as_str)
+                        {
+                            match text.complete(final_text) {
+                                Ok(Some(update)) => {
+                                    writer
+                                        .notify(
+                                            "session/update",
+                                            json!({"sessionId":acp_session_id,"update":update}),
+                                        )
+                                        .await
+                                }
+                                Ok(None) => {}
+                                Err(error) => break 'prompt Err(error),
+                            }
+                        }
+                        diagln!("[rpi-acp] session {acp_session_id}: prompt {id} outcome {outcome}, text bytes {}, repaired bytes {}", text.text.len(), text.repaired);
                         break 'prompt match outcome {
-                            "aborted" => "cancelled",
-                            _ => "end_turn",
+                            "aborted" => Ok("cancelled"),
+                            "failed" => Err(text.error.clone().unwrap_or_else(|| "rpi run failed before completing the reply; check the agent stderr log".into())),
+                            _ if text.stop_reason.as_deref() == Some("length") => Ok("max_tokens"),
+                            _ => Ok("end_turn"),
                         };
                     }
                     if value.get("type").and_then(Value::as_str) == Some("session_end") {
-                        emit_error_update(
-                            writer,
-                            acp_session_id,
-                            "rpi session ended before the prompt completed",
-                        )
-                        .await;
-                        break 'prompt "end_turn";
+                        break 'prompt Err("rpi session ended before the prompt completed".into());
                     }
                     // A plugin opened a UI dialog (e.g. a permission gate). Ask
                     // the ACP client, then answer the plugin.
@@ -280,7 +295,16 @@ impl Session {
                         }
                         continue;
                     }
-                    if let Some(update) = translate_event(&value) {
+                    let updates = match text.event(&value) {
+                        Ok(updates) => updates,
+                        // Keep draining until the backend completes; returning
+                        // early would allow a new prompt while this run is active.
+                        Err(error) => {
+                            stream_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    for update in updates {
                         writer
                             .notify(
                                 "session/update",
@@ -301,7 +325,9 @@ impl Session {
                     diagln!("[rpi-acp] dropped {skipped} child events (reader lagged)");
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => break 'prompt "end_turn",
+                Err(broadcast::error::RecvError::Closed) => {
+                    break 'prompt Err("rpi event stream closed before the prompt completed".into())
+                }
             }
         };
         dialogs.cancel_all().await;
@@ -316,6 +342,124 @@ impl Session {
             let _ = child.kill().await;
         }
     }
+}
+
+/// ACP chunks append text. Reconcile with cumulative backend snapshots so a
+/// dropped delta or an early RPC completion cannot silently truncate a reply.
+#[derive(Default)]
+struct StreamText {
+    text: String,
+    thinking: String,
+    stop_reason: Option<String>,
+    error: Option<String>,
+    repaired: usize,
+}
+
+impl StreamText {
+    fn event(&mut self, event: &Value) -> Result<Vec<Value>, String> {
+        let kind = event["type"].as_str().unwrap_or("");
+        let message = &event["message"];
+        if kind == "message_start" && message["role"] == "assistant" {
+            *self = Self {
+                repaired: self.repaired,
+                ..Self::default()
+            };
+            return Ok(Vec::new());
+        }
+        if matches!(kind, "message_update" | "message_end") && message["role"] == "assistant" {
+            if kind == "message_end" {
+                self.stop_reason = message["stopReason"].as_str().map(str::to_owned);
+                self.error = message["errorMessage"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+            }
+            if let Some(blocks) = message["content"].as_array() {
+                let mut updates = Vec::new();
+                for (block_type, field, variant, sent) in [
+                    (
+                        "thinking",
+                        "thinking",
+                        "agent_thought_chunk",
+                        &mut self.thinking,
+                    ),
+                    ("text", "text", "agent_message_chunk", &mut self.text),
+                ] {
+                    let parts: Vec<&str> = blocks
+                        .iter()
+                        .filter(|b| b["type"] == block_type)
+                        .filter_map(|b| b[field].as_str())
+                        .collect();
+                    if !parts.is_empty() {
+                        if let Some(update) = append_snapshot(sent, &parts.concat(), variant)? {
+                            if kind == "message_end" {
+                                self.repaired +=
+                                    update["content"]["text"].as_str().unwrap_or("").len();
+                            }
+                            updates.push(update);
+                        }
+                    }
+                }
+                // Older RPC senders may omit snapshots. Fall back only when the
+                // delta's content kind is absent, never append it twice.
+                let delta_type = match event["eventType"].as_str() {
+                    Some("text_delta") => "text",
+                    Some("thinking_delta") => "thinking",
+                    _ => "",
+                };
+                if kind != "message_end" && !blocks.iter().any(|b| b["type"] == delta_type) {
+                    if let Some(update) = self.delta(event) {
+                        updates.push(update);
+                    }
+                }
+                return Ok(updates);
+            }
+        }
+        Ok(self.delta(event).into_iter().collect())
+    }
+
+    fn delta(&mut self, event: &Value) -> Option<Value> {
+        let update = translate_event(event);
+        if let Some(update) = &update {
+            let sent = match update["sessionUpdate"].as_str() {
+                Some("agent_message_chunk") => Some(&mut self.text),
+                Some("agent_thought_chunk") => Some(&mut self.thinking),
+                _ => None,
+            };
+            if let Some(sent) = sent {
+                sent.push_str(update["content"]["text"].as_str().unwrap_or(""));
+            }
+        }
+        update
+    }
+
+    fn complete(&mut self, final_text: &str) -> Result<Option<Value>, String> {
+        let update = append_snapshot(&mut self.text, final_text, "agent_message_chunk")?;
+        if let Some(update) = &update {
+            self.repaired += update["content"]["text"].as_str().unwrap_or("").len();
+        }
+        Ok(update)
+    }
+}
+
+fn append_snapshot(
+    sent: &mut String,
+    complete: &str,
+    variant: &str,
+) -> Result<Option<Value>, String> {
+    if let Some(suffix) = complete.strip_prefix(sent.as_str()) {
+        if suffix.is_empty() {
+            return Ok(None);
+        }
+        let update = json!({"sessionUpdate":variant,"content":{"type":"text","text":suffix}});
+        *sent = complete.to_owned();
+        return Ok(Some(update));
+    }
+    // A delayed partial snapshot must not replace or duplicate newer text.
+    if sent.starts_with(complete) {
+        return Ok(None);
+    }
+    Err("rpi final message differs from the streamed text; reload this session to recover the saved reply".into())
 }
 
 /// Locate the `rpi` host binary to spawn in `--mode rpc`.
@@ -364,21 +508,6 @@ fn sibling_rpi(dir: Option<&Path>) -> Option<PathBuf> {
     let dir = dir?;
     let candidate = dir.join(format!("rpi{}", std::env::consts::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
-}
-
-async fn emit_error_update(writer: &Arc<Writer>, acp_session_id: &str, message: &str) {
-    writer
-        .notify(
-            "session/update",
-            json!({
-                "sessionId": acp_session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": format!("\n\n⚠️ {message}")},
-                },
-            }),
-        )
-        .await;
 }
 
 /// Owns each pending client request separately, so the event stream keeps advancing.
@@ -849,6 +978,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_delivers_complete_text_before_the_acp_response() {
+        let (session, commands) = test_session();
+        let mut commands = BufReader::new(commands).lines();
+        let (output, peer) = tokio::io::duplex(8192);
+        let writer = Arc::new(Writer::with_output(output));
+        let mut replies = BufReader::new(peer).lines();
+        let prompt = tokio::spawn({
+            let writer = writer.clone();
+            let session = session.clone();
+            async move {
+                let stop = session.prompt(&writer, "s", &[]).await.unwrap();
+                writer.respond(&json!(99), json!({"stopReason":stop})).await;
+            }
+        });
+        let command = read_json(&mut commands).await;
+        session
+            .events
+            .send(json!({"type":"message_update","eventType":"text_delta","delta":"前半段🌊"}))
+            .unwrap();
+        session.events.send(json!({"type":"response","id":command["id"],"status":"ok", "result":{"outcome":"completed","finalText":"前半段🌊，后半段。"}})).unwrap();
+        let mut text = String::new();
+        loop {
+            let message = read_json(&mut replies).await;
+            if message["id"] == 99 {
+                break;
+            }
+            if let Some(chunk) = message
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+            {
+                text.push_str(chunk);
+            }
+        }
+        prompt.await.unwrap();
+        assert_eq!(text, "前半段🌊，后半段。");
+    }
+
+    #[test]
+    fn cumulative_snapshots_repair_missing_middle_deltas_without_duplication() {
+        let mut stream = StreamText::default();
+        let partial = json!({"type":"message_update","eventType":"text_delta", "delta":"中文", "message":{"role":"assistant","content":[{"type":"text","text":"中文"}]}});
+        assert_eq!(
+            stream.event(&partial).unwrap()[0]["content"]["text"],
+            "中文"
+        );
+        // The middle delta was lost; the next snapshot still includes it.
+        let later = json!({"type":"message_update","eventType":"text_delta", "delta":"尾部", "message":{"role":"assistant","content":[{"type":"text","text":"中文🌊中间尾部"}]}});
+        assert_eq!(
+            stream.event(&later).unwrap()[0]["content"]["text"],
+            "🌊中间尾部"
+        );
+        assert!(stream.event(&later).unwrap().is_empty());
+        assert!(stream.event(&partial).unwrap().is_empty());
+        assert!(stream.complete("中文🌊中间尾部").unwrap().is_none());
+    }
+
+    #[test]
+    fn final_snapshots_repair_thinking_and_text_and_reset_between_assistant_messages() {
+        let mut stream = StreamText::default();
+        stream
+            .event(&json!({"type":"message_update","eventType":"thinking_delta","delta":"想"}))
+            .unwrap();
+        stream
+            .event(&json!({"type":"message_update","eventType":"text_delta","delta":"调用工具"}))
+            .unwrap();
+        let updates = stream.event(&json!({"type":"message_end","message":{"role":"assistant", "stopReason":"toolUse", "content":[{"type":"thinking","thinking":"想好了"},{"type":"text","text":"调用工具。"}]}})).unwrap();
+        assert_eq!(updates[0]["content"]["text"], "好了");
+        assert_eq!(updates[1]["content"]["text"], "。");
+        stream
+            .event(&json!({"type":"message_start","message":{"role":"toolResult"}}))
+            .unwrap();
+        assert_eq!(stream.text, "调用工具。");
+        stream
+            .event(&json!({"type":"message_start","message":{"role":"assistant"}}))
+            .unwrap();
+        assert_eq!(
+            stream.complete("最终答案").unwrap().unwrap()["content"]["text"],
+            "最终答案"
+        );
+        assert!(stream.complete("最终答案").unwrap().is_none());
+        assert!(stream.complete("不同的答案").is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_runs_report_errors_or_token_limits_instead_of_end_turn() {
+        for (outcome, reason, expected) in [
+            ("failed", "error", Err("provider disconnected".to_string())),
+            ("completed", "length", Ok("max_tokens")),
+        ] {
+            let (session, commands) = test_session();
+            let mut commands = BufReader::new(commands).lines();
+            let writer = Arc::new(Writer::with_output(tokio::io::sink()));
+            let prompt = tokio::spawn({
+                let session = session.clone();
+                async move { session.prompt(&writer, "s", &[]).await }
+            });
+            let command = read_json(&mut commands).await;
+            session.events.send(json!({"type":"message_end","message":{"role":"assistant", "content":[{"type":"text","text":"partial"}],"stopReason":reason,"errorMessage":"provider disconnected"}})).unwrap();
+            session.events.send(json!({"type":"response","id":command["id"],"status":"ok", "result":{"outcome":outcome,"finalText":"partial"}})).unwrap();
+            assert_eq!(prompt.await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn closed_dialog_does_not_block_prompt_completion_or_leave_a_pending_request() {
         let (session, commands) = test_session();
         let mut commands = BufReader::new(commands).lines();
@@ -876,7 +1109,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            "end_turn"
+            Ok("end_turn")
         );
         assert_eq!(writer.pending_count(), 0);
     }
@@ -916,7 +1149,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            "end_turn"
+            Ok("end_turn")
         );
         assert_eq!(writer.pending_count(), 0);
     }
@@ -944,7 +1177,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            "cancelled"
+            Ok("cancelled")
         );
         assert_eq!(writer.pending_count(), 0);
     }
