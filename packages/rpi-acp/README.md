@@ -12,8 +12,8 @@ Zed  ──ACP (JSON-RPC over stdio)──▶  rpi --acp  ──spawn──▶  
 
 Open WebUI Computer can use the same standard ACP entrypoint. Deploy and
 configure Computer separately; this package provides the ACP protocol,
-sessions and Zed registration. The standalone `rpi-acp-bridge` uses the shared
-`rpi-acp-core` server implementation.
+sessions and Zed registration. The standalone `rpi-acp-bridge` uses the same server implementation
+as the `rpi-acp` extension.
 
 `rpi-acp` is a `cdylib` extension. It does three things:
 
@@ -251,9 +251,6 @@ requests carry the original request ID under
 `params._meta["pi-rust/dialog"].requestId` for the same lifecycle mapping.
 Timeouts default to 300 seconds, with per-dialog overrides bounded to 1–86400
 seconds. The original host may impose a shorter timeout.
-
-An [Open WebUI Pipe](../rpi-webui/openwebui/rpi_acp_pipe.py) implements this
-client side. See [rpi-webui setup](../rpi-webui/README.md).
 
 ## Diagnosing a failed connection
 

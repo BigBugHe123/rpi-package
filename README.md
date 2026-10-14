@@ -45,14 +45,8 @@ an eventual
 ([`registry/`](registry/README.md)); the bridge owns stdio itself, so it needs
 no host support and works with a stock `rpi`.
 
-`rpi-webui` (`--webui=openwebui`) starts Open WebUI and automatically connects
-its embedded ACP server to the current project. It installs the UI through uv
-when needed, imports/configures its Pipe and selects the project model.
-Use `--webui-permission=bypass` or `--webui-workspace <path>` as needed. See
-[usage and existing-server setup](packages/rpi-webui/README.md).
-
-Open WebUI Computer can also launch `rpi --acp` through its native ACP
-client. Deploy and configure Computer separately; the extension serves ACP
+Open WebUI Computer launches `rpi --acp` through its native ACP client.
+Deploy and configure Computer separately; the `rpi-acp` extension serves ACP
 and manages agent sessions.
 
 ## Build and install
