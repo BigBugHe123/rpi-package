@@ -1,12 +1,12 @@
 [package]
 name = "rpi-acp"
-version = "0.1.3"
+version = "0.1.5"
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Agent Client Protocol (ACP) stdio server extension for rpi — use rpi as an external agent in Zed"
+description = "ACP agent server for rpi"
 readme = "README.md"
 keywords = ["rpi", "acp", "agent-protocol", "zed", "stdio"]
 

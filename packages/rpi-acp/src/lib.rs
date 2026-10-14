@@ -30,6 +30,7 @@
 pub mod diag;
 mod history;
 pub mod protocol;
+mod questions;
 pub mod session;
 pub mod zed;
 
@@ -277,7 +278,8 @@ extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_voi
 
     0
 }
-rpi_plugin_sdk::export_plugin!(|api| {
+
+fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     let _ = RUNTIME_ACTION.set(api.runtime_action);
     RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
     let _ = HOST_FREE_STRING.set(api.free_string);
@@ -288,7 +290,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
     if let Some(register_flag) = api.register_flag {
         let _ = register_flag(
             StbStringRef::from_str(ACP_FLAG),
-            StbStringRef::from_str("Run as an ACP (Agent Client Protocol) stdio agent (for Zed)"),
+            StbStringRef::from_str("Run as an ACP (Agent Client Protocol) stdio agent"),
         );
         let _ = register_flag(
             StbStringRef::from_str(INSTALL_ZED_FLAG),
@@ -327,7 +329,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
         return 1;
     }
 
-    // The one-shot Zed actions take precedence: they never start the server.
+    // One-shot actions own the headless lifecycle without starting an ACP server.
     INSTALL_ZED.store(install, Ordering::Release);
     PRINT_ZED.store(print, Ordering::Release);
     ACP_ENABLED.store(acp && !install && !print, Ordering::Release);
@@ -352,7 +354,9 @@ rpi_plugin_sdk::export_plugin!(|api| {
     }
 
     0
-});
+}
+
+rpi_plugin_sdk::export_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests {

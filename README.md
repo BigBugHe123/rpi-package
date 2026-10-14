@@ -45,6 +45,10 @@ an eventual
 ([`registry/`](registry/README.md)); the bridge owns stdio itself, so it needs
 no host support and works with a stock `rpi`.
 
+[Open WebUI Computer](integrations/computer/README.md) can launch the same
+`rpi --acp` through its native ACP client. Deploy and configure Computer
+separately; the extension only serves ACP and manages agent sessions.
+
 ## Build and install
 
 `rpi-run-stats` adds a live top-right monitoring panel: rounds, provider steps,
@@ -122,10 +126,18 @@ task install-bundle ARCHIVE=dist/rpi-packages-windows-x86_64.zip
 The optional `task smoke` maintainer check exercises the host loader and does
 require a sibling `pi-rust` checkout.
 
-For a release preflight, run `task publish-dry-run`. Real crates.io publishing
-is intentionally separate and requires `cargo login`. Since the first nine
-packages are already released, publish this batch with `task publish-new`; use
-`task publish` only for a fresh repository where none of the package names
-exist yet. Each extension is self-contained and can be published in any order.
+## Automatic releases and prebuilt extensions
+
+Merging to `main` runs version generation, Cargo publishing and the five-platform
+asset build. Extensions have independent package versions; each package Release
+contains its native libraries and a versioned `rpi-extension.json` manifest.
+
+See the [release workflow and distribution protocol](docs/prebuilt-distribution.md)
+for publishing credentials, branch protection, retry behavior and host installation.
+The [JSON schema](docs/rpi-extension.schema.json) defines the discovery manifest.
+
+For a local release preflight, run `task publish-dry-run`. Manual crates.io
+publishing requires `cargo login` and an unpublished package version. Each
+extension is self-contained and can be published in any order.
 `task pack` also creates a directly installable platform bundle under `dist/`
 for a GitHub Release or another binary registry.
