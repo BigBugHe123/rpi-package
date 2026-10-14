@@ -29,28 +29,6 @@ it embeds sherpa-onnx + SenseVoice and runs entirely offline (see
 [`packages/rpi-voice/README.md`](packages/rpi-voice/README.md) for the build
 either way).
 
-`rpi-acp` (`--acp`) runs rpi as an external agent in Zed (or any Agent Client
-Protocol client) over stdio, backing each ACP session with a child
-`rpi --mode rpc` process. It claims the process stdio via the plugin ABI's
-`ownsStdio` declaration, so see
-[`packages/rpi-acp/README.md`](packages/rpi-acp/README.md) for the host
-requirement and Zed configuration. **No hand-editing of Zed's `settings.json`
-is needed**: `rpi --install-zed` registers it (`rpi --print-zed` just prints the
-snippet), and starting `rpi --acp` registers it automatically — idempotent,
-comment-preserving; opt out with `RPI_ACP_NO_AUTO_REGISTER_ZED=1`. The same
-crate builds a standalone `rpi-acp-bridge` binary (`task pack-acp`) with the same
-commands, for clients that launch an ACP agent directly, and as the artifact for
-an eventual
-[ACP Registry](https://github.com/agentclientprotocol/registry) entry
-([`registry/`](registry/README.md)); the bridge owns stdio itself, so it needs
-no host support and works with a stock `rpi`.
-
-Open WebUI Computer launches `rpi --acp` through its native ACP client.
-Deploy and configure Computer separately; the `rpi-acp` extension serves ACP
-and manages agent sessions.
-
-## Build and install
-
 `rpi-run-stats` adds a live top-right monitoring panel: rounds, provider steps,
 output tok/s, time to first token, response time, rolling 60-second TPM,
 input/output/cache tokens, errors and USD cost. Use `/stats on`, `/stats off`
@@ -58,14 +36,59 @@ or `/stats` to toggle it, and `/stats position top-left` to move it.
 It uses the generic declarative panel interface in the host.
 See [rpi-run-stats](packages/rpi-run-stats/README.md) for measurement definitions.
 
+## Native ACP integration
+
+`rpi-acp` contains the ACP protocol, session history, streaming, question handling
+and Zed registration. The extension and standalone `rpi-acp-bridge` use the same
+implementation within this package.
+
+```text
+Computer / Zed -> ACP over stdin/stdout -> rpi --acp -> rpi --mode rpc
+                                                       (one child per session)
+```
+
+Install the extension with the `rpi` host:
+
+```bash
+rpi install rpi-acp
+```
+
+For **Open WebUI Computer**, deploy Computer separately and configure its native
+ACP agent to launch the `rpi` executable with `--acp`. The process must have
+access to the installed extension, provider credentials, project directory and
+writable session storage. Tools run in the workspace sent by the client's
+`session/new` request. Container deployments must make that same path available
+to the agent process.
+
+Set `RPI_ACP_NO_AUTO_REGISTER_ZED=1` in Computer's agent environment to disable
+automatic Zed registration. Set `RPI_ACP_SESSION_DIR` to an absolute directory
+when session history needs a persistent container volume. See the
+[ACP package README](packages/rpi-acp/README.md#configure-computer-native-acp)
+for the connection requirements and client capabilities.
+
+For **Zed**, run `rpi --install-zed` to register the agent or `rpi --print-zed`
+to print the settings snippet. Registration preserves comments and creates a
+backup when updating an existing file.
+
+The standalone bridge owns stdin/stdout and starts `rpi --mode rpc` itself.
+Build its archive with `task pack-acp`; use `RPI_BIN` to select the backend
+executable. Its packaging and proposed ACP Registry entry are documented in
+[registry/README.md](registry/README.md).
+
+## Build and install
+
+Source builds use stable Rust and Cargo. Task is required for the `task`
+commands; Python 3 is required for the ACP integration tests. The `rpi` host
+must already be installed and configured to run the extensions.
+
 ```powershell
-cargo test --workspace
-cargo build --release --workspace
+cargo test --workspace --locked
 task install
 ```
 
-`task install` copies the platform cdylibs to
-`~/.rpi/agent/extensions`. The CLI discovers that directory automatically; an
+`task install` builds the workspace and copies catalog extensions to
+`~/.rpi/agent/extensions`, or `$RPI_CODING_AGENT_DIR/extensions` when configured.
+The CLI discovers the default directory automatically; an
 explicit directory also works:
 
 ```powershell
@@ -78,22 +101,11 @@ into the `rpi` host:
 
 ```powershell
 rpi install rpi-todo
-rpi install rpi-todo --version 0.2.0
+rpi install rpi-todo --version 0.2.3
 ```
 
-`rpi-im-message` can run the Feishu/Lark long-connection server headlessly,
-without opening the TUI:
-
-```powershell
-rpi --im-message-server --im-profile feishu-main
-```
-
-The profile is optional when `defaultProfile` is set in `.rpi/im.json` (or
-`~/.rpi/agent/im.json`). Set the app secret through the profile's environment
-variable before starting the process.
-
-The command downloads the crate from crates.io, compiles its cdylib for the
-current OS and architecture, and places it in `~/.rpi/agent/extensions`.
+The `rpi install` command downloads the crate from crates.io, compiles its cdylib
+for the current OS and architecture, and places it in `~/.rpi/agent/extensions`.
 After publishing a release, users who prefer prebuilt binaries can download the
 platform-specific archive generated by CI and run the installer it ships with.
 The archive is self-contained: it carries the extension libraries, the catalog
@@ -126,11 +138,41 @@ task install-bundle ARCHIVE=dist/rpi-packages-windows-x86_64.zip
 The optional `task smoke` maintainer check exercises the host loader and does
 require a sibling `pi-rust` checkout.
 
+To test ACP unit tests and deterministic streaming scenarios, run:
+
+```bash
+task test-acp
+```
+
+Optional real-host lifecycle checks also run when `RPI_TEST_HOST` and
+`RPI_TEST_PLUGIN` point to the `rpi` executable and built ACP library.
+
+## Headless Feishu/Lark service
+
+`rpi-im-message` runs the Feishu/Lark long-connection server with:
+
+```powershell
+rpi --im-message-server --im-profile feishu-main
+```
+
+The profile is optional when `defaultProfile` is set in `.rpi/im.json` (or
+`~/.rpi/agent/im.json`). Set the app secret through the profile's environment
+variable before starting the process.
+
 ## Automatic releases and prebuilt extensions
 
-Merging to `main` runs version generation, Cargo publishing and the five-platform
-asset build. Extensions have independent package versions; each package Release
-contains its native libraries and a versioned `rpi-extension.json` manifest.
+Merging to `main` runs version generation and Cargo publishing. The workflow
+updates packages with unpublished changes and publishes their new versions;
+already published versions are skipped. Package contents and dependency changes
+determine which packages need a release.
+
+When package releases are available, CI builds Windows x64, Linux x64/ARM64 and
+macOS Intel/Apple Silicon assets. The matching package Releases receive native
+libraries and a versioned `rpi-extension.json` manifest. A separate bundle Release
+contains all workspace extensions, the installer and the standalone ACP bridge.
+The full workspace build does not mean every extension gets a new version.
+
+The workflow can also be run manually on `main` to retry a release.
 
 See the [release workflow and distribution protocol](docs/prebuilt-distribution.md)
 for publishing credentials, branch protection, retry behavior and host installation.
