@@ -18,13 +18,19 @@ tasks:
   test-acp:
     desc: Test ACP protocol and streaming (optional native host checks via RPI_TEST_HOST/PLUGIN)
     cmds:
-      - cargo test -p rpi-acp
+      - cargo test -p rpi-acp -p rpi-acp-core
       - cargo build -p rpi-acp --bin rpi-acp-bridge --example fake_rpc --lib
       - python packages/rpi-acp/tests/streaming.py --bridge "{{.ACP_BRIDGE}}"
       - python -m unittest discover -s packages/rpi-acp/tests -v
     vars:
       ACP_BRIDGE:
         sh: python -c "import json,subprocess,os; m=json.loads(subprocess.check_output(['cargo','metadata','--no-deps','--format-version','1'])); print(os.path.join(m['target_directory'],'debug','rpi-acp-bridge'+('.exe' if os.name=='nt' else '')))"
+
+  test-webui:
+    desc: Test the ACP bridge, Open WebUI launcher, and Python Pipe (Pydantic 2 required)
+    cmds:
+      - cargo test -p rpi-acp -p rpi-acp-core -p rpi-webui
+      - python -m unittest discover -s integrations/openwebui/tests -v
 
   build:
     desc: Build release cdylibs for this platform
@@ -86,7 +92,9 @@ tasks:
       - cargo publish --dry-run --allow-dirty -p rpi-webfetch
       - cargo publish --dry-run --allow-dirty -p rpi-im-message
       - cargo publish --dry-run --allow-dirty -p rpi-server
+      - cargo publish --dry-run --allow-dirty -p rpi-acp-core
       - cargo publish --dry-run --allow-dirty -p rpi-acp
+      - cargo publish --dry-run --allow-dirty -p rpi-webui
       - cargo publish --dry-run --allow-dirty -p rpi-permission-gate
       - cargo publish --dry-run --allow-dirty -p rpi-voice
       - cargo publish --dry-run --allow-dirty -p rpi-run-stats
@@ -109,8 +117,10 @@ tasks:
       - cargo publish --allow-dirty -p rpi-webfetch
       - cargo publish --allow-dirty -p rpi-im-message
       - cargo publish --allow-dirty -p rpi-server
+      - cargo publish --allow-dirty -p rpi-acp-core
       - cargo publish --allow-dirty -p rpi-acp
       - cargo publish --allow-dirty -p rpi-permission-gate
+      - cargo publish --allow-dirty -p rpi-webui
       - cargo publish --allow-dirty -p rpi-voice
       - cargo publish --allow-dirty -p rpi-run-stats
 

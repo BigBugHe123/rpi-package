@@ -8,13 +8,12 @@ single `rpi --acp` process.
 Zed  ──ACP (JSON-RPC over stdio)──▶  rpi --acp  ──spawn──▶  rpi --mode rpc  (per session)
 ```
 
-Open WebUI Computer uses the same standard ACP entrypoint. See the
-[tested Computer deployment](../../integrations/computer/README.md) for its
-agent profile and original-image deployment. UI deployment/configuration
-belongs to Computer; this package provides protocol, sessions and Zed registration.
-The standalone `rpi-acp-bridge` reuses this library.
-
 ## How it works
+
+Open WebUI Computer can use the same standard ACP entrypoint. Deploy and
+configure Computer separately; this package provides the ACP protocol,
+sessions and Zed registration. The standalone `rpi-acp-bridge` uses the shared
+`rpi-acp-core` server implementation.
 
 `rpi-acp` is a `cdylib` extension. It does three things:
 
@@ -210,8 +209,8 @@ It prints the sha256 and a ready-to-paste `distribution.binary` stanza; see
   with explicit `purpose: "permission"` and per-option `permission` decisions
   map to a permission request. Option titles are preserved in the returned
   answer. Ordinary questions use the negotiated extension below; clients that
-  do not advertise it cancel questions. Closure, timeout, prompt cancellation
-  and disconnect retire pending requests, including when the client never answers.
+  do not advertise it cancel questions. Closure, timeout, prompt cancellation and disconnect retire pending
+  requests, including when the client never answers.
 * Prompt templates / slash commands are not advertised as
   `available_commands_update`: `--mode rpc` does not expand prompt templates
   (only the host TUI does), so a client-side command list would be misleading.
@@ -252,6 +251,9 @@ requests carry the original request ID under
 `params._meta["pi-rust/dialog"].requestId` for the same lifecycle mapping.
 Timeouts default to 300 seconds, with per-dialog overrides bounded to 1–86400
 seconds. The original host may impose a shorter timeout.
+
+An [Open WebUI Pipe](../rpi-webui/openwebui/rpi_acp_pipe.py) implements this
+client side. See [rpi-webui setup](../rpi-webui/README.md).
 
 ## Diagnosing a failed connection
 
