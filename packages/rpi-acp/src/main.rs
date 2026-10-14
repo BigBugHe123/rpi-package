@@ -74,7 +74,7 @@ fn subcommand(args: Vec<String>) -> Option<i32> {
             Some(0)
         }
         "--install-zed" | "install-zed" => Some(install_zed(&args[1..])),
-        _ => None,
+        _ => Some(fail("unknown command (try --help)")),
     }
 }
 

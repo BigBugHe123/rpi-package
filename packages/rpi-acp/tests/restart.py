@@ -23,8 +23,12 @@ class Client:
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, encoding="utf-8")
         self.errors = []
-        threading.Thread(target=self.read, args=(self.process.stdout,), daemon=True).start()
-        threading.Thread(target=lambda: self.errors.extend(self.process.stderr), daemon=True).start()
+        self.readers = [
+            threading.Thread(target=self.read, args=(self.process.stdout,), daemon=True),
+            threading.Thread(target=lambda: self.errors.extend(self.process.stderr), daemon=True),
+        ]
+        for reader in self.readers:
+            reader.start()
         self.next_id = 0
 
     def read(self, stream):
@@ -51,6 +55,13 @@ class Client:
     def close(self):
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0, "".join(self.errors)
+        # A Windows .cmd backend can outlive the wrapper briefly. Wait for its
+        # inherited pipe handles to close before removing the temporary cwd.
+        for reader in self.readers:
+            reader.join(timeout=10)
+            assert not reader.is_alive(), "ACP subprocess did not close its output pipes"
+        self.process.stdout.close()
+        self.process.stderr.close()
 
 
 def check(command, env, cwd, store):

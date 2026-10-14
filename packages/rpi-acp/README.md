@@ -1,14 +1,20 @@
 # rpi-acp
 
-Run **rpi as an external agent in [Zed](https://zed.dev)** (or any client that
-speaks the [Agent Client Protocol](https://agentclientprotocol.com)) over a
+Run **rpi as an external agent in Computer, [Zed](https://zed.dev)** or any client
+that speaks the [Agent Client Protocol](https://agentclientprotocol.com) over a
 single `rpi --acp` process.
 
 ```
-Zed  ──ACP (JSON-RPC over stdio)──▶  rpi --acp  ──spawn──▶  rpi --mode rpc  (per session)
+Computer / Zed  ──ACP over stdio──▶  rpi --acp  ──spawn──▶  rpi --mode rpc  (per session)
 ```
 
 ## How it works
+
+Open WebUI Computer can use the same standard ACP entrypoint. Deploy and
+configure Computer separately; this package provides the ACP protocol,
+sessions and Zed registration. The standalone `rpi-acp-bridge` uses the same
+server implementation as the `rpi-acp` extension. All implementation modules
+are part of this package.
 
 `rpi-acp` is a `cdylib` extension. It does three things:
 
@@ -83,6 +89,36 @@ rpi install rpi-acp
 # or, in this repo:
 task install
 ```
+
+## Configure Computer (native ACP)
+
+Deploy Open WebUI Computer separately and configure its native ACP agent to
+launch the `rpi` executable with `--acp`. Use an absolute executable path if
+Computer's environment does not put `rpi` on `PATH`. The host must load the
+`rpi-acp` extension and have a configured provider/model before serving ACP.
+
+The connection is JSON-RPC over stdin/stdout. Computer starts the agent process
+and communicates through its pipes; a separately started process has no ACP
+network endpoint to connect to. Each session starts a child `rpi --mode rpc` in
+the `cwd` supplied by Computer.
+
+For container deployments, make the runtime, extension library, provider
+configuration and project accessible inside the container that starts `rpi`.
+The path sent as `session/new.cwd` must exist there. Mount session history on a
+writable persistent volume and configure the agent process environment:
+
+| Variable | Purpose |
+| --- | --- |
+| `RPI_ACP_NO_AUTO_REGISTER_ZED=1` | Disable automatic Zed settings registration |
+| `RPI_ACP_SESSION_DIR` | Absolute directory for persistent ACP session history |
+| `RPI_CODING_AGENT_DIR` | rpi configuration directory |
+| `RPI_BIN` | Optional override for the child rpi executable |
+
+Permission dialogs use standard `session/request_permission`; the native client
+controls how it presents or answers them. General `ask_user` questions require
+the client to negotiate the [question extension](#question-extension-v1).
+The agent cancels unsupported questions. Client support also determines how
+session replay and cancellation appear in Computer's UI.
 
 ## Configure Zed
 
@@ -246,9 +282,6 @@ requests carry the original request ID under
 `params._meta["pi-rust/dialog"].requestId` for the same lifecycle mapping.
 Timeouts default to 300 seconds, with per-dialog overrides bounded to 1–86400
 seconds. The original host may impose a shorter timeout.
-
-An [Open WebUI Pipe](../rpi-webui/openwebui/rpi_acp_pipe.py) implements this
-client side. See [rpi-webui setup](../rpi-webui/README.md).
 
 ## Diagnosing a failed connection
 
