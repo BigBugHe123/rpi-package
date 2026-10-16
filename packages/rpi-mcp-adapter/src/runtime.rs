@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveredServer {
@@ -140,6 +142,9 @@ struct Entry {
     /// Notifications from this connection's reader, consumed by its dispatcher.
     /// Owned by the entry so a re-opened session reuses the same dispatcher.
     notifications: SyncSender<Value>,
+    /// The dispatcher thread, joined on close so a released connection leaves no
+    /// thread behind. `stop` is cancelled first, which unblocks its wait.
+    dispatcher: Mutex<Option<JoinHandle<()>>>,
 }
 type Sessions = BTreeMap<String, Arc<Entry>>;
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
@@ -162,7 +167,11 @@ fn subscriptions() -> &'static Mutex<std::collections::HashMap<String, HashSet<S
 /// be shown to the model. Drained at the turn boundary (`TurnEnd`) so injection
 /// never splits an assistant `tool_calls` from its `toolResult`s.
 #[derive(Debug, Clone)]
-pub(crate) struct ResourceUpdate {
+pub struct ResourceUpdate {
+    /// Session scope this update belongs to (see [`scope_of_key`]). The host
+    /// serves one session at a time, so an update produced under a different
+    /// scope must never be injected into the current one.
+    pub scope: String,
     pub key: String,
     pub uri: String,
     pub text: String,
@@ -174,8 +183,70 @@ fn pending() -> &'static Mutex<Vec<ResourceUpdate>> {
 const MAX_PENDING: usize = 64;
 const MAX_RESOURCE_TEXT: usize = 20_000;
 
-pub(crate) fn take_pending_updates() -> Vec<ResourceUpdate> {
-    std::mem::take(&mut *pending().lock().unwrap_or_else(|p| p.into_inner()))
+/// The session scope of the most recent tool call.
+///
+/// `TurnEnd` carries no payload, so this latch is how the injection path learns
+/// which session it is serving: the host injects `__rpi.sessionId` into every
+/// plugin *tool* call, and every session-using tool goes through [`target`].
+static CURRENT_SCOPE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+fn current_scope_slot() -> &'static Mutex<Option<String>> {
+    CURRENT_SCOPE.get_or_init(|| Mutex::new(None))
+}
+fn remember_scope(scope: &str) {
+    *current_scope_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(scope.to_string());
+}
+pub(crate) fn current_scope() -> Option<String> {
+    current_scope_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The session scope embedded in a connection key (`[scope, identity, name]`).
+fn scope_of_key(key: &str) -> String {
+    serde_json::from_str::<Value>(key)
+        .ok()
+        .and_then(|value| value.get(0).and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Drain the queued updates, keeping only those for `scope`.
+///
+/// Updates belonging to any other scope are dropped: they were produced for a
+/// session the host is no longer serving, and injecting them would leak one
+/// session's resource contents into another's context. A host that predates
+/// `__rpi.sessionId` reports no scope, in which case everything is delivered.
+pub(crate) fn take_pending_updates(scope: Option<&str>) -> Vec<ResourceUpdate> {
+    let drained = std::mem::take(&mut *pending().lock().unwrap_or_else(|p| p.into_inner()));
+    match scope {
+        Some(scope) => drained
+            .into_iter()
+            .filter(|update| update.scope == scope)
+            .collect(),
+        None => drained,
+    }
+}
+
+/// Drop queued updates for one connection (close, unsubscribe, failed subscribe).
+fn clear_pending_for_key(key: &str) {
+    pending()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|update| update.key != key);
+}
+
+/// Drop queued updates for one connection + URI.
+fn clear_pending_for_uri(key: &str, uri: &str) {
+    pending()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|update| !(update.key == key && update.uri == uri));
+}
+
+fn clear_all_pending() {
+    pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
 fn add_subscription(key: &str, uri: &str) {
@@ -208,15 +279,23 @@ fn is_subscribed(key: &str, uri: &str) -> bool {
 }
 
 /// One dispatcher per connection. It ends when every sender is gone (entry
-/// removed and session dropped).
-fn spawn_dispatcher(key: String, receiver: Receiver<Value>) {
-    let _ = std::thread::Builder::new()
+/// removed and session dropped) or when the connection is stopped, whichever
+/// happens first — the stop check is what lets `close`/`shutdown` join it
+/// promptly instead of waiting on the reader.
+fn spawn_dispatcher(key: String, receiver: Receiver<Value>, stop: Control) -> JoinHandle<()> {
+    std::thread::Builder::new()
         .name("mcp-notify".into())
-        .spawn(move || {
-            while let Ok(value) = receiver.recv() {
-                dispatch_notification(&key, &value);
+        .spawn(move || loop {
+            if stop.check().is_err() {
+                break;
             }
-        });
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => dispatch_notification(&key, &value),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        })
+        .expect("spawn MCP notification dispatcher")
 }
 
 fn dispatch_notification(key: &str, value: &Value) {
@@ -235,6 +314,10 @@ fn dispatch_notification(key: &str, value: &Value) {
     else {
         return;
     };
+    // A subscription is marked *before* its `subscribe` request goes out, so a
+    // server that pushes the first update while the handshake is still in flight
+    // is accepted here rather than dropped. A failed subscribe rolls the mark
+    // back (and purges anything queued in the meantime).
     if !is_subscribed(key, &uri) {
         return;
     }
@@ -242,6 +325,7 @@ fn dispatch_notification(key: &str, value: &Value) {
         let mut pending = pending().lock().unwrap_or_else(|p| p.into_inner());
         if pending.len() < MAX_PENDING {
             pending.push(ResourceUpdate {
+                scope: scope_of_key(key),
                 key: key.to_string(),
                 uri,
                 text,
@@ -253,6 +337,10 @@ fn dispatch_notification(key: &str, value: &Value) {
 /// Read a resource on an existing connection (used by the dispatcher). Never
 /// creates a session: if the connection is gone, the update is dropped. Runs on
 /// the dispatcher thread, not the reader, so it can await the reply.
+///
+/// The control is linked to the connection's `stop`, so `close`/`shutdown`
+/// cancels an in-flight read instead of waiting for its timeout — and the lock
+/// wait below shares that same deadline.
 fn read_resource_by_key(key: &str, uri: &str) -> Result<String, String> {
     let entry = sessions()
         .lock()
@@ -260,7 +348,7 @@ fn read_resource_by_key(key: &str, uri: &str) -> Result<String, String> {
         .get(key)
         .cloned()
         .ok_or("MCP connection is gone")?;
-    let control = Control::default();
+    let control = Control::default().linked(&entry.stop);
     let deadline = Deadline::new(120, "resources/read", &control);
     let mut state = lock_until(&entry.session, &deadline)?;
     let session = state.as_mut().ok_or("MCP connection is closed")?;
@@ -358,6 +446,9 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
             )?)
         });
         remove_subscription(&key, &uri);
+        // Anything already read for this URI must not be injected after the
+        // model has been told the subscription is gone.
+        clear_pending_for_uri(&key, &uri);
         return Ok(json!({"server": name, "uri": uri, "unsubscribed": true}));
     }
     if action == "subscribe" {
@@ -367,10 +458,19 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                     .into(),
             );
         }
-        with_session(key.clone(), config, timeout, control, |session, control| {
-            response_result(session.request("resources/subscribe", json!({"uri": uri}), control)?)
-        })?;
+        // Mark the subscription *before* the request: a server may push the
+        // first `resources/updated` while the handshake is still in flight, and
+        // the dispatcher drops notifications for unmarked URIs. A failed
+        // subscribe rolls the mark back and purges anything queued meanwhile.
         add_subscription(&key, &uri);
+        let subscribed = with_session(key.clone(), config, timeout, control, |session, control| {
+            response_result(session.request("resources/subscribe", json!({"uri": uri}), control)?)
+        });
+        if let Err(error) = subscribed {
+            remove_subscription(&key, &uri);
+            clear_pending_for_uri(&key, &uri);
+            return Err(error);
+        }
         return Ok(json!({"server": name, "uri": uri, "subscribed": true}));
     }
     // read — flatten and bound the contents: a large blob must not reach the
@@ -413,11 +513,13 @@ fn with_session<T>(
             Some(entry) => entry.clone(),
             None => {
                 let (notifications, receiver) = mpsc::sync_channel(64);
-                spawn_dispatcher(key.clone(), receiver);
+                let stop = Control::default();
+                let dispatcher = spawn_dispatcher(key.clone(), receiver, stop.clone());
                 let entry = Arc::new(Entry {
                     session: Mutex::new(None),
-                    stop: Control::default(),
+                    stop,
                     notifications,
+                    dispatcher: Mutex::new(Some(dispatcher)),
                 });
                 sessions.insert(key.clone(), Arc::clone(&entry));
                 entry
@@ -447,7 +549,22 @@ fn with_session<T>(
     result
 }
 
+/// Stop a released entry and join its dispatcher. Cancelling `stop` first makes
+/// the dispatcher's 100 ms wait return promptly, and it also aborts any
+/// in-flight background `resources/read` (whose control is linked to it).
+fn retire_entry(entry: &Arc<Entry>) {
+    entry.stop.cancel();
+    let dispatcher = match entry.dispatcher.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    if let Some(handle) = dispatcher {
+        let _ = handle.join();
+    }
+}
+
 pub fn shutdown_connections() {
+    clear_all_pending();
     if let Ok(mut subs) = subscriptions().lock() {
         subs.clear();
     }
@@ -459,14 +576,19 @@ pub fn shutdown_connections() {
     for entry in entries.values() {
         entry.stop.cancel();
     }
-    for entry in entries.into_values() {
+    for entry in entries.values() {
         if let Ok(mut state) = entry.session.lock() {
             state.take();
         }
     }
+    // Ordered teardown: every session is gone, so each dispatcher can be joined.
+    for entry in entries.values() {
+        retire_entry(entry);
+    }
 }
 fn close_key(key: &str) -> Result<(), String> {
     clear_subscriptions(key);
+    clear_pending_for_key(key);
     let entry = sessions()
         .lock()
         .map_err(|_| "MCP session registry poisoned")?
@@ -478,6 +600,7 @@ fn close_key(key: &str) -> Result<(), String> {
             .lock()
             .map_err(|_| "MCP connection lock poisoned")?
             .take();
+        retire_entry(&entry);
     }
     Ok(())
 }
@@ -524,6 +647,9 @@ fn load_config(params: &Value) -> Result<(PathBuf, McpConfig), String> {
 }
 fn target(params: &Value) -> Result<(String, String, McpServerConfig, u64), String> {
     let scope = host_scope(params);
+    // Latch the session this call belongs to: `TurnEnd` carries no payload, so
+    // this is how the injection path learns which session it is serving.
+    remember_scope(&scope);
     let (name, identity, mut config) = if params.get("configPath").is_some() {
         if params.get("url").is_some() {
             return Err("specify configPath/server or url, not both".into());
@@ -708,10 +834,30 @@ pub fn close_from_config(config_path: &str, server_name: &str) -> Result<(), Str
     .map(|_| ())
 }
 
+/// `mcp_resource`'s actions against a configured server (`list`/`read`/
+/// `subscribe`/`unsubscribe`), for embedders and integration tests.
+pub fn resources_from_config(
+    config_path: &str,
+    server_name: &str,
+    action: &str,
+    uri: Option<&str>,
+) -> Result<Value, String> {
+    let mut params = json!({"configPath":config_path,"server":server_name,"action":action});
+    if let Some(uri) = uri {
+        params["uri"] = json!(uri);
+    }
+    resources(&params, &Control::default())
+}
+
+/// Drain the resource updates queued for `scope` — the same queue the `TurnEnd`
+/// injection path consumes. `None` drains everything (a host with no session id).
+pub fn take_resource_updates(scope: Option<&str>) -> Vec<ResourceUpdate> {
+    take_pending_updates(scope)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resource_text;
-    use serde_json::json;
+    use super::*;
 
     #[test]
     fn resource_text_flattens_text_and_notes_blobs() {
@@ -721,5 +867,92 @@ mod tests {
         assert!(text.contains("res://a"));
         assert!(text.contains("hello"));
         assert!(text.contains("[blob, 4 base64 chars]"), "got: {text}");
+    }
+
+    /// The queue is process-global, so these tests must not interleave.
+    static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn queue_test_guard() -> MutexGuard<'static, ()> {
+        QUEUE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn queue(scope: &str, key: &str, uri: &str, text: &str) {
+        pending()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(ResourceUpdate {
+                scope: scope.into(),
+                key: key.into(),
+                uri: uri.into(),
+                text: text.into(),
+            });
+    }
+
+    fn clear_queue() {
+        pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// Regression: the queue was global and `TurnEnd` drained all of it, so
+    /// session A's resource contents could land in session B's context.
+    #[test]
+    fn queued_updates_are_scoped_to_the_session_that_produced_them() {
+        let _serial = queue_test_guard();
+        clear_queue();
+        queue("session:a", "key-a", "mem://a", "A");
+        queue("session:b", "key-b", "mem://b", "B");
+
+        // The host is serving B: only B's update may reach the model.
+        let served = take_pending_updates(Some("session:b"));
+        assert_eq!(served.len(), 1, "got {served:?}");
+        assert_eq!(served[0].text, "B");
+        // A's update was dropped, not deferred into the next drain.
+        assert!(take_pending_updates(Some("session:a")).is_empty());
+        clear_queue();
+    }
+
+    /// A host with no session id (older, or an ephemeral session) still gets
+    /// everything rather than nothing.
+    #[test]
+    fn unscoped_host_still_receives_updates() {
+        let _serial = queue_test_guard();
+        clear_queue();
+        queue("library", "key-l", "mem://l", "L");
+        let served = take_pending_updates(None);
+        assert_eq!(served.len(), 1);
+        clear_queue();
+    }
+
+    /// Closing a connection (or unsubscribing one URI) drops exactly its queued
+    /// updates, and leaves other connections' alone.
+    #[test]
+    fn close_and_unsubscribe_drop_only_their_own_updates() {
+        let _serial = queue_test_guard();
+        clear_queue();
+        queue("session:a", "key-a", "mem://a", "A");
+        queue("session:b", "key-b", "mem://b", "B");
+
+        // Unsubscribing one URI drops exactly that update.
+        clear_pending_for_uri("key-a", "mem://a");
+        let remaining = take_pending_updates(None);
+        assert_eq!(remaining.len(), 1, "got {remaining:?}");
+        assert_eq!(remaining[0].text, "B");
+
+        // Closing one connection drops all of its updates, not the other's.
+        queue("session:a", "key-a", "mem://other", "A2");
+        queue("session:b", "key-b", "mem://b", "B2");
+        clear_pending_for_key("key-a");
+        let remaining = take_pending_updates(None);
+        assert_eq!(remaining.len(), 1, "got {remaining:?}");
+        assert_eq!(remaining[0].text, "B2");
+        clear_queue();
+    }
+
+    /// The scope stored with an update is the one embedded in its connection key
+    /// (`[scope, identity, name]`), which is what the filter above compares.
+    #[test]
+    fn scope_is_read_back_out_of_the_connection_key() {
+        let key = serde_json::to_string(&("session:abc", "/tmp/mcp.json", "fake")).unwrap();
+        assert_eq!(scope_of_key(&key), "session:abc");
+        assert_eq!(scope_of_key("not json"), "");
     }
 }

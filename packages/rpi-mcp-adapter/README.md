@@ -74,9 +74,22 @@ through a server's tools):
 A subscribed server pushes `notifications/resources/updated`. The adapter reads
 the resource and shows the new content to the model as a message at the next turn
 boundary (`TurnEnd`) — never mid tool batch, so an assistant `tool_calls` message
-stays adjacent to its `toolResult`s. Updates are queued per connection (last 64)
-and only read for URIs you actually subscribed to. This works for stdio servers
-today; HTTP/SSE push is not wired yet.
+stays adjacent to its `toolResult`s.
+
+Updates are queued **per session scope**, not globally: only updates produced
+under the session the host is currently serving (the `__rpi.sessionId` on the
+latest tool call) are injected, and a session switch drops the rest. Otherwise
+switching sessions would leak one session's resource contents into another's
+context. Closing a connection or unsubscribing a URI drops its queued updates.
+Only URIs you actually subscribed to are read.
+
+A subscription is marked **before** its `subscribe` request goes out, so a server
+that pushes the first update while the handshake is still in flight is not lost;
+a failed subscribe rolls the mark back. Closing a connection cancels an in-flight
+background read instead of waiting for its timeout, and joins the connection's
+dispatcher thread.
+
+This works for stdio servers today; HTTP/SSE push is not wired yet.
 
 ## Connections, bounds and cancellation
 

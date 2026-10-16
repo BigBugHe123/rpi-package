@@ -21,7 +21,8 @@ pub use jsonrpc::{
 };
 pub use runtime::{
     call_from_config, call_from_config_with_timeout, close_from_config, discover_from_config,
-    shutdown_connections, DiscoveredServer,
+    resources_from_config, shutdown_connections, take_resource_updates, DiscoveredServer,
+    ResourceUpdate,
 };
 use serde_json::{json, Value};
 pub use transport::{http_request, StdioTransport};
@@ -101,7 +102,12 @@ fn mcp_resource(params: &Value, control: &Control) -> Result<Value, String> {
 /// turn boundary, so the appended message never splits an assistant `tool_calls`
 /// from its `toolResult`s (the HTTP 400 that motivated this timing).
 extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    let updates = std::panic::catch_unwind(runtime::take_pending_updates).unwrap_or_default();
+    // Only the session the host is currently serving may reach the model. The
+    // scope is latched from the latest tool call (`__rpi.sessionId`), because
+    // `TurnEnd` carries no payload; updates for any other session are dropped.
+    let scope = std::panic::catch_unwind(runtime::current_scope).unwrap_or(None);
+    let updates = std::panic::catch_unwind(|| runtime::take_pending_updates(scope.as_deref()))
+        .unwrap_or_default();
     if updates.is_empty() {
         return 0;
     }

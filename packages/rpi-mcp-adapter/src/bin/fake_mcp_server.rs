@@ -74,8 +74,36 @@ fn main() {
         }
         let result = match method {
             "initialize" => {
-                json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"rpi-fake-mcp","version":"1"}})
+                json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"rpi-fake-mcp","version":"1"}})
             }
+            "resources/list" => {
+                json!({"resources":[{"uri":"mem://alpha","name":"alpha"}]})
+            }
+            "resources/read" => {
+                if mode("--hang-read") {
+                    eprintln!("fake server deliberately blocked in resources/read");
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
+                let uri = request["params"]["uri"].as_str().unwrap_or("mem://alpha");
+                json!({"contents":[{"uri":uri,"text":format!("value-of-{uri}")}]})
+            }
+            "resources/subscribe" => {
+                // Push the first update *before* the subscribe response, which is
+                // the ordering that used to lose it (the local subscription mark
+                // was only written after the reply arrived).
+                if mode("--notify-early") {
+                    let uri = request["params"]["uri"].as_str().unwrap_or("mem://alpha");
+                    writeln!(
+                        stdout,
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":uri}})
+                    )
+                    .unwrap();
+                    stdout.flush().unwrap();
+                }
+                json!({})
+            }
+            "resources/unsubscribe" => json!({}),
             "tools/list" => {
                 let echo = json!({"name":"echo","description":"Echo one value","inputSchema":{"type":"object","properties":{"value":{"type":"string"}}}});
                 if mode("--paged") {

@@ -105,6 +105,130 @@ fn config_with_mode(mode: &str) -> std::path::PathBuf {
     fs::write(&path, json!({"mcpServers":{"fake":{"command":env!("CARGO_BIN_EXE_fake_mcp_server"),"args":[mode],"timeout":2}}}).to_string()).unwrap();
     path
 }
+
+fn config_with_modes(modes: &[&str]) -> std::path::PathBuf {
+    config_with_modes_and_timeout(modes, 2)
+}
+
+fn config_with_modes_and_timeout(modes: &[&str], timeout: u64) -> std::path::PathBuf {
+    let path = config_path();
+    fs::write(&path, json!({"mcpServers":{"fake":{"command":env!("CARGO_BIN_EXE_fake_mcp_server"),"args":modes,"timeout":timeout}}}).to_string()).unwrap();
+    path
+}
+
+/// The pending queue is process-global, so tests that inspect it must not run
+/// concurrently with each other.
+static RESOURCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn drain_updates_until(within: std::time::Duration) -> Vec<rpi_mcp_adapter::ResourceUpdate> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let updates = rpi_mcp_adapter::take_resource_updates(None);
+        if !updates.is_empty() || std::time::Instant::now() >= deadline {
+            return updates;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Regression: the local subscription mark used to be written *after* the
+/// `subscribe` response, so a server that pushed the first
+/// `notifications/resources/updated` while the handshake was still in flight had
+/// that update dropped by the dispatcher.
+#[test]
+fn subscribe_keeps_an_update_pushed_before_the_response() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    let subscribed = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    assert_eq!(subscribed["subscribed"], true);
+
+    let updates = drain_updates_until(std::time::Duration::from_secs(5));
+    assert_eq!(
+        updates.len(),
+        1,
+        "the update pushed before the subscribe response was lost: {updates:?}"
+    );
+    assert!(updates[0].text.contains("value-of-mem://alpha"));
+
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+}
+
+/// Regression: the background `resources/read` used a standalone control, so
+/// `close` waited for its timeout (up to 120 s) instead of cancelling it.
+#[test]
+fn close_cancels_a_blocked_background_read() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // A long client timeout: without the fix, close would wait for the blocked
+    // read to time out (30 s) instead of cancelling it.
+    let path = config_with_modes_and_timeout(&["--notify-early", "--hang-read"], 30);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    // Give the dispatcher a moment to enter the (blocking) read.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let started = std::time::Instant::now();
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "close waited for the blocked read instead of cancelling it: {elapsed:?}"
+    );
+    let _ = fs::remove_file(path);
+}
+
+/// Regression: closing a connection must leave no queued updates behind, so a
+/// later session cannot be shown a released connection's resource contents.
+///
+/// Deliberately per-connection (`close_from_config`) rather than the global
+/// `shutdown_connections`, which would tear down every other test's session.
+#[test]
+fn close_drops_queued_resource_updates() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    let subscribe = || {
+        rpi_mcp_adapter::resources_from_config(
+            path.to_str().unwrap(),
+            "fake",
+            "subscribe",
+            Some("mem://alpha"),
+        )
+        .unwrap()
+    };
+
+    // The pipeline works: the update pushed before the response is queued.
+    subscribe();
+    let first = drain_updates_until(std::time::Duration::from_secs(5));
+    assert_eq!(first.len(), 1, "expected one queued update, got {first:?}");
+
+    // Queue another and close without draining it.
+    subscribe();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+
+    assert!(
+        rpi_mcp_adapter::take_resource_updates(None).is_empty(),
+        "close left resource updates queued for a later session"
+    );
+    let _ = fs::remove_file(path);
+}
 #[test]
 fn persistent_session_and_paginated_tools() {
     let path = config_with_mode("--paged");
