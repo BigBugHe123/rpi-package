@@ -150,7 +150,7 @@ pub(super) fn dispatch_with(
 
 /// Run `ids` with at most `max_parallel` children at a time, preserving input
 /// order in the returned pairs.
-fn run_wave(
+pub(super) fn run_wave(
     graph: &Graph,
     ids: &[String],
     max_parallel: usize,
@@ -159,6 +159,12 @@ fn run_wave(
 ) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(max_parallel.max(1)) {
+        // Cancellation can arrive after dispatch marks the ready set running
+        // but before the first chunk starts. Leave these nodes without outcomes
+        // so dispatch restores them to pending instead of failing a dead branch.
+        if control.is_cancelled() {
+            break;
+        }
         progress(
             progress_tx,
             &format!(

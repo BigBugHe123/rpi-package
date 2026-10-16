@@ -361,6 +361,67 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_the_first_chunk_keeps_the_whole_plan_retryable() {
+        let _serial = graph_test_guard();
+        let mut params = params_for(Some("cancel-before-first-chunk"));
+        params["action"] = serde_json::json!("set");
+        params["maxParallel"] = serde_json::json!(1);
+        params["nodes"] = serde_json::json!([
+            {"id":"a", "task":"a"},
+            {"id":"b", "task":"b"},
+            {"id":"dependent", "task":"dependent", "deps":["a"]}
+        ]);
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        crate::plan::plan(&params, &control, &progress).unwrap();
+        crate::dispatch::dispatch_with(
+            &params,
+            &control,
+            &progress,
+            |graph, ready, parallel, control, progress| {
+                // Cancel after dispatch marks the ready set running, but
+                // before run_wave starts its first chunk. No child may run.
+                control.cancel();
+                crate::dispatch::run_wave(graph, ready, parallel, control, progress)
+            },
+        )
+        .unwrap();
+        {
+            let state = lock_graph(&params);
+            for node in &state.graph().nodes {
+                assert_eq!(
+                    node.status,
+                    graph::Status::Pending,
+                    "unstarted node {} became {:?}",
+                    node.id,
+                    node.status
+                );
+            }
+        }
+        let control = crate::control::Control::default();
+        let fixture = |_: &graph::Graph,
+                       ready: &[String],
+                       _: usize,
+                       _: &crate::control::Control,
+                       _: &crate::kit::Progress| {
+            ready
+                .iter()
+                .map(|id| (id.clone(), Ok("fixture success".into())))
+                .collect()
+        };
+        // Retrying without resetting the graph completes the independent nodes,
+        // then their dependent on the next wave. The fixture launches no child.
+        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
+        assert_eq!(lock_graph(&params).graph().ready(), vec!["dependent"]);
+        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
+        assert!(lock_graph(&params)
+            .graph()
+            .nodes
+            .iter()
+            .all(|node| node.status == graph::Status::Done));
+    }
+
+    #[test]
     fn verification_keeps_plan_readable_and_does_not_commit_into_a_new_session() {
         use std::time::{Duration, Instant};
         let _serial = graph_test_guard();
