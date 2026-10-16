@@ -162,6 +162,38 @@ fn subscribe_keeps_an_update_pushed_before_the_response() {
     let _ = fs::remove_file(path);
 }
 
+#[test]
+fn unsubscribe_and_resubscribe_keep_resource_delivery_consistent() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    let resource = |action| {
+        rpi_mcp_adapter::resources_from_config(
+            path.to_str().unwrap(),
+            "fake",
+            action,
+            Some("mem://alpha"),
+        )
+        .unwrap()
+    };
+    resource("subscribe");
+    assert_eq!(
+        drain_updates_until(std::time::Duration::from_secs(5)).len(),
+        1
+    );
+    assert_eq!(resource("unsubscribe")["unsubscribed"], true);
+    assert!(rpi_mcp_adapter::take_resource_updates(None).is_empty());
+    assert_eq!(resource("subscribe")["subscribed"], true);
+    let updates = drain_updates_until(std::time::Duration::from_secs(5));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(
+        updates.len(),
+        1,
+        "new subscription failed to deliver: {updates:?}"
+    );
+}
+
 /// Regression: the background `resources/read` used a standalone control, so
 /// `close` waited for its timeout (up to 120 s) instead of cancelling it.
 #[test]

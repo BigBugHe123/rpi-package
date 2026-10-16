@@ -7,7 +7,7 @@ use crate::control::{Control, Deadline};
 use crate::http::HttpTransport;
 use crate::{McpConfig, McpServerConfig, Request, Response, ServerInfo, StdioTransport, Tool};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
@@ -156,10 +156,12 @@ fn sessions() -> &'static Mutex<Sessions> {
 // Resource subscriptions and pushed updates
 // ---------------------------------------------------------------------------
 
-/// Subscribed resource URIs, per connection key.
-static SUBSCRIPTIONS: OnceLock<Mutex<std::collections::HashMap<String, HashSet<String>>>> =
-    OnceLock::new();
-fn subscriptions() -> &'static Mutex<std::collections::HashMap<String, HashSet<String>>> {
+// Each subscription lifetime gets its own identity, so a read begun before
+// unsubscribe/close can never be accepted by a later subscription to the same URI.
+type Subscription = Arc<()>;
+type Subscriptions = HashMap<String, HashMap<String, Subscription>>;
+static SUBSCRIPTIONS: OnceLock<Mutex<Subscriptions>> = OnceLock::new();
+fn subscriptions() -> &'static Mutex<Subscriptions> {
     SUBSCRIPTIONS.get_or_init(Default::default)
 }
 
@@ -260,33 +262,53 @@ fn clear_all_pending() {
     pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
-fn add_subscription(key: &str, uri: &str) {
-    if let Ok(mut map) = subscriptions().lock() {
-        map.entry(key.to_string())
-            .or_default()
-            .insert(uri.to_string());
-    }
-}
-fn remove_subscription(key: &str, uri: &str) {
-    if let Ok(mut map) = subscriptions().lock() {
-        if let Some(set) = map.get_mut(key) {
-            set.remove(uri);
-            if set.is_empty() {
-                map.remove(key);
-            }
-        }
-    }
-}
-fn clear_subscriptions(key: &str) {
-    if let Ok(mut map) = subscriptions().lock() {
-        map.remove(key);
-    }
-}
-fn is_subscribed(key: &str, uri: &str) -> bool {
+fn add_subscription(key: &str, uri: &str) -> Subscription {
+    let token = Arc::new(());
     subscriptions()
         .lock()
-        .map(|map| map.get(key).is_some_and(|set| set.contains(uri)))
-        .unwrap_or(false)
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key.to_string())
+        .or_default()
+        .insert(uri.to_string(), token.clone());
+    token
+}
+
+fn subscription(key: &str, uri: &str) -> Option<Subscription> {
+    subscriptions()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .and_then(|uris| uris.get(uri))
+        .cloned()
+}
+
+/// Always lock subscriptions before pending, and hold both while invalidating
+/// and purging. Enqueue uses the same order, so nothing can slip in after purge.
+/// An expected token prevents a failed older operation retiring a newer lifetime.
+fn remove_subscription(key: &str, uri: &str, expected: Option<&Subscription>) {
+    let mut map = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(expected) = expected {
+        if !map
+            .get(key)
+            .and_then(|uris| uris.get(uri))
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            return;
+        }
+    }
+    if let Some(uris) = map.get_mut(key) {
+        uris.remove(uri);
+        if uris.is_empty() {
+            map.remove(key);
+        }
+    }
+    clear_pending_for_uri(key, uri);
+}
+
+fn clear_subscriptions(key: &str) {
+    let mut map = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
+    map.remove(key);
+    clear_pending_for_key(key);
 }
 
 /// One dispatcher per connection. It ends when every sender is gone (entry
@@ -310,6 +332,14 @@ fn spawn_dispatcher(key: String, receiver: Receiver<Value>, stop: Control) -> Jo
 }
 
 fn dispatch_notification(key: &str, value: &Value) {
+    dispatch_notification_with(key, value, read_resource_by_key);
+}
+
+fn dispatch_notification_with(
+    key: &str,
+    value: &Value,
+    read: impl FnOnce(&str, &str) -> Result<String, String>,
+) {
     let method = value
         .get("method")
         .and_then(Value::as_str)
@@ -329,10 +359,19 @@ fn dispatch_notification(key: &str, value: &Value) {
     // server that pushes the first update while the handshake is still in flight
     // is accepted here rather than dropped. A failed subscribe rolls the mark
     // back (and purges anything queued in the meantime).
-    if !is_subscribed(key, &uri) {
+    let Some(token) = subscription(key, &uri) else {
         return;
-    }
-    if let Ok(text) = read_resource_by_key(key, &uri) {
+    };
+    if let Ok(text) = read(key, &uri) {
+        let map = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
+        if !map
+            .get(key)
+            .and_then(|uris| uris.get(&uri))
+            .is_some_and(|current| Arc::ptr_eq(current, &token))
+        {
+            return;
+        }
+        // Keep the subscription lock through enqueue, synchronized with retirement.
         let mut pending = pending().lock().unwrap_or_else(|p| p.into_inner());
         if pending.len() < MAX_PENDING {
             pending.push(ResourceUpdate {
@@ -449,17 +488,27 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
 
     let uri = crate::kit::string_param(params, "uri")?;
     if action == "unsubscribe" {
+        let previous = subscription(&key, &uri);
+        let mut retired = false;
         let _ = with_session(key.clone(), config, timeout, control, |session, control| {
+            // Serialize subscription changes with their RPCs on this connection.
+            // Invalidate before sending, so even a failed remote unsubscribe
+            // stops local delivery and a read cannot outlive the purge.
+            remove_subscription(&key, &uri, None);
+            retired = true;
             response_result(session.request(
                 "resources/unsubscribe",
                 json!({"uri": uri}),
                 control,
             )?)
         });
-        remove_subscription(&key, &uri);
-        // Anything already read for this URI must not be injected after the
-        // model has been told the subscription is gone.
-        clear_pending_for_uri(&key, &uri);
+        // If connecting/locking failed, retire only the lifetime we observed;
+        // never remove a fresh subscription created by a concurrent call.
+        if !retired {
+            if let Some(previous) = previous {
+                remove_subscription(&key, &uri, Some(&previous));
+            }
+        }
         return Ok(json!({"server": name, "uri": uri, "unsubscribed": true}));
     }
     if action == "subscribe" {
@@ -469,19 +518,18 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                     .into(),
             );
         }
-        // Mark the subscription *before* the request: a server may push the
-        // first `resources/updated` while the handshake is still in flight, and
-        // the dispatcher drops notifications for unmarked URIs. A failed
-        // subscribe rolls the mark back and purges anything queued meanwhile.
-        add_subscription(&key, &uri);
-        let subscribed = with_session(key.clone(), config, timeout, control, |session, control| {
-            response_result(session.request("resources/subscribe", json!({"uri": uri}), control)?)
-        });
-        if let Err(error) = subscribed {
-            remove_subscription(&key, &uri);
-            clear_pending_for_uri(&key, &uri);
-            return Err(error);
-        }
+        with_session(key.clone(), config, timeout, control, |session, control| {
+            // Register before the RPC so early notifications are accepted, while
+            // holding the connection lock so subscribe/unsubscribe stay ordered.
+            let token = add_subscription(&key, &uri);
+            let subscribed = session
+                .request("resources/subscribe", json!({"uri": uri}), control)
+                .and_then(response_result);
+            if subscribed.is_err() {
+                remove_subscription(&key, &uri, Some(&token));
+            }
+            subscribed
+        })?;
         return Ok(json!({"server": name, "uri": uri, "subscribed": true}));
     }
     // read — flatten and bound the contents: a large blob must not reach the
@@ -575,9 +623,10 @@ fn retire_entry(entry: &Arc<Entry>) {
 }
 
 pub fn shutdown_connections() {
-    clear_all_pending();
-    if let Ok(mut subs) = subscriptions().lock() {
+    {
+        let mut subs = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
         subs.clear();
+        clear_all_pending();
     }
     let entries = if let Ok(mut map) = sessions().lock() {
         std::mem::take(&mut *map)
@@ -599,7 +648,6 @@ pub fn shutdown_connections() {
 }
 fn close_key(key: &str) -> Result<(), String> {
     clear_subscriptions(key);
-    clear_pending_for_key(key);
     let entry = sessions()
         .lock()
         .map_err(|_| "MCP session registry poisoned")?
@@ -901,6 +949,81 @@ mod tests {
 
     fn clear_queue() {
         pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    #[test]
+    fn in_flight_read_cannot_enqueue_after_subscription_retirement() {
+        let _serial = queue_test_guard();
+        const KEY: &str = r#"["session:race","config","server"]"#;
+        const URI: &str = "mem://race";
+        let notification = json!({"method":"notifications/resources/updated","params":{"uri":URI}});
+        for action in ["unsubscribe", "close-and-reopen", "replace"] {
+            clear_queue();
+            add_subscription(KEY, URI);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let value = notification.clone();
+            let worker = std::thread::spawn(move || {
+                dispatch_notification_with(KEY, &value, |_, _| {
+                    // Pause a successful read just before the dispatcher can
+                    // enqueue it, reproducing the original retirement race.
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok("obsolete content".into())
+                });
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            match action {
+                "unsubscribe" => remove_subscription(KEY, URI, None),
+                "close-and-reopen" => {
+                    clear_subscriptions(KEY);
+                    add_subscription(KEY, URI);
+                }
+                "replace" => {
+                    add_subscription(KEY, URI);
+                }
+                _ => unreachable!(),
+            }
+            queue("session:other", "other-key", URI, "unrelated");
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            let updates = take_pending_updates(None);
+            assert_eq!(
+                updates.len(),
+                1,
+                "{action}: stale read was queued: {updates:?}"
+            );
+            assert_eq!(updates[0].text, "unrelated");
+
+            if action != "unsubscribe" {
+                dispatch_notification_with(KEY, &notification, |_, _| Ok("fresh content".into()));
+                let updates = take_pending_updates(None);
+                assert_eq!(
+                    updates.len(),
+                    1,
+                    "{action}: new subscription stopped working"
+                );
+                assert_eq!(updates[0].text, "fresh content");
+            }
+            clear_subscriptions(KEY);
+        }
+    }
+
+    #[test]
+    fn stale_failure_cannot_remove_a_new_subscription_or_its_updates() {
+        let _serial = queue_test_guard();
+        clear_queue();
+        let old = add_subscription("key", "mem://a");
+        let current = add_subscription("key", "mem://a");
+        queue("session:a", "key", "mem://a", "fresh");
+        remove_subscription("key", "mem://a", Some(&old));
+        assert!(Arc::ptr_eq(
+            &subscription("key", "mem://a").unwrap(),
+            &current
+        ));
+        assert_eq!(take_pending_updates(None).len(), 1);
+        remove_subscription("key", "mem://a", Some(&current));
+        assert!(subscription("key", "mem://a").is_none());
     }
 
     struct SessionEnvGuard(Option<std::ffi::OsString>, Option<String>);

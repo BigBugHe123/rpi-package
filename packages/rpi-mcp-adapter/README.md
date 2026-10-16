@@ -77,11 +77,14 @@ boundary (`TurnEnd`) — never mid tool batch, so an assistant `tool_calls` mess
 stays adjacent to its `toolResult`s.
 
 Updates are queued **per session scope**, not globally: only updates produced
-under the session the host is currently serving (the `__rpi.sessionId` on the
-latest tool call) are injected, and a session switch drops the rest. Otherwise
+under the session the host is currently serving are injected, and a session
+switch drops the rest. The active session comes from the SDK environment, with
+the latest tool call's `__rpi.sessionId` as a fallback for older embedders. Otherwise
 switching sessions would leak one session's resource contents into another's
-context. Closing a connection or unsubscribing a URI drops its queued updates.
-Only URIs you actually subscribed to are read.
+context. Closing a connection or unsubscribing a URI drops its queued updates
+and prevents reads from that subscription lifetime from enqueueing late results.
+Subscribing again starts a new lifetime, so an older read cannot reach it.
+Only subscribed URIs trigger background reads.
 
 A subscription is marked **before** its `subscribe` request goes out, so a server
 that pushes the first update while the handshake is still in flight is not lost;
