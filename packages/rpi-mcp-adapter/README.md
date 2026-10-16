@@ -86,6 +86,12 @@ and prevents reads from that subscription lifetime from enqueueing late results.
 Subscribing again starts a new lifetime, so an older read cannot reach it.
 Only subscribed URIs trigger background reads.
 
+If the host rejects an update message, the adapter retries at a later turn
+boundary while the same session and subscription lifetime remain active. Newer
+reads supersede older failed deliveries, including reads already delivered by
+another boundary. Retries respect the 64-update queue limit and preserve newer
+queued content when it is full.
+
 A subscription is marked **before** its `subscribe` request goes out, so a server
 that pushes the first update while the handshake is still in flight is not lost;
 a failed subscribe rolls the mark back. Closing a connection cancels an in-flight

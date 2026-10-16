@@ -102,41 +102,17 @@ fn mcp_resource(params: &Value, control: &Control) -> Result<Value, String> {
 /// turn boundary, so the appended message never splits an assistant `tool_calls`
 /// from its `toolResult`s (the HTTP 400 that motivated this timing).
 extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    // Only the session the host is currently serving may reach the model. The
-    // host's session environment reflects hot switches even without an MCP
-    // call; older embedders fall back to the latest tool call's session scope.
-    let Ok(scope) = std::panic::catch_unwind(runtime::current_scope) else {
-        return 0;
-    };
-    let updates = std::panic::catch_unwind(|| runtime::take_pending_updates(scope.as_deref()))
-        .unwrap_or_default();
-    if updates.is_empty() {
-        return 0;
-    }
-    let mut text = String::from("🔔 MCP resource update(s):");
-    for update in &updates {
-        text.push_str(&format!(
-            "\n\n--- {} (server {})\n{}",
-            update.uri, update.key, update.text
-        ));
-    }
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let message = json!({
-        "kind": "custom",
-        "role": "custom",
-        "content": [{"type":"text","text": text}],
-        "data": {"customType": "mcp-resources", "display": true},
-        "timestamp": timestamp,
-    });
-    match call_runtime(
-        rpi_plugin_sdk::RuntimeActionId::AppendEntry,
-        json!({"message": message}),
-    ) {
-        Ok(_) => 0,
-        Err(_) => 1,
+    match std::panic::catch_unwind(|| {
+        runtime::flush_resource_updates(|message| {
+            call_runtime(
+                rpi_plugin_sdk::RuntimeActionId::AppendEntry,
+                json!({"message": message}),
+            )
+            .map(|_| ())
+        })
+    }) {
+        Ok(Ok(())) => 0,
+        _ => 1,
     }
 }
 

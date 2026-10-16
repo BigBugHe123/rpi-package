@@ -9,6 +9,7 @@ use crate::{McpConfig, McpServerConfig, Request, Response, ServerInfo, StdioTran
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread::JoinHandle;
@@ -164,7 +165,9 @@ fn sessions() -> &'static Mutex<Sessions> {
 
 // Each subscription lifetime gets its own identity, so a read begun before
 // unsubscribe/close can never be accepted by a later subscription to the same URI.
-type Subscription = Arc<()>;
+// Pointer identity distinguishes subscription lifetimes; the counter identifies
+// the newest read, including one delivered by an overlapping flush.
+type Subscription = Arc<AtomicU64>;
 type Subscriptions = HashMap<String, HashMap<String, Subscription>>;
 static SUBSCRIPTIONS: OnceLock<Mutex<Subscriptions>> = OnceLock::new();
 fn subscriptions() -> &'static Mutex<Subscriptions> {
@@ -184,8 +187,25 @@ pub struct ResourceUpdate {
     pub uri: String,
     pub text: String,
 }
-static PENDING: OnceLock<Mutex<Vec<ResourceUpdate>>> = OnceLock::new();
-fn pending() -> &'static Mutex<Vec<ResourceUpdate>> {
+struct QueuedResourceUpdate {
+    update: ResourceUpdate,
+    subscription: Subscription,
+    revision: u64,
+}
+
+impl QueuedResourceUpdate {
+    fn new(update: ResourceUpdate, subscription: Subscription) -> Self {
+        let revision = subscription.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        Self {
+            update,
+            subscription,
+            revision,
+        }
+    }
+}
+
+static PENDING: OnceLock<Mutex<Vec<QueuedResourceUpdate>>> = OnceLock::new();
+fn pending() -> &'static Mutex<Vec<QueuedResourceUpdate>> {
     PENDING.get_or_init(Default::default)
 }
 const MAX_PENDING: usize = 64;
@@ -238,14 +258,82 @@ fn scope_of_key(key: &str) -> String {
 /// session's resource contents into another's context. A host that predates
 /// `__rpi.sessionId` reports no scope, in which case everything is delivered.
 pub(crate) fn take_pending_updates(scope: Option<&str>) -> Vec<ResourceUpdate> {
+    take_pending_batch(scope)
+        .into_iter()
+        .map(|queued| queued.update)
+        .collect()
+}
+
+fn take_pending_batch(scope: Option<&str>) -> Vec<QueuedResourceUpdate> {
     let drained = std::mem::take(&mut *pending().lock().unwrap_or_else(|p| p.into_inner()));
     match scope {
         Some(scope) => drained
             .into_iter()
-            .filter(|update| update.scope == scope)
+            .filter(|queued| queued.update.scope == scope)
             .collect(),
         None => drained,
     }
+}
+
+/// Deliver resource notifications at a safe turn boundary.
+pub(crate) fn flush_resource_updates(
+    append: impl FnOnce(Value) -> Result<(), String>,
+) -> Result<(), String> {
+    let scope = current_scope();
+    let updates = take_pending_batch(scope.as_deref());
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut text = String::from("🔔 MCP resource update(s):");
+    for queued in &updates {
+        let update = &queued.update;
+        text.push_str(&format!(
+            "\n\n--- {} (server {})\n{}",
+            update.uri, update.key, update.text
+        ));
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let result = append(json!({
+        "kind": "custom",
+        "role": "custom",
+        "content": [{"type":"text","text": text}],
+        "data": {"customType": "mcp-resources", "display": true},
+        "timestamp": timestamp,
+    }));
+    if result.is_err() && current_scope() == scope {
+        restore_pending_batch(updates);
+    }
+    result
+}
+
+fn restore_pending_batch(updates: Vec<QueuedResourceUpdate>) {
+    // Retirement and enqueue use this same lock order. A failed append must
+    // never resurrect an unsubscribed URI, a closed connection or an older
+    // subscription lifetime. A newer read supersedes an older failed delivery,
+    // even if another flush has already drained and delivered that newer read.
+    let map = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
+    let mut pending = pending().lock().unwrap_or_else(|p| p.into_inner());
+    let mut retry = Vec::new();
+    for queued in updates {
+        if pending.len() + retry.len() >= MAX_PENDING {
+            break;
+        }
+        if map
+            .get(&queued.update.key)
+            .and_then(|uris| uris.get(&queued.update.uri))
+            .is_some_and(|current| {
+                Arc::ptr_eq(current, &queued.subscription)
+                    && current.load(Ordering::Relaxed) == queued.revision
+            })
+        {
+            retry.push(queued);
+        }
+    }
+    retry.append(&mut *pending);
+    *pending = retry;
 }
 
 /// Drop queued updates for one connection (close, unsubscribe, failed subscribe).
@@ -253,7 +341,7 @@ fn clear_pending_for_key(key: &str) {
     pending()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retain(|update| update.key != key);
+        .retain(|queued| queued.update.key != key);
 }
 
 /// Drop queued updates for one connection + URI.
@@ -261,11 +349,11 @@ fn clear_pending_for_uri(key: &str, uri: &str) {
     pending()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retain(|update| !(update.key == key && update.uri == uri));
+        .retain(|queued| !(queued.update.key == key && queued.update.uri == uri));
 }
 
 fn add_subscription(key: &str, uri: &str) -> Subscription {
-    let token = Arc::new(());
+    let token = Arc::new(AtomicU64::new(0));
     subscriptions()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -332,7 +420,7 @@ fn restore_subscriptions(
                 if skip_uri == Some(uri.as_str()) {
                     continue;
                 }
-                *token = Arc::new(());
+                *token = Arc::new(AtomicU64::new(0));
                 uris.push(uri.clone());
             }
         }
@@ -409,12 +497,15 @@ fn dispatch_notification_with(
         // Keep the subscription lock through enqueue, synchronized with retirement.
         let mut pending = pending().lock().unwrap_or_else(|p| p.into_inner());
         if pending.len() < MAX_PENDING {
-            pending.push(ResourceUpdate {
-                scope: scope_of_key(key),
-                key: key.to_string(),
-                uri,
-                text,
-            });
+            pending.push(QueuedResourceUpdate::new(
+                ResourceUpdate {
+                    scope: scope_of_key(key),
+                    key: key.to_string(),
+                    uri,
+                    text,
+                },
+                token,
+            ));
         }
     }
 }
@@ -1042,19 +1133,161 @@ mod tests {
     }
 
     fn queue(scope: &str, key: &str, uri: &str, text: &str) {
+        let token = subscription(key, uri).unwrap_or_default();
         pending()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(ResourceUpdate {
-                scope: scope.into(),
-                key: key.into(),
-                uri: uri.into(),
-                text: text.into(),
-            });
+            .push(QueuedResourceUpdate::new(
+                ResourceUpdate {
+                    scope: scope.into(),
+                    key: key.into(),
+                    uri: uri.into(),
+                    text: text.into(),
+                },
+                token,
+            ));
     }
 
     fn clear_queue() {
         pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    #[test]
+    fn failed_host_append_preserves_resource_updates_for_the_next_boundary() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        clear_queue();
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "delivery-retry");
+        const KEY: &str = r#"["session:delivery-retry","config","server"]"#;
+        const URI: &str = "mem://delivery";
+        add_subscription(KEY, URI);
+        let notification = json!({"method":"notifications/resources/updated","params":{"uri":URI}});
+        dispatch_notification_with(KEY, &notification, |_, _| Ok("current content".into()));
+        assert!(flush_resource_updates(|_| Err("host unavailable".into())).is_err());
+        assert_eq!(
+            pending().lock().unwrap().len(),
+            1,
+            "failed append lost the update"
+        );
+        let mut delivered = None;
+        flush_resource_updates(|message| {
+            delivered = Some(message);
+            Ok(())
+        })
+        .unwrap();
+        clear_subscriptions(KEY);
+        assert!(delivered.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("current content"));
+        flush_resource_updates(|_| panic!("successfully delivered update was replayed")).unwrap();
+    }
+
+    #[test]
+    fn failed_delivery_cannot_revive_retired_or_superseded_resource_content() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "delivery-lifetime");
+        const KEY: &str = r#"["session:delivery-lifetime","config","server"]"#;
+        const URI: &str = "mem://lifetime";
+        for action in [
+            "unsubscribe",
+            "close",
+            "replace",
+            "newer-read",
+            "newer-delivered",
+        ] {
+            clear_queue();
+            add_subscription(KEY, URI);
+            queue("session:delivery-lifetime", KEY, URI, "obsolete content");
+            let mut delivered = Vec::new();
+            let result = flush_resource_updates(|_| {
+                match action {
+                    "unsubscribe" => remove_subscription(KEY, URI, None),
+                    "close" => clear_subscriptions(KEY),
+                    _ => {
+                        if action == "replace" {
+                            add_subscription(KEY, URI);
+                        }
+                        queue("session:delivery-lifetime", KEY, URI, "fresh content");
+                        if action == "newer-delivered" {
+                            // Another boundary already delivered the newer read
+                            // before this older append reports failure.
+                            flush_resource_updates(|message| {
+                                delivered.push(message);
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    }
+                }
+                Err("host unavailable".into())
+            });
+            assert!(result.is_err());
+            flush_resource_updates(|message| {
+                delivered.push(message);
+                Ok(())
+            })
+            .unwrap();
+            clear_subscriptions(KEY);
+            if matches!(action, "unsubscribe" | "close") {
+                assert!(delivered.is_empty(), "{action}: {delivered:?}");
+            } else {
+                assert_eq!(delivered.len(), 1, "{action}: {delivered:?}");
+                let text = delivered[0]["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains("fresh content"), "{action}: {text}");
+                assert!(!text.contains("obsolete content"), "{action}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_delivery_drops_updates_after_a_session_switch() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        clear_queue();
+        const KEY_A: &str = r#"["session:delivery-a","config","server"]"#;
+        const KEY_B: &str = r#"["session:delivery-b","config","server"]"#;
+        const URI: &str = "mem://session";
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "delivery-a");
+        add_subscription(KEY_A, URI);
+        queue("session:delivery-a", KEY_A, URI, "A content");
+        assert!(flush_resource_updates(|_| {
+            std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "delivery-b");
+            add_subscription(KEY_B, URI);
+            queue("session:delivery-b", KEY_B, URI, "B content");
+            Err("host switched session".into())
+        })
+        .is_err());
+        let updates = take_pending_updates(None);
+        clear_subscriptions(KEY_A);
+        clear_subscriptions(KEY_B);
+        assert_eq!(updates.len(), 1, "old session was requeued: {updates:?}");
+        assert_eq!(updates[0].text, "B content");
+    }
+
+    #[test]
+    fn failed_delivery_keeps_the_queue_bounded_and_prefers_new_updates() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        clear_queue();
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "delivery-bounds");
+        const KEY: &str = r#"["session:delivery-bounds","config","server"]"#;
+        add_subscription(KEY, "mem://old");
+        queue("session:delivery-bounds", KEY, "mem://old", "old content");
+        assert!(flush_resource_updates(|_| {
+            for index in 0..MAX_PENDING {
+                let uri = format!("mem://fresh-{index}");
+                add_subscription(KEY, &uri);
+                queue("session:delivery-bounds", KEY, &uri, "fresh content");
+            }
+            Err("host unavailable".into())
+        })
+        .is_err());
+        let updates = take_pending_updates(None);
+        clear_subscriptions(KEY);
+        assert_eq!(updates.len(), MAX_PENDING);
+        assert!(updates.iter().all(|update| update.text == "fresh content"));
     }
 
     fn assert_teardown_retires_late_subscription(shutdown: bool) {
