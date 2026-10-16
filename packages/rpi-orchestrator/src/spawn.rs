@@ -454,31 +454,28 @@ mod tests {
         let mut command = Command::new("powershell.exe");
         command
             .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$p = Start-Process ping.exe -ArgumentList '-n','61','127.0.0.1' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:RPI_TEST_PID_FILE, [string]$p.Id); Start-Sleep -Seconds 60"])
+                "$ErrorActionPreference = 'Stop'; $i = New-Object System.Diagnostics.ProcessStartInfo; $i.FileName = 'ping.exe'; $i.Arguments = '-n 61 127.0.0.1'; $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $p = [System.Diagnostics.Process]::Start($i); [System.IO.File]::WriteAllText($env:RPI_TEST_PID_FILE, ([string]$p.Id + [Environment]::NewLine)); Start-Sleep -Seconds 60"])
             .env("RPI_TEST_PID_FILE", &pid_file)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
             .creation_flags(NO_WINDOW);
         let (mut parent, tree) = spawn_command(&mut command).expect("start parent");
+        let diagnostics = parent.stderr.take().map(spawn_reader);
         let deadline = Instant::now() + Duration::from_secs(15);
         let descendant = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file)
                 .ok()
+                .filter(|text| text.ends_with('\n'))
                 .and_then(|text| text.trim().parse::<u32>().ok())
             {
                 break Some(pid);
             }
-            if Instant::now() >= deadline {
+            if parent.try_wait().unwrap().is_some() || Instant::now() >= deadline {
                 break None;
             }
             std::thread::sleep(Duration::from_millis(50));
         };
         fn alive(pid: u32) -> bool {
-            let output = Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-                .creation_flags(NO_WINDOW)
-                .output()
-                .expect("query process");
-            String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+            rpi_plugin_sdk::process::process_is_running(pid).expect("query descendant process")
         }
         let was_alive = descendant.is_some_and(alive);
         kill_and_reap(&mut parent, &tree);
@@ -493,7 +490,13 @@ mod tests {
                 .status();
         }
         let _ = std::fs::remove_file(pid_file);
-        assert!(was_alive, "test descendant did not start");
+        let diagnostics = collect_reader(
+            diagnostics,
+            Instant::now() + Duration::from_secs(3),
+            &Control::default(),
+        )
+        .unwrap_or_else(|error| error);
+        assert!(was_alive, "test descendant did not start: {diagnostics}");
         assert!(!survived, "cancellation left the descendant running");
         assert!(parent.try_wait().unwrap().is_some());
     }
