@@ -59,6 +59,70 @@ class StagePluginsTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(Path(output), target / "release")
 
+    def test_rejects_output_that_would_delete_build_inputs(self):
+        for destination in ["release", "target", "ancestor", "alias"]:
+            with self.subTest(destination=destination), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+                target = root / "target"
+                release = target / "release"
+                release.mkdir(parents=True)
+                (release / "child").mkdir()
+                artifact = release / "rpi_probe.dll"
+                artifact.write_bytes(b"built plugin")
+                metadata = {
+                    "target_directory": str(target),
+                    "packages": [{"targets": [{"name": "rpi_probe", "crate_types": ["cdylib"]}]}],
+                }
+                output = {
+                    "release": release,
+                    "target": target,
+                    "ancestor": root,
+                    "alias": release / "child" / "..",
+                }[destination]
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    self.run_stage(metadata, "win32", "--out", str(output))
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(artifact.read_bytes(), b"built plugin")
+
+    def test_output_inside_release_preserves_the_build_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            release = root / "target" / "release"
+            release.mkdir(parents=True)
+            artifact = release / "rpi_probe.dll"
+            artifact.write_bytes(b"built plugin")
+            metadata = {
+                "target_directory": str(release.parent),
+                "packages": [{"targets": [{"name": "rpi_probe", "crate_types": ["cdylib"]}]}],
+            }
+            output = release / "smoke-plugins"
+            result, _ = self.run_stage(metadata, "win32", "--out", str(output))
+            self.assertEqual(result, 0)
+            self.assertEqual(artifact.read_bytes(), b"built plugin")
+            self.assertEqual((output / artifact.name).read_bytes(), b"built plugin")
+
+    def test_rejects_workspace_root_when_the_cargo_target_is_elsewhere(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            workspace = root / "workspace"
+            workspace.mkdir()
+            manifest = workspace / "Cargo.toml"
+            manifest.write_bytes(b"workspace manifest")
+            target = root / "shared-target"
+            (target / "release").mkdir(parents=True)
+            metadata = {
+                "workspace_root": str(workspace),
+                "target_directory": str(target),
+                "packages": [],
+            }
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                self.run_stage(metadata, "win32", "--out", str(workspace))
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(manifest.read_bytes(), b"workspace manifest")
+
 
 if __name__ == "__main__":
     unittest.main()
