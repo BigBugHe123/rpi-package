@@ -89,13 +89,17 @@ fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
                 .ok_or("each `setDeps` entry needs a `deps` array")?;
             let mut parsed = Vec::with_capacity(deps.len());
             for dep in deps {
-                parsed.push(
-                    dep.as_str()
-                        .map(str::trim)
-                        .filter(|dep| !dep.is_empty())
-                        .ok_or("`deps` must contain non-empty strings")?
-                        .to_string(),
-                );
+                let dep = dep
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|dep| !dep.is_empty())
+                    .ok_or("`deps` must contain non-empty strings")?
+                    .to_string();
+                // Match Node::from_value: duplicate edges are one dependency,
+                // otherwise the cycle detector's indegree can never reach zero.
+                if !parsed.contains(&dep) {
+                    parsed.push(dep);
+                }
             }
             let node = graph
                 .get_mut(id)
@@ -152,6 +156,23 @@ mod tests {
 
         apply_update(&mut g, &json!({"removeIds": ["c"]})).unwrap();
         assert!(g.get("c").is_none());
+    }
+
+    #[test]
+    fn dependency_updates_accept_duplicate_edges_like_plan_creation() {
+        let mut graph = seeded();
+        apply_update(
+            &mut graph,
+            &json!({"setDeps":[{"id":"b","deps":["a", " a "]}]}),
+        )
+        .unwrap();
+        graph
+            .validate()
+            .expect("duplicate dependency edges are not a cycle");
+        assert_eq!(graph.get("b").unwrap().deps, vec!["a"]);
+        assert_eq!(graph.ready(), vec!["a"]);
+        graph.get_mut("a").unwrap().status = Status::Done;
+        assert_eq!(graph.ready(), vec!["b"]);
     }
 
     #[test]
