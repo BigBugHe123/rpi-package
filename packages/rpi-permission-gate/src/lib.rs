@@ -8,6 +8,7 @@
 //! `--mode rpc` UI bridge that an ACP client such as `rpi-acp` serves.
 //!
 //! Off by default. Enable with `--permission-gate` or `RPI_PERMISSION_GATE=1`.
+//! `--bypass` overrides both activation methods for this process.
 //! When a tool is denied, the handler returns `EVENT_HANDLER_ABORT`, which the
 //! host's `before_tool_call` turns into a blocked tool (an error result the
 //! model sees). If the dialog cannot be answered (no UI), it **blocks** — the
@@ -24,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// CLI flag that turns gating on.
 const GATE_FLAG: &str = "permission-gate";
+const BYPASS_FLAG: &str = "bypass";
 /// Env equivalent (useful when the flag cannot be passed).
 const GATE_ENV: &str = "RPI_PERMISSION_GATE";
 
@@ -78,6 +80,10 @@ fn env_flag(name: &str) -> bool {
             !value.is_empty() && !value.eq_ignore_ascii_case("false") && value != "0"
         })
         .unwrap_or(false)
+}
+
+fn gate_enabled(bypass: bool, flag: bool, environment: bool) -> bool {
+    !bypass && (flag || environment)
 }
 
 fn next_request_id() -> String {
@@ -269,6 +275,12 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
 
             if let Some(register_flag) = api.register_flag {
                 let _ = register_flag(
+                    StbStringRef::from_str(BYPASS_FLAG),
+                    StbStringRef::from_str(
+                        "Skip permission-gate approvals for this process and ACP sessions",
+                    ),
+                );
+                let _ = register_flag(
                     StbStringRef::from_str(GATE_FLAG),
                     StbStringRef::from_str(
                         "Confirm dangerous bash/write/edit tool calls via the host UI dialog",
@@ -278,7 +290,11 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
 
             // Off unless explicitly enabled — a gate can hang a headless run
             // whose client cannot answer UI dialogs.
-            if !flag_is_on(get_cli_flag(GATE_FLAG).as_ref()) && !env_flag(GATE_ENV) {
+            if !gate_enabled(
+                flag_is_on(get_cli_flag(BYPASS_FLAG).as_ref()),
+                flag_is_on(get_cli_flag(GATE_FLAG).as_ref()),
+                env_flag(GATE_ENV),
+            ) {
                 return 0;
             }
             ENABLED.store(true, Ordering::Release);
@@ -294,6 +310,16 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bypass_overrides_both_gate_activation_methods() {
+        for flag in [false, true] {
+            for environment in [false, true] {
+                assert!(!gate_enabled(true, flag, environment));
+                assert_eq!(gate_enabled(false, flag, environment), flag || environment);
+            }
+        }
+    }
 
     #[test]
     fn summarize_covers_gated_tools() {

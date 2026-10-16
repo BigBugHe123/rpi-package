@@ -47,6 +47,7 @@ use std::thread;
 
 /// The CLI flag that turns an ordinary `rpi` invocation into an ACP agent.
 const ACP_FLAG: &str = "acp";
+const BYPASS_FLAG: &str = "bypass";
 /// One-shot: register rpi in Zed's settings, then exit.
 const INSTALL_ZED_FLAG: &str = "install-zed";
 /// One-shot: print the Zed settings snippet, then exit.
@@ -306,6 +307,12 @@ fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
             StbStringRef::from_str("Run as an ACP (Agent Client Protocol) stdio agent"),
         );
         let _ = register_flag(
+            StbStringRef::from_str(BYPASS_FLAG),
+            StbStringRef::from_str(
+                "Skip permission-gate approvals for this process and ACP sessions",
+            ),
+        );
+        let _ = register_flag(
             StbStringRef::from_str(INSTALL_ZED_FLAG),
             StbStringRef::from_str("Register rpi in Zed's settings.json, then exit"),
         );
@@ -323,6 +330,7 @@ fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     // `read_piped_stdin` from the `ownsStdio` declaration, which must be in the
     // registry before `build()` returns.
     let acp = flag_is_on(get_cli_flag(ACP_FLAG).as_ref());
+    session::set_permission_bypass(flag_is_on(get_cli_flag(BYPASS_FLAG).as_ref()));
     let install = flag_is_on(get_cli_flag(INSTALL_ZED_FLAG).as_ref());
     let print = flag_is_on(get_cli_flag(PRINT_ZED_FLAG).as_ref());
     let setup = flag_is_on(get_cli_flag(SETUP_FLAG).as_ref());

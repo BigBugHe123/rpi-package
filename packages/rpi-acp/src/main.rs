@@ -33,11 +33,13 @@ const USAGE: &str = "\
 rpi-acp-bridge - ACP stdio agent for rpi
 
 USAGE:
+    rpi-acp-bridge [--bypass]
     rpi-acp-bridge [--setup [--provider <ID>]] [--install-zed [OPTIONS]] [--print-zed]
 
 With no arguments it serves ACP on stdin/stdout (this is how Zed launches it).
 
 COMMANDS:
+    --bypass        Serve ACP without permission-gate approvals
     --setup         Log in to a provider, then exit 0 once credentials are usable.
                     This is the ACP `terminal` auth method: an ACP client runs
                     the same command it uses to start the agent, plus --setup.
@@ -79,6 +81,10 @@ fn main() {
 /// `None` falls through to the ACP server so an ACP client can spawn us bare.
 fn subcommand(args: Vec<String>) -> Option<i32> {
     match args.first().map(String::as_str)? {
+        "--bypass" if args.len() == 1 => {
+            rpi_acp::session::set_permission_bypass(true);
+            None
+        }
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
             Some(0)
