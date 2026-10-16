@@ -306,6 +306,74 @@ fn repeated_subscribe_reuses_the_active_remote_subscription() {
 }
 
 #[test]
+fn failed_remote_unsubscribe_does_not_prevent_resubscribing() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&[
+        "--stateful-resources",
+        "--reject-duplicate-subscribe",
+        "--reject-unsubscribe",
+    ]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "unsubscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    let subscribed = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    );
+    let tick = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_secs(3));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert!(
+        subscribed.is_ok(),
+        "remote unsubscribe failure stranded the subscription: {subscribed:?}"
+    );
+    assert_eq!(tick.unwrap(), "echo:tick");
+    assert_eq!(updates.len(), 1, "resubscribed resource stopped updating");
+}
+
+#[test]
+fn failed_remote_unsubscribe_preserves_other_subscriptions_on_reconnect() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&[
+        "--stateful-resources",
+        "--reject-duplicate-subscribe",
+        "--reject-unsubscribe",
+    ]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://beta"),
+    )
+    .unwrap();
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "unsubscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    let tick = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_secs(3));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(tick.unwrap(), "echo:tick");
+    assert_eq!(updates.len(), 1, "unrelated subscription was lost");
+    assert_eq!(updates[0].uri, "mem://beta");
+}
+
+#[test]
 fn explicit_resubscribe_after_disconnect_keeps_the_early_update() {
     let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = config_with_modes(&["--stateful-resources", "--notify-early"]);
@@ -505,8 +573,15 @@ fn close_drops_queued_resource_updates() {
     let first = drain_updates_until(std::time::Duration::from_secs(5));
     assert_eq!(first.len(), 1, "expected one queued update, got {first:?}");
 
-    // Queue another and close without draining it.
-    subscribe();
+    // A new URI triggers another early update. Repeating the existing URI
+    // reuses its remote registration and would leave this check with no update.
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://beta"),
+    )
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
 
