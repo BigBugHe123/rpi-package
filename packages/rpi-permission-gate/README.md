@@ -29,7 +29,14 @@ RPI_PERMISSION_GATE=1 rpi      # or env
 ```
 
 `rpi-acp` passes `--permission-gate` to its child sessions by default (so Zed
-shows approval prompts); set `RPI_ACP_NO_PERMISSION_GATE=1` to opt out.
+shows approval prompts). Use `rpi --acp --bypass` to skip those approvals, or
+`rpi --permission-gate --bypass` for a direct invocation. `--bypass` wins over
+both `--permission-gate` and `RPI_PERMISSION_GATE=1`, applies only to this
+process (and ACP children), and does not change saved settings. It only disables
+this gate; other extensions' policies and ordinary questions still apply.
+
+The legacy `RPI_ACP_NO_PERMISSION_GATE=1` remains supported: it stops ACP from
+adding the enable flag but does not override `RPI_PERMISSION_GATE=1`.
 
 ## Behavior
 
