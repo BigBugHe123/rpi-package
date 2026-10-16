@@ -106,3 +106,10 @@ schema; it simply persists and forwards the custom message to the model.
 Injection is deduplicated per goal-state fingerprint (`title|status|notes`). The
 live turn counter is deliberately excluded from the fingerprint so a running
 budget does not re-inject every turn.
+
+Changes made by the `goal` tool are queued until `TurnEnd`, keeping custom
+messages outside tool-call batches. Slash commands flush at the end of their
+handler. A failed `AppendEntry` keeps the latest notice for the next safe
+boundary; only a successful append marks it delivered. Budget-exhaustion notices
+use the same retry path and retain the reason the goal paused. A newer goal
+change supersedes an older notice still waiting to be delivered.
