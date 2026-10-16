@@ -11,9 +11,13 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const GOAL_FILE: &str = ".rpi/goals.json";
+/// State is stored as a custom entry in the current session branch. Unlike the
+/// legacy project file, this cannot leak an active goal into another session.
+const GOAL_STATE_ENTRY: &str = "goal-state";
 /// The custom-message type stored in the generic AgentMessage payload.
 const GOAL_CUSTOM_TYPE: &str = "goal";
 const MAX_TITLE_CHARS: usize = 500;
@@ -26,6 +30,45 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// Last injected goal-state fingerprint (title + status + notes). Prevents
 /// re-injecting the same status on every `TurnEnd` (transcript bloat).
 static LAST_INJECTED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// A goal notice queued by a state change that happened inside a tool batch.
+/// Appending immediately would split an assistant tool call from its result.
+struct PendingInjection {
+    revision: u64,
+    goal: Goal,
+    budget_reason: Option<String>,
+}
+
+static PENDING_INJECT: OnceLock<Mutex<Option<PendingInjection>>> = OnceLock::new();
+static PENDING_STATE: OnceLock<Mutex<Option<Goals>>> = OnceLock::new();
+static INJECTION_REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn pending_state() -> &'static Mutex<Option<Goals>> {
+    PENDING_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn queue_state(goals: &Goals) {
+    *pending_state().lock().unwrap_or_else(|p| p.into_inner()) = Some(goals.clone());
+}
+
+fn pending_inject() -> &'static Mutex<Option<PendingInjection>> {
+    PENDING_INJECT.get_or_init(|| Mutex::new(None))
+}
+
+fn queue_notice(goal: &Goal, budget_reason: Option<String>) {
+    let revision = INJECTION_REVISION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    *pending_inject().lock().unwrap_or_else(|p| p.into_inner()) = Some(PendingInjection {
+        revision,
+        goal: goal.clone(),
+        budget_reason,
+    });
+}
+
+fn queue_inject(goal: &Goal) {
+    queue_notice(goal, None);
+}
 
 fn last_injected() -> &'static Mutex<Option<String>> {
     LAST_INJECTED.get_or_init(|| Mutex::new(None))
@@ -64,20 +107,23 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Goal {
     title: String,
     status: String, // active | paused | complete
     notes: String,
+    #[serde(alias = "started_at")]
     started_at: i64,
+    #[serde(alias = "updated_at")]
     updated_at: i64,
     /// Turns completed while the goal was active. Drives the `max_turns` budget.
-    #[serde(default)]
+    #[serde(default, alias = "turns_used")]
     turns_used: u32,
     /// Turn budget. `None` = unlimited.
-    #[serde(default)]
+    #[serde(default, alias = "max_turns")]
     max_turns: Option<u32>,
     /// Absolute epoch-ms deadline. `None` = unlimited.
-    #[serde(default)]
+    #[serde(default, alias = "deadline_ms")]
     deadline_ms: Option<i64>,
 }
 
@@ -135,7 +181,52 @@ fn goals_path() -> PathBuf {
         .join(GOAL_FILE)
 }
 
+/// Read the latest goal state from the current session branch. The file
+/// fallback exists only for unit tests or hosts that invoke the library
+/// without a runtime; a live plugin never reads the project-scoped file.
+fn flush_pending_state() -> bool {
+    let state = pending_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    let Some(goals) = state else {
+        return true;
+    };
+    if write_goals(&goals).is_ok() {
+        true
+    } else {
+        *pending_state().lock().unwrap_or_else(|p| p.into_inner()) = Some(goals);
+        false
+    }
+}
+
 fn read_goals() -> Goals {
+    if RUNTIME.get().is_some() {
+        if let Some(goals) = pending_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return goals;
+        }
+        let Ok(value) = call_runtime(RuntimeActionId::GetSessionBranch, json!({})) else {
+            return Goals::default();
+        };
+        let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+            return Goals::default();
+        };
+        for entry in entries.iter().rev() {
+            if entry.get("type").and_then(Value::as_str) == Some("custom")
+                && entry.get("customType").and_then(Value::as_str) == Some(GOAL_STATE_ENTRY)
+            {
+                if let Some(data) = entry.get("data") {
+                    return serde_json::from_value(data.clone()).unwrap_or_default();
+                }
+            }
+        }
+        return Goals::default();
+    }
+
     let path = goals_path();
     let Ok(text) = fs::read_to_string(&path) else {
         return Goals::default();
@@ -144,6 +235,14 @@ fn read_goals() -> Goals {
 }
 
 fn write_goals(goals: &Goals) -> Result<(), String> {
+    if RUNTIME.get().is_some() {
+        call_runtime(
+            RuntimeActionId::AppendEntry,
+            json!({"customType": GOAL_STATE_ENTRY, "data": goals}),
+        )?;
+        return Ok(());
+    }
+
     let path = goals_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create goal directory: {e}"))?;
@@ -295,6 +394,32 @@ fn append_budget_message(goal: &Goal, reason: &str) -> Result<(), String> {
     append_custom_message(goal, text)
 }
 
+fn flush_pending_inject() {
+    if !flush_pending_state() {
+        return;
+    }
+    let pending = pending_inject()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    let Some(pending) = pending else {
+        return;
+    };
+    let result = match pending.budget_reason.as_deref() {
+        Some(reason) => append_budget_message(&pending.goal, reason),
+        None => append_goal_custom_message(&pending.goal),
+    };
+    let mut queued = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
+    if INJECTION_REVISION.load(Ordering::Relaxed) != pending.revision {
+        return;
+    }
+    if result.is_ok() {
+        remember_injected(Some(fingerprint(&pending.goal)));
+    } else {
+        *queued = Some(pending);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core operations (shared by the `goal` tool and the `/goal` command)
 // ---------------------------------------------------------------------------
@@ -329,13 +454,19 @@ fn validate_notes(notes: &str) -> Result<String, String> {
     Ok(notes.to_string())
 }
 
-/// Persist `goal` as the active goal and inject it into the model context.
-fn persist_and_inject(goals: &Goals, goal: &Goal) -> Result<(), String> {
+/// Persist `goal` as the active goal and queue its context injection.
+///
+/// The notice is appended at a safe boundary, never inline with a goal tool
+/// result. This preserves the provider-required tool-call/tool-result order.
+fn persist_and_queue(goals: &Goals, goal: &Goal) -> Result<(), String> {
     let mut goals = goals.clone();
     goals.active = Some(goal.clone());
-    write_goals(&goals)?;
-    let _ = append_goal_custom_message(goal);
-    remember_injected(Some(fingerprint(goal)));
+    if RUNTIME.get().is_some() {
+        queue_state(&goals);
+    } else {
+        write_goals(&goals)?;
+    }
+    queue_inject(goal);
     Ok(())
 }
 
@@ -362,7 +493,7 @@ fn op_start(
     if let Some(old) = goals.active.take() {
         goals.archived.push(old);
     }
-    persist_and_inject(&goals, &goal)?;
+    persist_and_queue(&goals, &goal)?;
     Ok(goal)
 }
 
@@ -379,7 +510,7 @@ fn op_update(notes: Option<&str>, status: Option<&str>) -> Result<Goal, String> 
         updated.status = status.to_string();
     }
     updated.updated_at = now_ms();
-    persist_and_inject(&goals, &updated)?;
+    persist_and_queue(&goals, &updated)?;
     Ok(updated)
 }
 
@@ -417,7 +548,7 @@ fn op_set_limits(
     let goals = read_goals();
     let active = require_active(&goals)?;
     let updated = apply_limits(&active, now_ms(), max_turns, deadline_ms);
-    persist_and_inject(&goals, &updated)?;
+    persist_and_queue(&goals, &updated)?;
     Ok(updated)
 }
 
@@ -428,9 +559,12 @@ fn op_complete() -> Result<Goal, String> {
     done.updated_at = now_ms();
     goals.archived.push(done.clone());
     goals.active = None;
-    write_goals(&goals)?;
-    let _ = append_goal_custom_message(&done);
-    remember_injected(Some(fingerprint(&done)));
+    if RUNTIME.get().is_some() {
+        queue_state(&goals);
+    } else {
+        write_goals(&goals)?;
+    }
+    queue_inject(&done);
     Ok(done)
 }
 
@@ -752,18 +886,19 @@ use rpi_plugin_sdk::callbacks::free_string;
 extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
     // TurnEnd carries no payload (empty event) in this ABI; ignore the struct.
     let _ = event;
+    // State changes made by the goal tool are flushed only after all tool
+    // results have been appended to the transcript.
+    flush_pending_inject();
+
     let mut goals = read_goals();
     let Some(mut goal) = goals.active.clone() else {
-        // No active goal — nothing to inject.
         remember_injected(None);
         return 0;
     };
     if goal.status != "active" {
-        remember_injected(Some(fingerprint(&goal)));
         return 0;
     }
 
-    // Count this turn against the budget.
     goal.turns_used = goal.turns_used.saturating_add(1);
     goal.updated_at = now_ms();
 
@@ -779,8 +914,8 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         goal.status = "paused".into();
         goals.active = Some(goal.clone());
         let _ = write_goals(&goals);
-        let _ = append_budget_message(&goal, &reason);
-        remember_injected(Some(fingerprint(&goal)));
+        queue_notice(&goal, Some(reason));
+        flush_pending_inject();
         return 0;
     }
 
@@ -788,16 +923,14 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
     let _ = write_goals(&goals);
 
     let fp = fingerprint(&goal);
-    if !should_inject(Some(&fp)) {
-        return 0;
-    }
-    match append_goal_custom_message(&goal) {
-        Ok(_) => {
-            remember_injected(Some(fp));
-        }
-        Err(_) => {
-            // Non-fatal: keep last-injected unset so a later TurnEnd retries.
-        }
+    if pending_inject()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_none()
+        && should_inject(Some(&fp))
+        && append_goal_custom_message(&goal).is_ok()
+    {
+        remember_injected(Some(fp));
     }
     0
 }
@@ -836,6 +969,48 @@ fn split_title_notes(rest: &str) -> (String, Option<String>) {
     (title_parts.join(" "), notes)
 }
 
+const START_NEXT_STEP_HINT: &str =
+    "ℹ️ Goal recorded; the first work run is starting in the background.";
+
+fn start_from_command(title: &str, notes: &str) -> Result<String, String> {
+    let goal = op_start(title, notes, None, None)?;
+    // A slash command runs outside an agent/tool turn, so it is safe to flush
+    // the state and notice before submitting the first user message.
+    if !flush_pending_state() {
+        return Err("unable to persist the goal state".into());
+    }
+    flush_pending_inject();
+    let prompt = if goal.notes.trim().is_empty() {
+        format!("Work on the active goal: {}", goal.title)
+    } else {
+        format!(
+            "Work on the active goal: {}\nNotes: {}",
+            goal.title, goal.notes
+        )
+    };
+    // Extension slash commands execute on the TUI command thread. A full
+    // SendUserMessage waits for the agent run to finish; calling it inline
+    // deadlocks that thread, leaving the editor populated and unresponsive.
+    // Start it after returning from the command so the host can clear and
+    // refocus the editor first.
+    std::thread::Builder::new()
+        .name("rpi-goal-start".into())
+        .spawn(move || {
+            if let Err(error) =
+                call_runtime(RuntimeActionId::SendUserMessage, json!({"text": prompt}))
+            {
+                eprintln!("rpi-goal: failed to start goal run: {error}");
+            }
+        })
+        .map_err(|error| format!("unable to start goal worker: {error}"))?;
+    Ok(format!(
+        "🎯 Goal started: {}\n{}\n{}",
+        goal.title,
+        goal.budget_summary(now_ms()),
+        START_NEXT_STEP_HINT
+    ))
+}
+
 const COMMAND_HELP: &str = "\
 /goal                     show status
 /goal start <title>       start a goal (--notes \"...\" optional)
@@ -865,13 +1040,7 @@ fn run_command(args: &str) -> String {
         "help" => Ok(COMMAND_HELP.to_string()),
         "start" => {
             let (title, notes) = split_title_notes(rest);
-            op_start(&title, notes.as_deref().unwrap_or(""), None, None).map(|goal| {
-                format!(
-                    "🎯 Goal started: {}\n{}",
-                    goal.title,
-                    goal.budget_summary(now_ms())
-                )
-            })
+            start_from_command(&title, notes.as_deref().unwrap_or(""))
         }
         "pause" => op_set_status("paused").map(|goal| format!("⏸️ Paused: {}", goal.title)),
         "resume" => op_set_status("active").map(|goal| format!("▶️ Resumed: {}", goal.title)),
@@ -923,8 +1092,7 @@ fn run_command(args: &str) -> String {
         // Unknown verb → treat the whole input as a title (shorthand start).
         _ => {
             let (title, notes) = split_title_notes(args);
-            op_start(&title, notes.as_deref().unwrap_or(""), None, None)
-                .map(|goal| format!("🎯 Goal started: {}", goal.title))
+            start_from_command(&title, notes.as_deref().unwrap_or(""))
         }
     };
 
@@ -944,6 +1112,9 @@ fn goal_command(args_json, out, _user_data) {
         .unwrap_or("")
         .trim();
     let text = run_command(args);
+    // Non-start commands may also have changed the goal state; flush their
+    // notice at the end of the command, outside any tool batch.
+    flush_pending_inject();
     command_output(out, json!({"kind": "message", "text": text}))
 }
 }
@@ -975,7 +1146,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
     let schema = Box::new(StableToolSchema {
         name: StbString::from_string("goal".into()),
         description: StbString::from_string(
-            "Codex-style goal mode: record one persistent, context-injected objective per project and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
+            "Codex-style goal mode: record one session-scoped, context-injected objective and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
         ),
         parameters: StbString::from_string(
             r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","update","pause","resume","complete","limit","show","list"]},"title":{"type":"string","description":"Goal title (required for start)"},"notes":{"type":"string","description":"Goal notes or progress update (start/update)"},"status":{"type":"string","enum":["active","paused"],"description":"Explicit status change (update)"},"maxTurns":{"type":"integer","minimum":1,"description":"Optional turn budget (start/limit)"},"maxMinutes":{"type":"integer","minimum":1,"description":"Optional wall-clock budget in minutes (start/limit)"}},"required":["action"]}"#.into(),
