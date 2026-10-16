@@ -38,6 +38,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 pub(crate) struct GraphState {
     session: Option<String>,
     graph: graph::Graph,
+    generation: u64,
 }
 
 static GRAPH: OnceLock<Mutex<GraphState>> = OnceLock::new();
@@ -69,11 +70,45 @@ pub(crate) fn lock_graph(params: &Value) -> MutexGuard<'static, GraphState> {
     if guard.session != session {
         guard.session = session;
         guard.graph = graph::Graph::default();
+        guard.advance_generation();
     }
     guard
 }
 
+/// Rejoin a wave without changing the active session or touching a newer plan.
+/// The generation also detects A -> B -> A switches with reused node ids.
+pub(crate) fn lock_graph_for_wave(
+    params: &Value,
+    generation: u64,
+) -> Result<MutexGuard<'static, GraphState>, String> {
+    let guard = graph_state().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.session != session_of(params) || guard.generation != generation {
+        return Err(
+            "plan or session changed while dispatch was running; stale results discarded".into(),
+        );
+    }
+    Ok(guard)
+}
+
 impl GraphState {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn advance_generation(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("graph generation exhausted");
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.graph
+            .nodes
+            .iter()
+            .any(|node| node.status == graph::Status::Running)
+    }
+
     pub(crate) fn graph(&self) -> &graph::Graph {
         &self.graph
     }
@@ -240,7 +275,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
     {
         let schema = Box::new(crate::kit::schema(
             "plan",
-            "Author or edit the task DAG. action=set (replace with `nodes`), action=update (addNodes/removeIds/setDeps/reset), action=show. A node may declare `expectFile` (file that must exist after its child runs) and `verify` (shell command that must exit 0); `dispatch` enforces both. Completion is written only by `dispatch`, never by `plan`.",
+            "Author or edit the task DAG. action=set (replace with `nodes`), action=update (addNodes/removeIds/setDeps/reset), action=show. Edit only between dispatch waves; show is available during a wave. A node may declare `expectFile` (file that must exist after its child runs) and `verify` (shell command that must exit 0); `dispatch` enforces both. Completion is written only by `dispatch`, never by `plan`.",
             PLAN_PARAMS,
         ));
         let rc = register(
@@ -323,6 +358,86 @@ mod tests {
             }),
             None => serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn running_wave_rejects_plan_edits_and_overlapping_dispatch() {
+        let _serial = graph_test_guard();
+        let params = params_for(Some("busy-wave"));
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut set = params.clone();
+        set["action"] = serde_json::json!("set");
+        set["nodes"] = serde_json::json!([{"id":"x", "task":"original"}]);
+        crate::plan::plan(&set, &control, &progress).unwrap();
+        let generation = {
+            let mut guard = lock_graph(&params);
+            guard.graph_mut().get_mut("x").unwrap().status = graph::Status::Running;
+            guard.generation()
+        };
+
+        let mut update = params.clone();
+        update["action"] = serde_json::json!("update");
+        update["reset"] = serde_json::json!(["x"]);
+        for edit in [&set, &update] {
+            assert!(crate::plan::plan(edit, &control, &progress)
+                .unwrap_err()
+                .contains("dispatch is running"));
+        }
+        assert!(crate::plan::plan(&params, &control, &progress)
+            .unwrap()
+            .contains("original"));
+        assert!(crate::dispatch::dispatch(&params, &control, &progress)
+            .unwrap_err()
+            .contains("already running"));
+        {
+            let mut guard = lock_graph_for_wave(&params, generation).unwrap();
+            assert_eq!(
+                guard.graph().get("x").unwrap().status,
+                graph::Status::Running
+            );
+            guard.graph_mut().get_mut("x").unwrap().status = graph::Status::Done;
+        }
+        crate::plan::plan(&update, &control, &progress).unwrap();
+        assert_eq!(
+            lock_graph(&params).graph().get("x").unwrap().status,
+            graph::Status::Pending
+        );
+        assert!(lock_graph_for_wave(&params, generation).is_err());
+    }
+
+    #[test]
+    fn stale_wave_cannot_reset_new_session_or_touch_reused_node_ids() {
+        let _serial = graph_test_guard();
+        let a = params_for(Some("wave-a"));
+        let b = params_for(Some("wave-b"));
+        let old_generation = lock_graph(&a).generation();
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut replacement = b.clone();
+        replacement["action"] = serde_json::json!("set");
+        replacement["nodes"] = serde_json::json!([{"id":"x", "task":"replacement"}]);
+        crate::plan::plan(&replacement, &control, &progress).unwrap();
+        assert!(lock_graph_for_wave(&a, old_generation).is_err());
+        {
+            // Inspect directly: using lock_graph(&b) would hide an accidental
+            // reset by a stale completion by switching the session back again.
+            let guard = graph_state().lock().unwrap();
+            assert_eq!(guard.session, session_of(&b));
+            assert_eq!(guard.graph().get("x").unwrap().task, "replacement");
+            assert_eq!(
+                guard.graph().get("x").unwrap().status,
+                graph::Status::Pending
+            );
+        }
+        // Returning to A still must not accept an old A wave's results.
+        replacement[rpi_plugin_sdk::HOST_CONTEXT_KEY] = a[rpi_plugin_sdk::HOST_CONTEXT_KEY].clone();
+        crate::plan::plan(&replacement, &control, &progress).unwrap();
+        assert!(lock_graph_for_wave(&a, old_generation).is_err());
+        assert_eq!(
+            lock_graph(&a).graph().get("x").unwrap().status,
+            graph::Status::Pending
+        );
     }
 
     /// Regression: the graph used to be one process-global value, so session B

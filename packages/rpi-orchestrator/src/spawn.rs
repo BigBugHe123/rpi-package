@@ -229,6 +229,19 @@ pub fn run_with_exe(
 }
 
 pub(crate) fn kill_and_reap(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Kill descendants while the parent still exists so taskkill can walk
+        // the tree. Child::kill alone leaves delegated commands running.
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status();
+    }
     #[cfg(unix)]
     {
         // Descendants can re-group: rpi's own `bash` tool puts each shell in a new
@@ -316,6 +329,65 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_and_reap_terminates_windows_descendants() {
+        use std::os::windows::process::CommandExt;
+        const NO_WINDOW: u32 = 0x08000000;
+        let pid_file = std::env::temp_dir().join(format!(
+            "rpi-orchestrator-child-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Pass the path as an environment value, not interpolated shell code.
+        let mut parent = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$p = Start-Process ping.exe -ArgumentList '-n','61','127.0.0.1' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:RPI_TEST_PID_FILE, [string]$p.Id); Start-Sleep -Seconds 60"])
+            .env("RPI_TEST_PID_FILE", &pid_file)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .creation_flags(NO_WINDOW).spawn().expect("start parent");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let descendant = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break Some(pid);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        fn alive(pid: u32) -> bool {
+            let output = Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .creation_flags(NO_WINDOW)
+                .output()
+                .expect("query process");
+            String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        }
+        let was_alive = descendant.is_some_and(alive);
+        kill_and_reap(&mut parent);
+        let survived = descendant.is_some_and(alive);
+        // Clean up even when the regression fails.
+        if survived {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &descendant.unwrap().to_string()])
+                .creation_flags(NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_file(pid_file);
+        assert!(was_alive, "test descendant did not start");
+        assert!(!survived, "cancellation left the descendant running");
+        assert!(parent.try_wait().unwrap().is_some());
+    }
 
     #[test]
     fn child_command_sets_recursion_guard_and_turn_budget() {

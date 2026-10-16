@@ -47,6 +47,8 @@ A node is `{id, task, deps[], role?, provider?, model?, maxTurns?, timeoutSecond
 
 **Completion is written only by `dispatch`** — there is no way to hand-mark a node
 `done`, so a plan cannot be "completed" by the model. `reset` re-arms a node.
+While a dispatch wave is running, `set` and `update` (including `reset`) return
+a busy error. `show` remains available; edit the plan after the wave finishes.
 
 ### `dispatch` — run one wave
 
@@ -58,6 +60,9 @@ results and can reshape the graph before the next call.
 Guards (all enforced in code, not asked of the model):
 
 - a cycle is rejected by `plan` before anything runs;
+- overlapping dispatch calls return a busy error; results from a wave whose
+  session or plan generation has changed are discarded without modifying the
+  active graph;
 - a wave with nothing ready and pending nodes left reports "no progress" instead
   of spinning;
 - a failed node makes its dependents `skipped` transitively;
@@ -68,8 +73,9 @@ Guards (all enforced in code, not asked of the model):
 - **non-blocking and cancellable**: each tool's builder runs on a worker thread,
   so `poll` never blocks. Progress streams as a pending partial (per wave for
   `dispatch`), and cancelling the run kills the in-flight child **and its
-  descendants** within ~100 ms — the tree is walked because nested shells
-  (rpi's own `bash` tool) put themselves in a new process group;
+  descendants**. Cancellation is checked every ~100 ms; Unix walks the tree
+  because nested shells can create new process groups, and Windows uses
+  `taskkill /T /F` before reaping the direct child;
 - **bounded acceptance**: a node's `verify` command runs under the *same*
   deadline and cancellation as its child, captures (and caps) its own output
   instead of inheriting the host's stdio, and reports a timeout as a node

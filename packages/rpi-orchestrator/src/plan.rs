@@ -21,6 +21,11 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
         .and_then(Value::as_str)
         .unwrap_or("show");
     let mut guard = lock_graph(params);
+    if matches!(action, "set" | "update") && guard.is_running() {
+        return Err(
+            "dispatch is running: wait for the wave to finish before editing the plan".into(),
+        );
+    }
     let graph = guard.graph_mut();
     match action {
         "set" => {
@@ -42,7 +47,11 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
             ))
         }
     }
-    Ok(result_with_details(&graph.render(), graph.to_details()))
+    let result = result_with_details(&graph.render(), graph.to_details());
+    if matches!(action, "set" | "update") {
+        guard.advance_generation();
+    }
+    Ok(result)
 }
 
 fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {

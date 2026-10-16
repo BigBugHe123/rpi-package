@@ -9,8 +9,8 @@
 use crate::control::Control;
 use crate::graph::{Graph, Status};
 use crate::kit::{progress, result_with_details, Progress};
-use crate::lock_graph;
 use crate::spawn::{self, POLL_SLICE};
+use crate::{lock_graph, lock_graph_for_wave};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
@@ -36,6 +36,10 @@ pub fn dispatch(
         .clamp(1, MAX_PARALLEL_CAP as u64) as usize;
 
     let mut guard = lock_graph(params);
+    if guard.is_running() {
+        return Err("dispatch is already running: wait for the current wave to finish".into());
+    }
+    let generation = guard.generation();
     let graph = guard.graph_mut();
     if graph.nodes.is_empty() {
         return Err("no plan yet: call plan(action=set, nodes=[...]) first".into());
@@ -68,9 +72,9 @@ pub fn dispatch(
     drop(guard);
     let outcomes = run_wave(&snapshot, &ready, max_parallel, control, progress_tx);
 
-    // Re-lock for the results: the session may have changed while the wave ran,
-    // in which case `lock_graph` has already handed us the new session's graph.
-    let mut guard = lock_graph(params);
+    // A stale wave must neither reset the current session nor apply results to
+    // a new plan that happens to reuse the same node ids.
+    let mut guard = lock_graph_for_wave(params, generation)?;
     let graph = guard.graph_mut();
 
     // A cancelled wave may not have reached every chunk. Those nodes never
