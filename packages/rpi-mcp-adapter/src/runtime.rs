@@ -645,11 +645,16 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                 // stops local delivery and a read cannot outlive the purge.
                 remove_subscription(&key, &uri, None);
                 retired = true;
-                response_result(session.request(
-                    "resources/unsubscribe",
-                    json!({"uri": uri}),
-                    control,
-                )?)
+                let result = session
+                    .request("resources/unsubscribe", json!({"uri": uri}), control)
+                    .and_then(response_result);
+                // A rejected unsubscribe can leave the remote registration alive
+                // after local delivery is retired. Reconnect rather than reusing
+                // that mismatched state; other URIs will be restored normally.
+                if result.is_err() {
+                    session.failed = true;
+                }
+                result
             },
         );
         // If connecting/locking failed, retire only the lifetime we observed;

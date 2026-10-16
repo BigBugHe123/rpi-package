@@ -147,6 +147,11 @@ fn main() {
                 json!({})
             }
             "resources/unsubscribe" => {
+                if mode("--reject-unsubscribe") {
+                    writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"unsubscribe temporarily failed"}})).unwrap();
+                    stdout.flush().unwrap();
+                    continue;
+                }
                 if let Some(uri) = request["params"]["uri"].as_str() {
                     subscribed.remove(uri);
                 }

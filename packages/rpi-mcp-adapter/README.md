@@ -89,6 +89,10 @@ for an active URI reuses the server registration; after reconnecting, that
 registration is restored once before the call completes.
 Only subscribed URIs trigger background reads.
 
+Unsubscribing always stops local delivery. If the server rejects the unsubscribe,
+the adapter closes that transport so a later subscribe can start cleanly. Other
+active subscriptions are restored on the next connection.
+
 If the host rejects an update message, the adapter retries at a later turn
 boundary while the same session and subscription lifetime remain active. Newer
 reads supersede older failed deliveries, including reads already delivered by
