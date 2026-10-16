@@ -52,6 +52,7 @@ mod tests {
             "codegraph_search",
             "codegraph_status",
             "delegate_task",
+            "dispatch",
             "goal",
             "im_message_server",
             "langfuse_prompt",
@@ -62,10 +63,12 @@ mod tests {
             "mcp_request",
             "mcp_resource",
             "permissions",
+            "plan",
             "plan_mode_complete",
             "plan_mode_start",
             "rpc_client",
             "rpc_server",
+            "subagent",
             "todo",
             "webfetch",
             "websearch",
@@ -73,8 +76,8 @@ mod tests {
         assert_eq!(names, expected);
         assert_eq!(
             session.loaded_paths().len(),
-            18,
-            "all eighteen cdylibs should load"
+            19,
+            "all nineteen cdylibs should load"
         );
         let tool = snapshot
             .tools()
