@@ -1202,4 +1202,169 @@ mod tests {
         assert!(text.contains(START_NEXT_STEP_HINT));
         assert!(started_confirmation("Ship it", None).contains(START_NEXT_STEP_HINT));
     }
+
+    // -----------------------------------------------------------------------
+    // Review follow-ups: the two tests below cover the *file state* and the
+    // *event-handler path*, which the boolean-only test above does not.
+    // -----------------------------------------------------------------------
+
+    /// Serializes everything below: they mutate process-global state (cwd, env,
+    /// the `RUNTIME` vtable, the injected-fingerprint latch).
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run with the process cwd pointed at a fresh temp directory, restoring it
+    /// afterwards. `goals_path()` is cwd-relative, so this is the only way to
+    /// exercise the real read/write path without touching the developer's project.
+    struct CwdGuard {
+        previous: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn isolated_cwd(tag: &str) -> CwdGuard {
+        let dir = std::env::temp_dir().join(format!("rpi-goal-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp cwd");
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&dir).expect("enter temp cwd");
+        CwdGuard { previous, dir }
+    }
+
+    fn turn_end() {
+        on_turn_end(
+            StablePluginEvent::empty(EventTag::TurnEnd),
+            std::ptr::null_mut(),
+        );
+    }
+
+    /// Regression: a subagent process shares the parent's cwd — and therefore
+    /// its `.rpi/goals.json` — so its `TurnEnd` used to increment the parent's
+    /// `turnsUsed`. A wave of subagents could exhaust any `/goal turns N` budget
+    /// on its own. The parent must keep counting; subagents under *either* marker
+    /// must not.
+    #[test]
+    fn subagent_turns_do_not_count_against_the_parent_goal() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("subagent-budget");
+        remember_injected(None);
+
+        // The parent records a goal (this happens inside a tool batch).
+        op_start("Ship it", "", None, None).expect("goal starts");
+
+        let turns_used = || {
+            read_goals()
+                .active
+                .expect("goal is still active")
+                .turns_used
+        };
+
+        // A normal parent turn counts, and lands in the real file.
+        turn_end();
+        assert_eq!(turns_used(), 1, "the parent's own turn must count");
+
+        // Subagents in the same cwd run several turns each. Neither marker may
+        // add to the parent's budget.
+        for marker in [
+            ORCHESTRATOR_SUBAGENT_ENV,
+            rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+        ] {
+            std::env::set_var(marker, "1");
+            for _ in 0..5 {
+                turn_end();
+            }
+            std::env::remove_var(marker);
+        }
+        assert_eq!(
+            turns_used(),
+            1,
+            "a subagent's turns leaked into the parent's goal budget"
+        );
+
+        // The parent still counts once the markers are gone.
+        turn_end();
+        assert_eq!(turns_used(), 2);
+    }
+
+    /// Records the `AppendEntry` payloads the plugin asks the host for, in order.
+    static APPENDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    rpi_plugin_sdk::string_handler! {
+    fn recording_runtime_action(action, args, out, _user_data) {
+        if action == RuntimeActionId::AppendEntry as u32 {
+            APPENDED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(args.to_owned());
+        }
+        let _ = out;
+        0
+    }
+    }
+
+    /// Install the recording runtime. `RUNTIME` is a `OnceLock`, so the first
+    /// caller wins; the recorder is deterministic regardless of which test it is.
+    fn install_recording_runtime() {
+        let _ = RUNTIME.set(rpi_plugin_sdk::PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
+            free_string: rpi_plugin_sdk::callbacks::free_string,
+            register_tool: None,
+            register_command: None,
+            register_shortcut: None,
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: None,
+            register_resources_discover: None,
+            runtime_action: recording_runtime_action,
+            dispatch_event: None,
+            user_data: std::ptr::null_mut(),
+            declare: None,
+            register_before_agent_start: None,
+            register_oauth_provider: None,
+        });
+    }
+
+    /// Regression for the HTTP 400: a `goal` tool call runs *inside* a tool
+    /// batch, so appending its notice immediately placed a custom message
+    /// between `assistant(tool_calls)` and its `toolResult`. The notice must be
+    /// queued and flushed only at the turn boundary.
+    #[test]
+    fn goal_notice_is_appended_at_the_turn_boundary_not_inside_the_batch() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("inject-boundary");
+        install_recording_runtime();
+        remember_injected(None);
+        APPENDED.lock().unwrap_or_else(|p| p.into_inner()).clear();
+
+        // Inside the batch: none of these may append anything.
+        op_start("Ship it", "", None, None).expect("start");
+        op_update(None, Some("active")).expect("update");
+        op_complete().expect("complete");
+        assert!(
+            APPENDED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "a goal tool call inside a batch must not append a message"
+        );
+
+        // The turn boundary is where the queued notice lands.
+        turn_end();
+        let appended = APPENDED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            appended.len(),
+            1,
+            "exactly one notice at the boundary, got {appended:?}"
+        );
+        assert!(appended[0].contains("Ship it"), "got {}", appended[0]);
+    }
 }
