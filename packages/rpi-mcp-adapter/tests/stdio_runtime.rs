@@ -273,6 +273,67 @@ fn resource_echo(path: &std::path::Path, value: &str) -> Result<String, String> 
 }
 
 #[test]
+fn repeated_subscribe_reuses_the_active_remote_subscription() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--stateful-resources", "--reject-duplicate-subscribe"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    resource_echo(&path, "tick").unwrap();
+    assert_eq!(
+        drain_updates_until(std::time::Duration::from_secs(3)).len(),
+        1
+    );
+    let repeated = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    );
+    let tick = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_secs(1));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert!(
+        repeated.is_ok(),
+        "active subscription was sent twice: {repeated:?}"
+    );
+    assert_eq!(tick.unwrap(), "echo:tick");
+    assert_eq!(
+        updates.len(),
+        1,
+        "repeated subscribe stopped resource delivery"
+    );
+}
+
+#[test]
+fn explicit_resubscribe_after_disconnect_keeps_the_early_update() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--stateful-resources", "--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    assert_eq!(
+        drain_updates_until(std::time::Duration::from_secs(3)).len(),
+        1
+    );
+    assert!(resource_echo(&path, "disconnect").is_err());
+    let subscribed = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    );
+    let updates = drain_updates_until(std::time::Duration::from_secs(3));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    subscribed.unwrap();
+    assert_eq!(
+        updates.len(),
+        1,
+        "the first update on the new transport was lost"
+    );
+}
+
+#[test]
 fn explicit_resubscribe_after_disconnect_does_not_subscribe_twice() {
     let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = config_with_modes(&["--stateful-resources", "--reject-duplicate-subscribe"]);

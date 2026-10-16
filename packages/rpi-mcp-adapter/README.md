@@ -84,6 +84,9 @@ switching sessions would leak one session's resource contents into another's
 context. Closing a connection or unsubscribing a URI drops its queued updates
 and prevents reads from that subscription lifetime from enqueueing late results.
 Subscribing again starts a new lifetime, so an older read cannot reach it.
+It also drops content already queued by the old lifetime. Repeating `subscribe`
+for an active URI reuses the server registration; after reconnecting, that
+registration is restored once before the call completes.
 Only subscribed URIs trigger background reads.
 
 If the host rejects an update message, the adapter retries at a later turn
