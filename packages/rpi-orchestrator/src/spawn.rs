@@ -13,6 +13,8 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use wait_timeout::ChildExt;
@@ -35,7 +37,7 @@ pub const SUBAGENT_ENV: &str = "RPI_ORCHESTRATOR_SUBAGENT";
 
 /// How often the wait loop re-checks cancellation/timeout. Bounds how long a
 /// cancelled call can keep a child alive.
-const POLL_SLICE: Duration = Duration::from_millis(100);
+pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 
 /// Build the child command. Separate from `run` so it is unit-testable without
 /// spawning anything.
@@ -98,6 +100,28 @@ pub fn truncate_output(mut text: String) -> String {
     text
 }
 
+/// Collect a reader's bounded output, giving up at `deadline` instead of
+/// blocking on a descendant that still holds the pipe.
+pub(crate) fn collect_reader(
+    reader: Option<(Receiver<String>, JoinHandle<()>)>,
+    deadline: Instant,
+) -> Result<String, String> {
+    let Some((receiver, _handle)) = reader else {
+        return Ok(String::new());
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("subagent timed out while collecting output".into());
+        }
+        match receiver.recv_timeout(remaining.min(POLL_SLICE)) {
+            Ok(text) => return Ok(text),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(String::new()),
+        }
+    }
+}
+
 /// Run one delegation using the current executable as the child `rpi`.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -138,16 +162,21 @@ pub fn run_with_exe(
         .spawn()
         .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
 
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     // Drain stdout/stderr on their own threads so a chatty child cannot block on
-    // a full pipe while we wait for it to exit.
+    // a full pipe while we wait for it to exit. Each reader caps what it keeps
+    // and signals completion through a channel, so collecting output can never
+    // outwait the deadline: a descendant that inherits the pipe and outlives the
+    // direct child must not extend the call.
     let out_reader = child.stdout.take().map(spawn_reader);
     let err_reader = child.stderr.take().map(spawn_reader);
 
-    write_stdin(&mut child, task);
+    // Writing is part of the bounded lifecycle too: a child that never reads
+    // stdin must not make the tool hang before the wait loop starts.
+    write_stdin(child.stdin.take(), task);
 
     // Wait in slices so cancellation and the wall-clock deadline are both observed
     // while the child is still running.
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         if control.is_cancelled() {
             kill_and_reap(&mut child);
@@ -161,7 +190,35 @@ pub fn run_with_exe(
             .saturating_duration_since(Instant::now())
             .min(POLL_SLICE);
         match child.wait_timeout(slice) {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                let mut text = match collect_reader(out_reader, deadline) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        kill_and_reap(&mut child);
+                        return Err(error);
+                    }
+                };
+                let stderr_text = match collect_reader(err_reader, deadline) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        kill_and_reap(&mut child);
+                        return Err(error);
+                    }
+                };
+                if !status.success() && !stderr_text.trim().is_empty() {
+                    text.push_str("\n[stderr]\n");
+                    text.push_str(stderr_text.trim_end());
+                }
+                let text = truncate_output(text);
+                if !status.success() {
+                    return Err(format!(
+                        "subagent exited with {}:\n{}",
+                        status.code().unwrap_or(-1),
+                        text
+                    ));
+                }
+                return Ok(text);
+            }
             Ok(None) => continue,
             Err(err) => {
                 kill_and_reap(&mut child);
@@ -169,28 +226,9 @@ pub fn run_with_exe(
             }
         }
     }
-
-    let status = child
-        .wait()
-        .map_err(|err| format!("failed to reap subagent: {err}"))?;
-    let mut text = join_reader(out_reader);
-    let stderr_text = join_reader(err_reader);
-    if !status.success() && !stderr_text.trim().is_empty() {
-        text.push_str("\n[stderr]\n");
-        text.push_str(stderr_text.trim_end());
-    }
-    let text = truncate_output(text);
-    if !status.success() {
-        return Err(format!(
-            "subagent exited with {}:\n{}",
-            status.code().unwrap_or(-1),
-            text
-        ));
-    }
-    Ok(text)
 }
 
-fn kill_and_reap(child: &mut Child) {
+pub(crate) fn kill_and_reap(child: &mut Child) {
     #[cfg(unix)]
     {
         // Descendants can re-group: rpi's own `bash` tool puts each shell in a new
@@ -225,28 +263,54 @@ fn kill_descendants(pid: u32) {
         .status();
 }
 
-fn write_stdin(child: &mut Child, task: &str) {
-    if let Some(mut stdin) = child.stdin.take() {
-        // A child that exits before reading yields EPIPE; not fatal — the exit
-        // status is what decides success.
-        let _ = stdin.write_all(task.as_bytes());
-        let _ = stdin.flush();
-        // Dropping `stdin` closes the pipe so the child observes EOF.
-    }
-}
-
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<String> {
+fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
+    // A child that never reads (or exits first) must not block the caller, so the
+    // write happens on its own thread; EPIPE is not fatal — the exit status is
+    // what decides success. Dropping the handle closes the pipe so the child
+    // observes EOF.
+    let task = task.to_owned();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    })
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(task.as_bytes());
+            let _ = stdin.flush();
+        }
+    });
 }
 
-fn join_reader(handle: Option<std::thread::JoinHandle<String>>) -> String {
-    handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default()
+/// Read a child's stream with a hard cap, signalling completion over a channel so
+/// the caller can apply its own deadline. The thread keeps draining after the cap
+/// so the child never blocks on a full pipe, and stops as soon as the child (and
+/// any descendant that inherited the pipe) closes it.
+pub(crate) fn spawn_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> (Receiver<String>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if output.len() < MAX_OUTPUT_BYTES {
+                        let keep = count.min(MAX_OUTPUT_BYTES - output.len());
+                        output.extend_from_slice(&buf[..keep]);
+                        truncated |= keep < count;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut text = String::from_utf8_lossy(&output).into_owned();
+        if truncated {
+            text.push_str("\n[output truncated]");
+        }
+        let _ = sender.send(text);
+    });
+    (receiver, handle)
 }
 
 #[cfg(test)]

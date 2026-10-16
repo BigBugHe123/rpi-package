@@ -77,8 +77,6 @@ mod tests {
             session.loaded_paths().len(),
             19,
             "all nineteen cdylibs should load"
-            13,
-            "all thirteen cdylibs should load"
         );
         let tool = snapshot
             .tools()

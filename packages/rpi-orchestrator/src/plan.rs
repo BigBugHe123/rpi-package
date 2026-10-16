@@ -10,8 +10,8 @@
 
 use crate::control::Control;
 use crate::graph::{Graph, Node, Status};
-use crate::graph_state;
 use crate::kit::{result_with_details, Progress};
+use crate::lock_graph;
 use serde_json::Value;
 
 pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<String, String> {
@@ -20,19 +20,20 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("show");
-    let mut guard = graph_state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = lock_graph(params);
+    let graph = guard.graph_mut();
     match action {
         "set" => {
             let nodes = params
                 .get("nodes")
                 .ok_or("`nodes` is required for action=set")?;
-            *guard = Graph::from_nodes_value(nodes)?;
+            *graph = Graph::from_nodes_value(nodes)?;
         }
         "update" => {
-            let mut next = guard.clone();
+            let mut next = graph.clone();
             apply_update(&mut next, params)?;
             next.validate()?;
-            *guard = next;
+            *graph = next;
         }
         "show" => {}
         other => {
@@ -41,7 +42,7 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
             ))
         }
     }
-    Ok(result_with_details(&guard.render(), guard.to_details()))
+    Ok(result_with_details(&graph.render(), graph.to_details()))
 }
 
 fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {

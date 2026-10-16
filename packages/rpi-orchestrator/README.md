@@ -10,10 +10,13 @@ host, `rpi-goal` and `rpi-mcp-adapter`: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Status
 
-Three tools share one in-memory task graph. It lives for the life of a run and
-is cleared when the session is switched; deciding whether to resume from history
-or start over is left to the human. `plan`/`dispatch` results still carry the
-graph in `details` for inspection.
+Three tools share one in-memory task graph, keyed by the **session** the host is
+serving. The host injects `__rpi.sessionId` into every plugin tool call, so a
+different session starts with an empty plan and switching back does not
+resurrect the old one; deciding whether to resume from history or start over is
+left to the human. A host that predates that field (or an ephemeral session with
+no id) shares a single fallback graph rather than refusing to work.
+`plan`/`dispatch` results still carry the graph in `details` for inspection.
 
 ### `subagent` — one bounded delegation
 
@@ -67,6 +70,13 @@ Guards (all enforced in code, not asked of the model):
   `dispatch`), and cancelling the run kills the in-flight child **and its
   descendants** within ~100 ms — the tree is walked because nested shells
   (rpi's own `bash` tool) put themselves in a new process group;
+- **bounded acceptance**: a node's `verify` command runs under the *same*
+  deadline and cancellation as its child, captures (and caps) its own output
+  instead of inheriting the host's stdio, and reports a timeout as a node
+  failure rather than blocking `dispatch` — and the graph lock — forever;
+- **resumable cancels**: a wave cancelled mid-flight returns nodes that never
+  started to `pending`, so a later `dispatch` picks them up instead of leaving
+  phantom `running` nodes that can never be scheduled again;
 - **no session litter**: children run with `--no-session`, so a wave does not
   leave a ~2 MB session file per node in the parent's `.rpi/sessions/` directory.
 

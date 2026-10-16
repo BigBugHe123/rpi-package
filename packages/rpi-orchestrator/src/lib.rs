@@ -24,14 +24,63 @@ mod spawn;
 mod subagent;
 
 use serde_json::Value;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-static GRAPH: OnceLock<Mutex<graph::Graph>> = OnceLock::new();
+/// The orchestration graph, scoped to the session the host says it is serving.
+///
+/// The plan is session state: switching sessions must not let session B see or
+/// dispatch session A's plan. The host injects `__rpi.sessionId` into every
+/// plugin tool call ([`rpi_plugin_sdk::HOST_CONTEXT_KEY`]), so the current
+/// session is known without the model supplying it. A host that predates that
+/// field — or an ephemeral session with no id — shares a single fallback graph
+/// rather than refusing to work.
+#[derive(Default)]
+pub(crate) struct GraphState {
+    session: Option<String>,
+    graph: graph::Graph,
+}
 
-/// The one in-memory graph. A poisoned lock is recovered rather than panicking,
-/// mirroring the SDK's tool-handle convention.
-pub(crate) fn graph_state() -> &'static Mutex<graph::Graph> {
-    GRAPH.get_or_init(|| Mutex::new(graph::Graph::default()))
+static GRAPH: OnceLock<Mutex<GraphState>> = OnceLock::new();
+
+fn graph_state() -> &'static Mutex<GraphState> {
+    GRAPH.get_or_init(|| Mutex::new(GraphState::default()))
+}
+
+/// The session id the host attached to this tool call, if any.
+pub(crate) fn session_of(params: &Value) -> Option<String> {
+    params
+        .get(rpi_plugin_sdk::HOST_CONTEXT_KEY)
+        .and_then(|ctx| ctx.get("sessionId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Lock the graph belonging to `params`' session.
+///
+/// A session change **resets** the graph: whether to resume an old plan or start
+/// over is a human decision, not something the extension should silently replay.
+/// A poisoned lock is recovered rather than panicking, mirroring the SDK's
+/// tool-handle convention.
+pub(crate) fn lock_graph(params: &Value) -> MutexGuard<'static, GraphState> {
+    let session = session_of(params);
+    let mut guard = graph_state().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.session != session {
+        guard.session = session;
+        guard.graph = graph::Graph::default();
+    }
+    guard
+}
+
+impl GraphState {
+    pub(crate) fn graph(&self) -> &graph::Graph {
+        &self.graph
+    }
+
+    pub(crate) fn graph_mut(&mut self) -> &mut graph::Graph {
+        &mut self.graph
+    }
 }
 
 crate::tool_entry!(subagent_tool, crate::subagent::subagent);
@@ -257,5 +306,99 @@ mod tests {
         assert!(!active_goal_from(r#"{"active":{"status":"complete"}}"#));
         assert!(!active_goal_from("{}"));
         assert!(!active_goal_from("not json"));
+    }
+
+    /// The graph is process-global by design, so graph-mutating tests must not
+    /// interleave. A poisoned lock is recovered (a failed test still releases it).
+    static GRAPH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn graph_test_guard() -> MutexGuard<'static, ()> {
+        GRAPH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn params_for(session: Option<&str>) -> Value {
+        match session {
+            Some(id) => serde_json::json!({
+                rpi_plugin_sdk::HOST_CONTEXT_KEY: { "cwd": "/tmp/p", "sessionId": id }
+            }),
+            None => serde_json::json!({}),
+        }
+    }
+
+    /// Regression: the graph used to be one process-global value, so session B
+    /// saw (and could dispatch) session A's plan. Each session now owns its own
+    /// graph, and a switch resets rather than replays.
+    #[test]
+    fn graphs_are_isolated_per_session() {
+        let _serial = graph_test_guard();
+        let a = params_for(Some("session-a"));
+        let b = params_for(Some("session-b"));
+
+        let result = crate::plan::plan(
+            &serde_json::json!({
+                "action": "set",
+                "nodes": [{"id": "only-a", "task": "a-task"}],
+                rpi_plugin_sdk::HOST_CONTEXT_KEY: { "sessionId": "session-a" }
+            }),
+            &crate::control::Control::default(),
+            &std::sync::mpsc::channel().0,
+        )
+        .unwrap();
+        assert!(result.contains("only-a"));
+
+        {
+            let guard = lock_graph(&a);
+            assert_eq!(guard.graph().nodes.len(), 1);
+            assert!(guard.graph().get("only-a").is_some());
+        }
+        // A different session must not inherit that plan.
+        {
+            let guard = lock_graph(&b);
+            assert!(
+                guard.graph().nodes.is_empty(),
+                "session B saw session A's plan"
+            );
+        }
+    }
+
+    /// Switching back to the first session starts clean rather than replaying:
+    /// resuming an old plan is the human's decision.
+    #[test]
+    fn returning_to_a_session_does_not_resurrect_the_old_plan() {
+        let _serial = graph_test_guard();
+        let a = params_for(Some("session-a"));
+        let b = params_for(Some("session-b"));
+        for params in [&a, &b] {
+            let mut guard = lock_graph(params);
+            *guard.graph_mut() = graph::Graph::default();
+            guard.graph_mut().nodes.push(
+                graph::Node::from_value(&serde_json::json!({"id": "x", "task": "t"})).unwrap(),
+            );
+        }
+        // Touch B, then come back to A: A's graph is reset, not restored.
+        drop(lock_graph(&b));
+        let guard = lock_graph(&a);
+        assert!(
+            guard.graph().nodes.is_empty(),
+            "a stale plan survived a session round-trip"
+        );
+    }
+
+    /// A host without `__rpi` (or an ephemeral session with no id) still works:
+    /// it shares the single `None` bucket instead of refusing to serve.
+    #[test]
+    fn missing_session_id_falls_back_to_one_shared_graph() {
+        let _serial = graph_test_guard();
+        let none = params_for(None);
+        assert!(session_of(&none).is_none());
+        {
+            let mut guard = lock_graph(&none);
+            *guard.graph_mut() = graph::Graph::from_nodes_value(&serde_json::json!([
+                {"id": "fallback", "task": "t"}
+            ]))
+            .unwrap();
+        }
+        let guard = lock_graph(&params_for(None));
+        assert!(guard.graph().get("fallback").is_some());
     }
 }
