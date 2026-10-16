@@ -28,6 +28,21 @@ pub fn dispatch(
     control: &Control,
     progress_tx: &Progress,
 ) -> Result<String, String> {
+    dispatch_with(params, control, progress_tx, run_wave)
+}
+
+pub(super) fn dispatch_with(
+    params: &Value,
+    control: &Control,
+    progress_tx: &Progress,
+    run: impl FnOnce(
+        &Graph,
+        &[String],
+        usize,
+        &Control,
+        &Progress,
+    ) -> Vec<(String, Result<String, String>)>,
+) -> Result<String, String> {
     control.check()?;
     let max_parallel = params
         .get("maxParallel")
@@ -70,10 +85,29 @@ pub fn dispatch(
     // `plan`, and vice versa).
     let snapshot = graph.clone();
     drop(guard);
-    let outcomes = run_wave(&snapshot, &ready, max_parallel, control, progress_tx);
+    let outcomes = run(&snapshot, &ready, max_parallel, control, progress_tx);
 
-    // A stale wave must neither reset the current session nor apply results to
-    // a new plan that happens to reuse the same node ids.
+    // Reject an already stale wave before running acceptance commands, then
+    // keep verification outside the graph lock so plan/show and session
+    // switches remain responsive. Validate again before applying any results.
+    drop(lock_graph_for_wave(params, generation)?);
+    let outcomes: Vec<_> = outcomes
+        .into_iter()
+        .map(|(id, outcome)| {
+            let spec = snapshot.get(&id);
+            let verified = match &outcome {
+                Ok(_) => verify_node(
+                    spec.and_then(|node| node.expect_file.as_deref()),
+                    spec.and_then(|node| node.verify.as_deref()),
+                    spec.map(|node| node.timeout_secs)
+                        .unwrap_or(MIN_VERIFY_SECS),
+                    control,
+                ),
+                Err(_) => Ok(()),
+            };
+            (id, outcome, verified)
+        })
+        .collect();
     let mut guard = lock_graph_for_wave(params, generation)?;
     let graph = guard.graph_mut();
 
@@ -81,7 +115,7 @@ pub fn dispatch(
     // started, so restore them to `pending`: leaving them `running` would strand
     // them with no child to finish, and a later dispatch could never pick them up.
     let started: std::collections::HashSet<String> =
-        outcomes.iter().map(|(id, _)| id.clone()).collect();
+        outcomes.iter().map(|(id, _, _)| id.clone()).collect();
     for id in &ready {
         if !started.contains(id) {
             if let Some(node) = graph.get_mut(id) {
@@ -90,20 +124,7 @@ pub fn dispatch(
         }
     }
 
-    for (id, outcome) in outcomes {
-        // Acceptance is checked only when the child reported success: a child that
-        // hit its turn cap still exits 0, so without this a no-op would be `done`.
-        let spec = snapshot.get(&id);
-        let verified = match &outcome {
-            Ok(_) => verify_node(
-                spec.and_then(|node| node.expect_file.as_deref()),
-                spec.and_then(|node| node.verify.as_deref()),
-                spec.map(|node| node.timeout_secs)
-                    .unwrap_or(MIN_VERIFY_SECS),
-                control,
-            ),
-            Err(_) => Ok(()),
-        };
+    for (id, outcome, verified) in outcomes {
         if let Some(node) = graph.get_mut(&id) {
             match (outcome, verified) {
                 (Ok(text), Ok(())) => {
@@ -211,8 +232,8 @@ fn verify_node(
     Ok(())
 }
 
-/// Run a node's `verify` shell command under the same deadline and cancellation
-/// as its child.
+/// Run a node's `verify` shell command with the same timeout setting and
+/// cancellation control as its child, using a fresh verification deadline.
 ///
 /// It used to be a bare `.status()`: a hanging acceptance command blocked
 /// `dispatch` (and the graph lock) forever, and an inherited stdout/stderr could
@@ -220,11 +241,18 @@ fn verify_node(
 /// timeout or a failed command surfaces as a clear node result.
 fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Result<(), String> {
     control.check()?;
-    let mut command_builder = if cfg!(windows) {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.arg("/C").arg(command);
+    #[cfg(windows)]
+    let mut command_builder = {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmd.exe");
+        // cmd.exe needs its own quoting, not Command::arg's C-style escaping.
+        // /S strips the outer pair while retaining quotes inside the script.
+        cmd.args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""));
         cmd
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut command_builder = {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(command);
         cmd
@@ -310,6 +338,19 @@ fn summarize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn verify_command_supports_quoted_file_paths() {
+        let path =
+            std::env::temp_dir().join(format!("rpi verify quoted {}.txt", std::process::id()));
+        let command = format!("echo verified>\"{}\"", path.display());
+        let result = run_verify_command(&command, 5, &Control::default());
+        let contents = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_ok(), "quoted verification failed: {result:?}");
+        assert_eq!(contents.unwrap().trim(), "verified");
+    }
 
     #[test]
     fn summarize_bounds_and_stays_char_safe() {

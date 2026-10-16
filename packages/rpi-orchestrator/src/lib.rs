@@ -361,6 +361,97 @@ mod tests {
     }
 
     #[test]
+    fn verification_keeps_plan_readable_and_does_not_commit_into_a_new_session() {
+        use std::time::{Duration, Instant};
+        let _serial = graph_test_guard();
+        let marker_name = format!(
+            "rpi-verify-review-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let marker = std::env::current_dir().unwrap().join(&marker_name);
+        #[cfg(windows)]
+        let verify = format!("echo started>{marker_name} & ping -n 31 127.0.0.1 >nul");
+        #[cfg(unix)]
+        let verify = format!(
+            "printf started > '{}'; sleep 30",
+            marker.to_string_lossy().replace('\'', "'\\''")
+        );
+        let mut params = params_for(Some("verification-a"));
+        params["action"] = serde_json::json!("set");
+        params["nodes"] = serde_json::json!([{"id":"x", "task":"original", "verify":verify}]);
+        let control = crate::control::Control::default();
+        crate::plan::plan(&params, &control, &std::sync::mpsc::channel().0).unwrap();
+        let wave_params = params.clone();
+        let wave_control = control.clone();
+        let wave = std::thread::spawn(move || {
+            crate::dispatch::dispatch_with(
+                &wave_params,
+                &wave_control,
+                &std::sync::mpsc::channel().0,
+                |_, ready, _, _, _| {
+                    ready
+                        .iter()
+                        .map(|id| (id.clone(), Ok("fixture result".into())))
+                        .collect()
+                },
+            )
+        });
+        let setup_deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < setup_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let verification_started = marker.exists();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let show_params = params_for(Some("verification-a"));
+        let show = std::thread::spawn(move || {
+            let _ = tx.send(crate::plan::plan(
+                &show_params,
+                &crate::control::Control::default(),
+                &std::sync::mpsc::channel().0,
+            ));
+        });
+        let readable = rx.recv_timeout(Duration::from_millis(500));
+        let replacement = if matches!(&readable, Ok(Ok(_))) {
+            let editing = crate::plan::plan(&params, &control, &std::sync::mpsc::channel().0);
+            let mut replacement = params_for(Some("verification-b"));
+            replacement["action"] = serde_json::json!("set");
+            replacement["nodes"] = serde_json::json!([{"id":"x", "task":"replacement"}]);
+            let result = crate::plan::plan(&replacement, &control, &std::sync::mpsc::channel().0);
+            Some((editing, result, replacement))
+        } else {
+            None
+        };
+        // Clean up both workers before any assertion, including on old code
+        // where the show worker is blocked behind the verification command.
+        control.cancel();
+        let wave_result = wave.join().unwrap();
+        show.join().unwrap();
+        let _ = std::fs::remove_file(marker);
+        assert!(
+            verification_started,
+            "verification fixture did not start: {wave_result:?}"
+        );
+        assert!(
+            matches!(&readable, Ok(Ok(_))),
+            "plan show blocked during verification: {readable:?}"
+        );
+        let (editing, result, replacement) = replacement.unwrap();
+        assert!(editing.unwrap_err().contains("dispatch is running"));
+        result.unwrap();
+        assert!(wave_result.unwrap_err().contains("stale results discarded"));
+        let state = lock_graph(&replacement);
+        assert_eq!(state.graph().get("x").unwrap().task, "replacement");
+        assert_eq!(
+            state.graph().get("x").unwrap().status,
+            graph::Status::Pending
+        );
+    }
+
+    #[test]
     fn running_wave_rejects_plan_edits_and_overlapping_dispatch() {
         let _serial = graph_test_guard();
         let params = params_for(Some("busy-wave"));
