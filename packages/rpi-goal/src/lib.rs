@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const GOAL_FILE: &str = ".rpi/goals.json";
@@ -38,23 +38,65 @@ fn last_injected() -> &'static Mutex<Option<String>> {
 /// OpenAI-compatible providers reject with HTTP 400 ("An assistant message with
 /// 'tool_calls' must be followed by tool messages…"). The notice is flushed at a
 /// safe boundary instead (TurnEnd, or the end of the `/goal` command handler).
-static PENDING_INJECT: OnceLock<Mutex<Option<Goal>>> = OnceLock::new();
+struct PendingInjection {
+    revision: u64,
+    goal: Goal,
+    budget_reason: Option<String>,
+}
 
-fn pending_inject() -> &'static Mutex<Option<Goal>> {
+static PENDING_INJECT: OnceLock<Mutex<Option<PendingInjection>>> = OnceLock::new();
+// Accessed under the queue mutex, including while its pending slot is empty
+// because a flush has taken the notice into an in-flight host callback.
+static INJECTION_REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn pending_inject() -> &'static Mutex<Option<PendingInjection>> {
     PENDING_INJECT.get_or_init(|| Mutex::new(None))
 }
 
 fn queue_inject(goal: &Goal) {
-    *pending_inject().lock().unwrap_or_else(|p| p.into_inner()) = Some(goal.clone());
+    queue_notice(goal, None);
+}
+
+fn queue_notice(goal: &Goal, budget_reason: Option<String>) {
+    let mut pending = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
+    let revision = INJECTION_REVISION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    *pending = Some(PendingInjection {
+        revision,
+        goal: goal.clone(),
+        budget_reason,
+    });
 }
 
 fn flush_pending_inject() {
-    let goal = pending_inject()
+    flush_pending_inject_with(|pending| match &pending.budget_reason {
+        Some(reason) => append_budget_message(&pending.goal, reason),
+        None => append_goal_custom_message(&pending.goal),
+    });
+}
+
+fn flush_pending_inject_with(inject: impl FnOnce(&PendingInjection) -> Result<(), String>) {
+    let pending = pending_inject()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take();
-    if let Some(goal) = goal {
-        let _ = append_goal_custom_message(&goal);
+    if let Some(pending) = pending {
+        let result = inject(&pending);
+        let mut queued = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
+        // A newer notice may have been queued AND delivered while this host
+        // call was in flight. An empty slot alone cannot distinguish that
+        // from this notice still being current.
+        if INJECTION_REVISION.load(Ordering::Relaxed) != pending.revision {
+            return;
+        }
+        if result.is_ok() {
+            remember_injected(Some(fingerprint(&pending.goal)));
+        } else {
+            // Retry at a later safe boundary, but never overwrite a newer
+            // goal change queued while the host callback was in flight.
+            queued.get_or_insert(pending);
+        }
     }
 }
 
@@ -399,7 +441,6 @@ fn persist_and_queue(goals: &Goals, goal: &Goal) -> Result<(), String> {
     goals.active = Some(goal.clone());
     write_goals(&goals)?;
     queue_inject(goal);
-    remember_injected(Some(fingerprint(goal)));
     Ok(())
 }
 
@@ -494,7 +535,6 @@ fn op_complete() -> Result<Goal, String> {
     goals.active = None;
     write_goals(&goals)?;
     queue_inject(&done);
-    remember_injected(Some(fingerprint(&done)));
     Ok(done)
 }
 
@@ -831,7 +871,6 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         return 0;
     };
     if goal.status != "active" {
-        remember_injected(Some(fingerprint(&goal)));
         return 0;
     }
 
@@ -851,8 +890,10 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         goal.status = "paused".into();
         goals.active = Some(goal.clone());
         let _ = write_goals(&goals);
-        let _ = append_budget_message(&goal, &reason);
-        remember_injected(Some(fingerprint(&goal)));
+        // This paused state supersedes an active notice whose append failed.
+        // Keep the reason too, so a retry still explains why work stopped.
+        queue_notice(&goal, Some(reason));
+        flush_pending_inject();
         return 0;
     }
 
@@ -860,7 +901,12 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
     let _ = write_goals(&goals);
 
     let fp = fingerprint(&goal);
-    if !should_inject(Some(&fp)) {
+    if pending_inject()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+        || !should_inject(Some(&fp))
+    {
         return 0;
     }
     match append_goal_custom_message(&goal) {
@@ -1388,10 +1434,15 @@ mod tests {
 
     /// Records the `AppendEntry` payloads the plugin asks the host for, in order.
     static APPENDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static FAIL_APPENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     rpi_plugin_sdk::string_handler! {
     fn recording_runtime_action(action, args, out, _user_data) {
         if action == RuntimeActionId::AppendEntry as u32 {
+            if FAIL_APPENDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1)).is_ok() {
+                return 1;
+            }
             APPENDED
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1462,5 +1513,144 @@ mod tests {
             "exactly one notice at the boundary, got {appended:?}"
         );
         assert!(appended[0].contains("Ship it"), "got {}", appended[0]);
+    }
+
+    #[test]
+    fn queued_goal_notices_retry_after_host_append_failure() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-retry");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        for status in ["active", "paused", "complete"] {
+            remember_injected(None);
+            op_start("Retry notice", "", None, None).unwrap();
+            match status {
+                "paused" => {
+                    op_set_status("paused").unwrap();
+                }
+                "complete" => {
+                    op_complete().unwrap();
+                }
+                _ => {}
+            }
+            APPENDED.lock().unwrap().clear();
+            FAIL_APPENDS.store(1, Ordering::SeqCst);
+            turn_end();
+            let delivered = APPENDED.lock().unwrap().clone();
+            assert!(
+                delivered.is_empty(),
+                "retry ran twice at one boundary: {delivered:?}"
+            );
+            assert!(
+                pending_inject().lock().unwrap().is_some(),
+                "{status} notice was lost after AppendEntry failed"
+            );
+            assert!(
+                last_injected().lock().unwrap().is_none(),
+                "{status} notice was marked delivered before AppendEntry succeeded"
+            );
+            turn_end();
+            let delivered = APPENDED.lock().unwrap().clone();
+            assert_eq!(delivered.len(), 1, "{status}: {delivered:?}");
+            let message: Value = serde_json::from_str(&delivered[0]).unwrap();
+            assert_eq!(message["message"]["data"]["details"]["status"], status);
+            assert!(pending_inject().lock().unwrap().is_none());
+            turn_end();
+            assert_eq!(
+                APPENDED.lock().unwrap().len(),
+                1,
+                "duplicate {status} notice"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_budget_notice_retries_without_replaying_stale_active_goal() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("budget-notice-retry");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Budget notice", "", Some(1), None).unwrap();
+        APPENDED.lock().unwrap().clear();
+        // Fail both the queued active notice and the subsequent budget notice.
+        FAIL_APPENDS.store(2, Ordering::SeqCst);
+        turn_end();
+        assert_eq!(read_goals().active.unwrap().status, "paused");
+        assert!(APPENDED.lock().unwrap().is_empty());
+        assert!(
+            pending_inject().lock().unwrap().is_some(),
+            "budget notice was lost"
+        );
+        turn_end();
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("turn budget reached (1)"));
+        assert!(!delivered[0].contains("Active goal"));
+        turn_end();
+        assert_eq!(APPENDED.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newer_goal_change_supersedes_a_notice_waiting_for_retry() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-superseded");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Latest notice", "", None, None).unwrap();
+        op_set_status("paused").unwrap();
+        APPENDED.lock().unwrap().clear();
+        FAIL_APPENDS.store(1, Ordering::SeqCst);
+        turn_end();
+        assert!(APPENDED.lock().unwrap().is_empty());
+
+        // The user resumes and updates the goal before its failed pause notice
+        // can be retried. Only the current active state should reach context.
+        op_update(Some("new progress"), Some("active")).unwrap();
+        turn_end();
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        let message: Value = serde_json::from_str(&delivered[0]).unwrap();
+        let details = &message["message"]["data"]["details"];
+        assert_eq!(details["status"], "active");
+        assert_eq!(details["notes"], "new progress");
+        assert!(pending_inject().lock().unwrap().is_none());
+        assert_eq!(read_goals().active.unwrap().turns_used, 1);
+    }
+
+    #[test]
+    fn older_failed_flush_cannot_requeue_after_a_newer_notice_was_delivered() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-in-flight");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Concurrent notice", "old progress", None, None).unwrap();
+        APPENDED.lock().unwrap().clear();
+        flush_pending_inject_with(|_| {
+            // Interleave another safe-boundary flush while the older callback
+            // is still in flight, then let the older callback report failure.
+            op_update(Some("new progress"), None).unwrap();
+            flush_pending_inject();
+            Err("older host callback failed".into())
+        });
+        assert!(
+            pending_inject().lock().unwrap().is_none(),
+            "stale notice was requeued"
+        );
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("new progress"));
+        assert_eq!(
+            *last_injected().lock().unwrap(),
+            Some(fingerprint(&read_goals().active.unwrap()))
+        );
+        turn_end();
+        assert_eq!(
+            APPENDED.lock().unwrap().len(),
+            1,
+            "stale notice reached context"
+        );
     }
 }
