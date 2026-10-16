@@ -85,6 +85,15 @@ Build its archive with `task pack-acp`; use `RPI_BIN` to select the backend
 executable. Its packaging and proposed ACP Registry entry are documented in
 [registry/README.md](registry/README.md).
 
+## UI adapters
+
+`rpi-ui-adapter` adds `rpi --webui=openwebui` to connect an existing Open WebUI
+instance directly to rpi ACP, with streaming, progress, tool details and cancellation.
+It automatically installs a managed Pipe; Computer is not required. rpi and
+the project can remain outside the UI container. See the
+[Chinese setup guide](packages/rpi-ui-adapter/README.md) for first-run URL/token
+parameters, container networking and session behavior.
+
 ## Build and install
 
 Source builds use stable Rust and Cargo. Task is required for the `task`
