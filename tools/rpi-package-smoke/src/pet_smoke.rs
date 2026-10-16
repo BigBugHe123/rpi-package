@@ -167,7 +167,7 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
         );
     }
     assert_eq!(run("status")["enabled"], false);
-    assert!(!mailbox.panels().contains_key("rpi.pet"));
+    assert!(!has_panel(&mailbox, "rpi.pet"));
     run("quiet");
     assert!(has_panel(&mailbox, "rpi.pet"));
     for handler in snapshot.handlers_for(EventTag::SessionShutdown) {
