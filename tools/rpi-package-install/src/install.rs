@@ -349,6 +349,20 @@ mod tests {
     }
 
     #[test]
+    fn workspace_catalog_includes_orchestrator_in_default_install() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let workspace = crate::metadata::load(&manifest).unwrap();
+        let catalog = crate::catalog::load(&crate::catalog::default_path(&workspace.root)).unwrap();
+        let chosen = select(&workspace.extensions, catalog.as_deref(), &[], false).unwrap();
+        assert!(
+            chosen
+                .iter()
+                .any(|extension| extension.package == "rpi-orchestrator"),
+            "the default install/pack selection must include the built orchestrator"
+        );
+    }
+
+    #[test]
     fn catalog_missing_entries_are_reported() {
         let catalog = vec!["rpi-lens".to_string(), "rpi-does-not-exist".to_string()];
         let err = select(&built(), Some(&catalog), &[], false).unwrap_err();
