@@ -8,7 +8,7 @@ set and fails a test that has nothing to do with it.
 
 This copies only the cdylibs that the current workspace declares into a staging
 directory (empty first), so the loaded set is a property of the checkout rather
-than of whatever was built last.
+than of whatever was built last. The output must not contain the build inputs.
 
 Usage: stage_plugins.py [--target-dir DIR] [--out DIR]
        stage_plugins.py --print-release-dir
@@ -17,6 +17,7 @@ Usage: stage_plugins.py [--target-dir DIR] [--out DIR]
 import argparse
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,15 @@ def main() -> int:
     if args.print_release_dir:
         print(release)
         return 0
+    output_path = Path(args.out).resolve()
+    protected_paths = [Path(release).resolve()]
+    if metadata.get("workspace_root"):
+        protected_paths.append(Path(metadata["workspace_root"]).resolve())
+    # Validate the resolved paths before emptying staging: --out=target/release
+    # (or one of its ancestors) would otherwise erase the files being copied.
+    if any(output_path == protected or output_path in protected.parents
+           for protected in protected_paths):
+        parser.error("--out must not contain the release directory or workspace root")
     prefix = "" if sys.platform == "win32" else "lib"
     suffix = ext_for(sys.platform)
 
