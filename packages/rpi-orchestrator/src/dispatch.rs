@@ -229,11 +229,11 @@ fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Re
         cmd.arg("-c").arg(command);
         cmd
     };
-    let mut child = command_builder
+    command_builder
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let (mut child, tree) = spawn::spawn_command(&mut command_builder)
         .map_err(|err| format!("could not run verification command: {err}"))?;
 
     let stdout = child.stdout.take().map(spawn::spawn_reader);
@@ -241,27 +241,27 @@ fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Re
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         if control.is_cancelled() {
-            spawn::kill_and_reap(&mut child);
+            spawn::kill_and_reap(&mut child, &tree);
             return Err("verification cancelled".into());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            spawn::kill_and_reap(&mut child);
+            spawn::kill_and_reap(&mut child, &tree);
             return Err(format!("verification timed out after {timeout_secs}s"));
         }
         match child.wait_timeout(remaining.min(POLL_SLICE)) {
             Ok(Some(status)) => {
-                let out = match spawn::collect_reader(stdout, deadline) {
+                let out = match spawn::collect_reader(stdout, deadline, control) {
                     Ok(text) => text,
                     Err(error) => {
-                        spawn::kill_and_reap(&mut child);
+                        spawn::kill_and_reap(&mut child, &tree);
                         return Err(error);
                     }
                 };
-                let err = match spawn::collect_reader(stderr, deadline) {
+                let err = match spawn::collect_reader(stderr, deadline, control) {
                     Ok(text) => text,
                     Err(error) => {
-                        spawn::kill_and_reap(&mut child);
+                        spawn::kill_and_reap(&mut child, &tree);
                         return Err(error);
                     }
                 };
@@ -276,7 +276,7 @@ fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Re
             }
             Ok(None) => continue,
             Err(err) => {
-                spawn::kill_and_reap(&mut child);
+                spawn::kill_and_reap(&mut child, &tree);
                 return Err(format!("verification wait failed: {err}"));
             }
         }

@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use rpi_plugin_sdk::process::ProcessTree;
 use wait_timeout::ChildExt;
 
 use crate::control::Control;
@@ -105,11 +106,14 @@ pub fn truncate_output(mut text: String) -> String {
 pub(crate) fn collect_reader(
     reader: Option<(Receiver<String>, JoinHandle<()>)>,
     deadline: Instant,
+    control: &Control,
 ) -> Result<String, String> {
+    control.check()?;
     let Some((receiver, _handle)) = reader else {
         return Ok(String::new());
     };
     loop {
+        control.check()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("subagent timed out while collecting output".into());
@@ -158,8 +162,7 @@ pub fn run_with_exe(
 ) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
     control.check()?;
-    let mut child = child_command(exe, max_turns, provider, model)
-        .spawn()
+    let (mut child, tree) = spawn_command(&mut child_command(exe, max_turns, provider, model))
         .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -179,11 +182,11 @@ pub fn run_with_exe(
     // while the child is still running.
     loop {
         if control.is_cancelled() {
-            kill_and_reap(&mut child);
+            kill_and_reap(&mut child, &tree);
             return Err("subagent cancelled".into());
         }
         if Instant::now() >= deadline {
-            kill_and_reap(&mut child);
+            kill_and_reap(&mut child, &tree);
             return Err(format!("subagent timed out after {timeout_secs}s"));
         }
         let slice = deadline
@@ -191,17 +194,17 @@ pub fn run_with_exe(
             .min(POLL_SLICE);
         match child.wait_timeout(slice) {
             Ok(Some(status)) => {
-                let mut text = match collect_reader(out_reader, deadline) {
+                let mut text = match collect_reader(out_reader, deadline, control) {
                     Ok(text) => text,
                     Err(error) => {
-                        kill_and_reap(&mut child);
+                        kill_and_reap(&mut child, &tree);
                         return Err(error);
                     }
                 };
-                let stderr_text = match collect_reader(err_reader, deadline) {
+                let stderr_text = match collect_reader(err_reader, deadline, control) {
                     Ok(text) => text,
                     Err(error) => {
-                        kill_and_reap(&mut child);
+                        kill_and_reap(&mut child, &tree);
                         return Err(error);
                     }
                 };
@@ -221,37 +224,35 @@ pub fn run_with_exe(
             }
             Ok(None) => continue,
             Err(err) => {
-                kill_and_reap(&mut child);
+                kill_and_reap(&mut child, &tree);
                 return Err(format!("failed while waiting for subagent: {err}"));
             }
         }
     }
 }
 
-pub(crate) fn kill_and_reap(child: &mut Child) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Kill descendants while the parent still exists so taskkill can walk
-        // the tree. Child::kill alone leaves delegated commands running.
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &child.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .status();
+/// Start under an owned process tree before any user code can spawn children.
+/// Windows keeps the job handle alive even after the direct child exits.
+pub(crate) fn spawn_command(command: &mut Command) -> Result<(Child, ProcessTree), String> {
+    ProcessTree::prepare(command);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    match ProcessTree::attach(&child) {
+        Ok(tree) => Ok((child, tree)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
     }
+}
+
+pub(crate) fn kill_and_reap(child: &mut Child, tree: &ProcessTree) {
+    // Walk while the parent is still attached: Unix descendants can put
+    // themselves in another group. The owned group/job also covers descendants
+    // whose direct parent already exited while we were collecting output.
     #[cfg(unix)]
-    {
-        // Descendants can re-group: rpi's own `bash` tool puts each shell in a new
-        // process group, so a group kill from here would miss them. Walk the tree
-        // first (while it is still attached), then kill the group and the child.
-        kill_descendants(child.id());
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(-(child.id() as i32)), Signal::SIGKILL);
-    }
+    kill_descendants(child.id());
+    tree.kill();
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -330,9 +331,115 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
 mod tests {
     use super::*;
 
+    static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn collect_after_parent_exit(cancel: bool) {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let pid_file = std::env::temp_dir().join(format!(
+            "rpi-orchestrator-pipes-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command",
+                "$i = New-Object System.Diagnostics.ProcessStartInfo; $i.FileName = 'ping.exe'; $i.Arguments = '-n 61 127.0.0.1'; $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $p = [System.Diagnostics.Process]::Start($i); [System.IO.File]::WriteAllText($env:RPI_TEST_PID_FILE, [string]$p.Id)"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 60 & echo $! > \"$RPI_TEST_PID_FILE\""]);
+            command
+        };
+        command
+            .env("RPI_TEST_PID_FILE", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut parent, tree) = spawn_command(&mut command).unwrap();
+        let stdout = parent.stdout.take().map(spawn_reader);
+        let stderr = parent.stderr.take().map(spawn_reader);
+        let exited = parent
+            .wait_timeout(Duration::from_secs(15))
+            .unwrap()
+            .is_some();
+        if !exited {
+            kill_and_reap(&mut parent, &tree);
+        }
+        assert!(exited, "fixture parent did not exit");
+        let descendant: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(pid_file);
+
+        let control = Control::default();
+        let cancel_handle = if cancel {
+            let canceller = control.clone();
+            Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                canceller.cancel();
+            }))
+        } else {
+            None
+        };
+        let start = Instant::now();
+        let budget = if cancel {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(150)
+        };
+        let result = collect_reader(stdout, start + budget, &control);
+        let elapsed = start.elapsed();
+        if let Some(handle) = cancel_handle {
+            handle.join().unwrap();
+        }
+        // The direct parent is already reaped; its job/group must still kill
+        // the descendant and close both inherited pipes.
+        kill_and_reap(&mut parent, &tree);
+        let drained = collect_reader(
+            stderr,
+            Instant::now() + Duration::from_secs(3),
+            &Control::default(),
+        );
+        #[cfg(windows)]
+        let survived = rpi_plugin_sdk::process::process_is_running(descendant).unwrap();
+        #[cfg(unix)]
+        let _ = descendant;
+        assert!(
+            drained.is_ok(),
+            "descendant kept the stderr pipe open: {drained:?}"
+        );
+        #[cfg(windows)]
+        assert!(!survived, "descendant survived after its parent exited");
+        let expected = if cancel { "cancelled" } else { "timed out" };
+        assert!(result.unwrap_err().contains(expected));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "collect ignored cancellation/deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn output_collection_observes_cancellation_after_parent_exit() {
+        collect_after_parent_exit(true);
+    }
+
+    #[test]
+    fn output_timeout_cleans_descendants_after_parent_exit() {
+        collect_after_parent_exit(false);
+    }
+
     #[cfg(windows)]
     #[test]
     fn kill_and_reap_terminates_windows_descendants() {
+        let _serial = PROCESS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use std::os::windows::process::CommandExt;
         const NO_WINDOW: u32 = 0x08000000;
         let pid_file = std::env::temp_dir().join(format!(
@@ -344,12 +451,14 @@ mod tests {
                 .as_nanos()
         ));
         // Pass the path as an environment value, not interpolated shell code.
-        let mut parent = Command::new("powershell.exe")
+        let mut command = Command::new("powershell.exe");
+        command
             .args(["-NoProfile", "-NonInteractive", "-Command",
                 "$p = Start-Process ping.exe -ArgumentList '-n','61','127.0.0.1' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:RPI_TEST_PID_FILE, [string]$p.Id); Start-Sleep -Seconds 60"])
             .env("RPI_TEST_PID_FILE", &pid_file)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .creation_flags(NO_WINDOW).spawn().expect("start parent");
+            .creation_flags(NO_WINDOW);
+        let (mut parent, tree) = spawn_command(&mut command).expect("start parent");
         let deadline = Instant::now() + Duration::from_secs(15);
         let descendant = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file)
@@ -372,7 +481,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
         }
         let was_alive = descendant.is_some_and(alive);
-        kill_and_reap(&mut parent);
+        kill_and_reap(&mut parent, &tree);
         let survived = descendant.is_some_and(alive);
         // Clean up even when the regression fails.
         if survived {

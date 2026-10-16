@@ -74,8 +74,9 @@ Guards (all enforced in code, not asked of the model):
   so `poll` never blocks. Progress streams as a pending partial (per wave for
   `dispatch`), and cancelling the run kills the in-flight child **and its
   descendants**. Cancellation is checked every ~100 ms; Unix walks the tree
-  because nested shells can create new process groups, and Windows uses
-  `taskkill /T /F` before reaping the direct child;
+  because nested shells can create new process groups, and Windows owns a job
+  that also covers descendants after the direct child exits. Output collection
+  continues checking cancellation and the deadline;
 - **bounded acceptance**: a node's `verify` command runs under the *same*
   deadline and cancellation as its child, captures (and caps) its own output
   instead of inheriting the host's stdio, and reports a timeout as a node
