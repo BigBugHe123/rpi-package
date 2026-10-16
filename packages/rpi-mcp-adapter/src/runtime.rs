@@ -264,10 +264,6 @@ fn clear_pending_for_uri(key: &str, uri: &str) {
         .retain(|update| !(update.key == key && update.uri == uri));
 }
 
-fn clear_all_pending() {
-    pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
-}
-
 fn add_subscription(key: &str, uri: &str) -> Subscription {
     let token = Arc::new(());
     subscriptions()
@@ -683,54 +679,76 @@ fn with_session<T>(
 /// in-flight background `resources/read` (whose control is linked to it).
 fn retire_entry(entry: &Arc<Entry>) {
     entry.stop.cancel();
-    let dispatcher = match entry.dispatcher.lock() {
-        Ok(mut slot) => slot.take(),
-        Err(_) => None,
-    };
-    if let Some(handle) = dispatcher {
-        let _ = handle.join();
+    // Serialize joins too: another close/shutdown must not remove this entry
+    // and allow a replacement while the first caller is still joining it.
+    if let Ok(mut slot) = entry.dispatcher.lock() {
+        if let Some(handle) = slot.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 pub fn shutdown_connections() {
-    {
-        let mut subs = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
-        subs.clear();
-        clear_all_pending();
-    }
-    let entries = if let Ok(mut map) = sessions().lock() {
-        std::mem::take(&mut *map)
+    let entries = if let Ok(map) = sessions().lock() {
+        // Keep stopped entries registered until their active operations have
+        // released the connection lock. New calls cannot reopen the same key
+        // while its old subscription lifetimes are still being retired.
+        for entry in map.values() {
+            entry.stop.cancel();
+        }
+        map.clone()
     } else {
         return;
     };
-    for entry in entries.values() {
-        entry.stop.cancel();
-    }
-    for entry in entries.values() {
-        if let Ok(mut state) = entry.session.lock() {
-            state.session.take();
-        }
-    }
-    // Ordered teardown: every session is gone, so each dispatcher can be joined.
-    for entry in entries.values() {
-        retire_entry(entry);
+    for (key, entry) in entries {
+        let _ = release_entry(&key, &entry);
     }
 }
 fn close_key(key: &str) -> Result<(), String> {
-    clear_subscriptions(key);
-    let entry = sessions()
-        .lock()
-        .map_err(|_| "MCP session registry poisoned")?
-        .remove(key);
+    let entry = {
+        let map = sessions()
+            .lock()
+            .map_err(|_| "MCP session registry poisoned")?;
+        match map.get(key) {
+            Some(entry) => {
+                entry.stop.cancel();
+                Some(entry.clone())
+            }
+            None => {
+                clear_subscriptions(key);
+                None
+            }
+        }
+    };
     if let Some(entry) = entry {
-        entry.stop.cancel();
-        entry
+        release_entry(key, &entry)?;
+    }
+    Ok(())
+}
+
+/// Drain active operations before purging local lifetimes. Keep removal and
+/// purge atomic with respect to opening a replacement, and let only the owner
+/// of the registered entry purge it (concurrent close/shutdown may join twice).
+fn release_entry(key: &str, entry: &Arc<Entry>) -> Result<(), String> {
+    {
+        let mut state = entry
             .session
             .lock()
-            .map_err(|_| "MCP connection lock poisoned")?
-            .session
-            .take();
-        retire_entry(&entry);
+            .map_err(|_| "MCP connection lock poisoned")?;
+        state.session.take();
+    }
+    // Keep the stopped entry registered while joining: an old notification
+    // must not resolve this key to a newly opened connection and read from it.
+    retire_entry(entry);
+    let mut map = sessions()
+        .lock()
+        .map_err(|_| "MCP session registry poisoned")?;
+    if map
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, entry))
+    {
+        clear_subscriptions(key);
+        map.remove(key);
     }
     Ok(())
 }
@@ -1037,6 +1055,174 @@ mod tests {
 
     fn clear_queue() {
         pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    fn assert_teardown_retires_late_subscription(shutdown: bool) {
+        let _serial = queue_test_guard();
+        clear_queue();
+        const KEY: &str = r#"["session:closing","config","server"]"#;
+        const URI: &str = "mem://closing";
+        let (notifications, _receiver) = mpsc::sync_channel(1);
+        let entry = Arc::new(Entry {
+            session: Mutex::new(ConnectionState::default()),
+            stop: Control::default(),
+            notifications,
+            dispatcher: Mutex::new(None),
+        });
+        sessions().lock().unwrap().insert(KEY.into(), entry.clone());
+        // Subscribe mutates its local lifetime under this connection lock,
+        // before its RPC observes cancellation. Pause it immediately before
+        // that mutation, then start teardown on another thread.
+        let state = entry.session.lock().unwrap();
+        let closing = std::thread::spawn(move || {
+            if shutdown {
+                shutdown_connections();
+            } else {
+                close_key(KEY).unwrap();
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while entry.stop.check().is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled = entry.stop.check().is_err();
+        add_subscription(KEY, URI);
+        queue("session:closing", KEY, URI, "late content");
+        drop(state);
+        closing.join().unwrap();
+        let retained = subscription(KEY, URI).is_some();
+        let updates = take_pending_updates(None);
+        clear_subscriptions(KEY);
+        assert!(cancelled, "teardown did not cancel the active operation");
+        assert!(
+            !retained,
+            "teardown left an in-flight subscription registered"
+        );
+        assert!(
+            updates.is_empty(),
+            "teardown left queued content: {updates:?}"
+        );
+        assert!(!sessions().lock().unwrap().contains_key(KEY));
+    }
+
+    #[test]
+    fn close_retires_subscriptions_after_in_flight_operations_exit() {
+        assert_teardown_retires_late_subscription(false);
+    }
+
+    #[test]
+    fn closing_connection_stays_registered_until_its_dispatcher_exits() {
+        let _serial = queue_test_guard();
+        const KEY: &str = r#"["session:dispatcher-close","config","server"]"#;
+        let stop = Control::default();
+        let worker_stop = stop.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let dispatcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while worker_stop.check().is_ok() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ready_tx.send(()).unwrap();
+            // Model a notification already being processed when close begins.
+            let _ = resume_rx.recv_timeout(Duration::from_secs(3));
+        });
+        let (notifications, _receiver) = mpsc::sync_channel(1);
+        let entry = Arc::new(Entry {
+            session: Mutex::new(ConnectionState::default()),
+            stop,
+            notifications,
+            dispatcher: Mutex::new(Some(dispatcher)),
+        });
+        sessions().lock().unwrap().insert(KEY.into(), entry.clone());
+        let closing = std::thread::spawn(|| close_key(KEY));
+        let ready = ready_rx.recv_timeout(Duration::from_secs(3));
+        // Removing the key early lets a new call replace it while the old
+        // dispatcher can still resolve it in read_resource_by_key.
+        let retained = sessions()
+            .lock()
+            .unwrap()
+            .get(KEY)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry));
+        let _ = resume_tx.send(());
+        closing.join().unwrap().unwrap();
+        assert!(ready.is_ok(), "dispatcher fixture did not observe close");
+        assert!(
+            retained,
+            "a replacement could open before the old dispatcher exited"
+        );
+        assert!(!sessions().lock().unwrap().contains_key(KEY));
+    }
+
+    #[test]
+    fn shutdown_retires_subscriptions_after_in_flight_operations_exit() {
+        // Shutdown intentionally affects every registry entry. Isolate this
+        // test from parallel HTTP lifecycle tests that also use the registry.
+        const CHILD: &str = "RPI_MCP_SHUTDOWN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_teardown_retires_late_subscription(true);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::shutdown_retires_subscriptions_after_in_flight_operations_exit",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn repeated_retirement_cannot_clear_a_replacement_connections_subscriptions() {
+        let _serial = queue_test_guard();
+        clear_queue();
+        const KEY: &str = r#"["session:replacement","config","server"]"#;
+        const URI: &str = "mem://replacement";
+        let make_entry = || {
+            let (notifications, _receiver) = mpsc::sync_channel(1);
+            Arc::new(Entry {
+                session: Mutex::new(ConnectionState::default()),
+                stop: Control::default(),
+                notifications,
+                dispatcher: Mutex::new(None),
+            })
+        };
+        let old = make_entry();
+        sessions().lock().unwrap().insert(KEY.into(), old.clone());
+        close_key(KEY).unwrap();
+        let current = make_entry();
+        sessions()
+            .lock()
+            .unwrap()
+            .insert(KEY.into(), current.clone());
+        let token = add_subscription(KEY, URI);
+        queue("session:replacement", KEY, URI, "new content");
+        // A concurrent shutdown may have captured the old entry before close
+        // finished, then reach its cleanup after the key has been reopened.
+        release_entry(KEY, &old).unwrap();
+        let retained = subscription(KEY, URI).is_some_and(|current| Arc::ptr_eq(&current, &token));
+        let still_registered = sessions()
+            .lock()
+            .unwrap()
+            .get(KEY)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &current));
+        let updates = take_pending_updates(None);
+        close_key(KEY).unwrap();
+        assert!(retained, "old cleanup cleared the replacement subscription");
+        assert!(
+            still_registered,
+            "old cleanup removed the replacement connection"
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, "new content");
     }
 
     #[test]

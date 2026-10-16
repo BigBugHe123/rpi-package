@@ -90,7 +90,9 @@ A subscription is marked **before** its `subscribe` request goes out, so a serve
 that pushes the first update while the handshake is still in flight is not lost;
 a failed subscribe rolls the mark back. Closing a connection cancels an in-flight
 background read instead of waiting for its timeout, and joins the connection's
-dispatcher thread.
+dispatcher thread. Closing or shutting down first drains in-flight operations,
+then purges their subscriptions and queued updates. The stopped connection stays
+registered until its dispatcher exits, so late work cannot reach a replacement.
 
 This works for stdio servers today; HTTP/SSE push is not wired yet.
 
