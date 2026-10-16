@@ -4,7 +4,7 @@ version: "3"
 # tests at the files `task build` just produced on any platform.
 vars:
   DLL_PREFIX:
-    sh: python -c "import sys; print('lib' if sys.platform=='darwin' else '')"
+    sh: python -c "import sys; print('' if sys.platform=='win32' else 'lib')"
   DLL_SUFFIX:
     sh: python -c "import sys; print({'win32':'.dll','darwin':'.dylib'}.get(sys.platform,'.so'))"
   EXE_SUFFIX:
@@ -78,9 +78,11 @@ tasks:
     vars:
       # `task smoke` runs every `--ignored` test, so point the artifact-specific
       # ones at the cdylibs this task just built; otherwise they skip.
-      RELEASE: "{{.ROOT_DIR}}/target/release"
+      RELEASE:
+        sh: python tools/rpi-package-smoke/stage_plugins.py --print-release-dir
       PLUGIN_DIR: "{{.ROOT_DIR}}/target/smoke-plugins"
     cmds:
+      - python -m unittest discover -s tools/rpi-package-smoke -p test_stage_plugins.py
       # Stage exactly this workspace's cdylibs so the loaded set depends on the
       # checkout, not on whatever else was built into target/release.
       - python tools/rpi-package-smoke/stage_plugins.py --out "{{.PLUGIN_DIR}}"

@@ -11,6 +11,7 @@ directory (empty first), so the loaded set is a property of the checkout rather
 than of whatever was built last.
 
 Usage: stage_plugins.py [--target-dir DIR] [--out DIR]
+       stage_plugins.py --print-release-dir
 """
 
 import argparse
@@ -22,7 +23,7 @@ import sys
 
 
 def ext_for(platform: str) -> str:
-    if os.name == "nt":
+    if platform == "win32":
         return ".dll"
     if platform == "darwin":
         return ".dylib"
@@ -32,8 +33,11 @@ def ext_for(platform: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-dir", help="cargo target dir (default: cargo's own)")
-    parser.add_argument("--out", required=True, help="staging directory")
+    parser.add_argument("--out", help="staging directory")
+    parser.add_argument("--print-release-dir", action="store_true", help="print Cargo's resolved release directory")
     args = parser.parse_args()
+    if not args.print_release_dir and not args.out:
+        parser.error("--out is required when staging plugins")
 
     metadata = json.loads(
         subprocess.check_output(
@@ -45,7 +49,10 @@ def main() -> int:
     )
     target_dir = args.target_dir or metadata["target_directory"]
     release = os.path.join(target_dir, "release")
-    prefix = "lib" if sys.platform == "darwin" else ""
+    if args.print_release_dir:
+        print(release)
+        return 0
+    prefix = "" if sys.platform == "win32" else "lib"
     suffix = ext_for(sys.platform)
 
     # A workspace member that builds a cdylib *is* an extension.
