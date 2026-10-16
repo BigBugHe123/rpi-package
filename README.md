@@ -37,14 +37,14 @@ the row stable. USD accumulates model usage costs calculated by the host from
 model pricing. It uses the host's generic `UiComponent` text interface.
 See [rpi-run-stats](packages/rpi-run-stats/README.md) for measurement definitions.
 
-## DeepSeek provider
+## Provider integrations
 
-`rpi-provider-deepseek` provides the independently loaded `deepseek` provider,
-its model catalog, scoped `DEEPSEEK_API_KEY` policy, streaming reasoning and
-multi-round tool calls. It requires the provider-package host branch and is
-currently installed from source, rather than crates.io. See
-[the package guide](packages/rpi-provider-deepseek/README.md) for setup,
-migration and real-DLL offline tests.
+`rpi-providers` is one independently loaded package for DeepSeek, OpenRouter,
+llama.cpp and Proxy. It keeps a single native plugin entry and separate
+provider IDs, model catalogs and authentication policies. Install or upgrade
+one package; maintain vendor implementations in separate modules. It currently
+requires the provider-package host branch and source linking. See
+[the package guide](packages/rpi-providers/README.md) for migration and tests.
 
 ## Native ACP integration
 

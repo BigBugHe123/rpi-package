@@ -1,5 +1,5 @@
 [package]
-name = "rpi-provider-deepseek"
+name = "rpi-providers"
 version = "0.1.0"
 publish = false
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "DeepSeek streaming provider extension for rpi, including reasoning and tool-call replay"
+description = "Unified DeepSeek, OpenRouter, llama.cpp and proxy provider extension for rpi"
 readme = "README.md"
 
 [lib]
@@ -21,7 +21,10 @@ rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef27
 rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
 rpi-provider-runtime = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
 
 [dev-dependencies]
 rpi-extensions = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }

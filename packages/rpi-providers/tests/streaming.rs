@@ -4,7 +4,7 @@ use rpi_ai::{
     types::{Content, Message, StopReason, UserMessage},
     AssistantMessageEvent, Context, Model, Provider, SimpleStreamOptions,
 };
-use rpi_provider_deepseek::{MODEL_ID, PROVIDER_ID};
+use rpi_providers::deepseek::{MODEL_ID, PROVIDER_ID};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -27,7 +27,7 @@ fn load_extension() -> (rpi_extensions::ExtensionSession, Arc<dyn Provider>, Mod
         .unwrap()
         .to_path_buf();
     let filename = format!(
-        "{}rpi_provider_deepseek{}",
+        "{}rpi_providers{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
@@ -37,7 +37,7 @@ fn load_extension() -> (rpi_extensions::ExtensionSession, Arc<dyn Provider>, Mod
     ]
     .into_iter()
     .find(|path| path.is_file())
-    .expect("build the extension first: cargo build -p rpi-provider-deepseek");
+    .expect("build the extension first: cargo build -p rpi-providers");
     let session = rpi_extensions::load_session_mixed(
         &[],
         &[PathBuf::from(library)],

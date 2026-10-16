@@ -18,14 +18,14 @@ fn library() -> PathBuf {
         .unwrap()
         .to_path_buf();
     let name = format!(
-        "{}rpi_provider_deepseek{}",
+        "{}rpi_providers{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
     [profile.join(&name), profile.join("deps").join(name)]
         .into_iter()
         .find(|path| path.is_file())
-        .expect("first cargo build -p rpi-provider-deepseek")
+        .expect("first cargo build -p rpi-providers")
 }
 
 fn command(temp: &tempfile::TempDir, auth: bool) -> Command {

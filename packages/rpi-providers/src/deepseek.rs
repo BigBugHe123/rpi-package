@@ -144,7 +144,7 @@ fn create(_: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
     Arc::new(DeepSeekProvider::new(options.api_key.clone()))
 }
 
-rpi_provider_runtime::export_provider!(
+crate::registration::register_provider!(
     PROVIDER_ID,
     BASE_URL,
     "openai-completions",
