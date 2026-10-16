@@ -1,0 +1,29 @@
+[package]
+name = "rpi-provider-deepseek"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "DeepSeek streaming provider extension for rpi, including reasoning and tool-call replay"
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Provider registration and manifests require the provider-package host API.
+# Keep all three dependencies on the same reviewed core revision. Do not change
+# the SDK used by unrelated extensions in this workspace.
+[dependencies]
+rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af", features = ["providers"] }
+rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+rpi-provider-runtime = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rpi-extensions = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+tokio = { workspace = true, features = ["macros", "net", "io-util"] }
+tempfile = "3"

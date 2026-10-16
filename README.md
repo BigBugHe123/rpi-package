@@ -37,6 +37,15 @@ the row stable. USD accumulates model usage costs calculated by the host from
 model pricing. It uses the host's generic `UiComponent` text interface.
 See [rpi-run-stats](packages/rpi-run-stats/README.md) for measurement definitions.
 
+## DeepSeek provider
+
+`rpi-provider-deepseek` provides the independently loaded `deepseek` provider,
+its model catalog, scoped `DEEPSEEK_API_KEY` policy, streaming reasoning and
+multi-round tool calls. It requires the provider-package host branch and is
+currently installed from source, rather than crates.io. See
+[the package guide](packages/rpi-provider-deepseek/README.md) for setup,
+migration and real-DLL offline tests.
+
 ## Native ACP integration
 
 `rpi-acp` contains the ACP protocol, session history, streaming, question handling
