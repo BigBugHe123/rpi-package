@@ -48,7 +48,6 @@ impl Transport {
 }
 #[derive(Debug)]
 struct Session {
-    config: McpServerConfig,
     transport: Transport,
     info: ServerInfo,
     next_id: u64,
@@ -82,7 +81,6 @@ impl Session {
         }
         transport.notify(control)?;
         Ok(Self {
-            config: config.clone(),
             transport,
             info,
             next_id: 2,
@@ -136,8 +134,16 @@ impl Session {
         Err("MCP tools/list exceeded 100 pages".into())
     }
 }
+// Keep the last configuration even after a failed transport is dropped, so
+// a config edit cannot replay the old server's subscriptions onto a new server.
+#[derive(Default)]
+struct ConnectionState {
+    config: Option<McpServerConfig>,
+    session: Option<Session>,
+}
+
 struct Entry {
-    session: Mutex<Option<Session>>,
+    session: Mutex<ConnectionState>,
     stop: Control,
     /// Notifications from this connection's reader, consumed by its dispatcher.
     /// Owned by the entry so a re-opened session reuses the same dispatcher.
@@ -311,6 +317,39 @@ fn clear_subscriptions(key: &str) {
     clear_pending_for_key(key);
 }
 
+/// Re-register only resource subscriptions when a transport is recreated.
+/// User tool calls are never replayed. Rotate identities and purge the old
+/// connection's queued reads atomically before accepting early notifications.
+fn restore_subscriptions(
+    key: &str,
+    session: &mut Session,
+    control: &Control,
+    skip_uri: Option<&str>,
+) -> Result<(), String> {
+    let uris = {
+        let mut map = subscriptions().lock().unwrap_or_else(|p| p.into_inner());
+        let mut uris = Vec::new();
+        if let Some(subscribed) = map.get_mut(key) {
+            for (uri, token) in subscribed {
+                // An explicit subscribe/unsubscribe will handle this URI once
+                // the connection is ready; do not issue a duplicate RPC.
+                if skip_uri == Some(uri.as_str()) {
+                    continue;
+                }
+                *token = Arc::new(());
+                uris.push(uri.clone());
+            }
+        }
+        clear_pending_for_key(key);
+        uris.sort();
+        uris
+    };
+    for uri in uris {
+        response_result(session.request("resources/subscribe", json!({"uri":uri}), control)?)?;
+    }
+    Ok(())
+}
+
 /// One dispatcher per connection. It ends when every sender is gone (entry
 /// removed and session dropped) or when the connection is stopped, whichever
 /// happens first — the stop check is what lets `close`/`shutdown` join it
@@ -401,10 +440,14 @@ fn read_resource_by_key(key: &str, uri: &str) -> Result<String, String> {
     let control = Control::default().linked(&entry.stop);
     let deadline = Deadline::new(120, "resources/read", &control);
     let mut state = lock_until(&entry.session, &deadline)?;
-    let session = state.as_mut().ok_or("MCP connection is closed")?;
-    let result =
-        response_result(session.request("resources/read", json!({"uri": uri}), &control)?)?;
-    Ok(resource_text(&result))
+    let session = state.session.as_mut().ok_or("MCP connection is closed")?;
+    let result = session
+        .request("resources/read", json!({"uri": uri}), &control)
+        .and_then(response_result);
+    if session.failed {
+        state.session.take();
+    }
+    result.map(|result| resource_text(&result))
 }
 
 /// Flatten a `resources/read` result's `contents` into text (blobs are noted by
@@ -456,7 +499,7 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
     let (key, name, config, timeout) = target(params)?;
 
     if action == "list" {
-        return with_session(key, config, timeout, control, |session, control| {
+        return with_session(key, config, timeout, control, None, |session, control| {
             let mut resources = Vec::new();
             let mut cursor = None;
             let mut seen = HashSet::new();
@@ -494,18 +537,25 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
     if action == "unsubscribe" {
         let previous = subscription(&key, &uri);
         let mut retired = false;
-        let _ = with_session(key.clone(), config, timeout, control, |session, control| {
-            // Serialize subscription changes with their RPCs on this connection.
-            // Invalidate before sending, so even a failed remote unsubscribe
-            // stops local delivery and a read cannot outlive the purge.
-            remove_subscription(&key, &uri, None);
-            retired = true;
-            response_result(session.request(
-                "resources/unsubscribe",
-                json!({"uri": uri}),
-                control,
-            )?)
-        });
+        let _ = with_session(
+            key.clone(),
+            config,
+            timeout,
+            control,
+            Some(&uri),
+            |session, control| {
+                // Serialize subscription changes with their RPCs on this connection.
+                // Invalidate before sending, so even a failed remote unsubscribe
+                // stops local delivery and a read cannot outlive the purge.
+                remove_subscription(&key, &uri, None);
+                retired = true;
+                response_result(session.request(
+                    "resources/unsubscribe",
+                    json!({"uri": uri}),
+                    control,
+                )?)
+            },
+        );
         // If connecting/locking failed, retire only the lifetime we observed;
         // never remove a fresh subscription created by a concurrent call.
         if !retired {
@@ -522,23 +572,30 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                     .into(),
             );
         }
-        with_session(key.clone(), config, timeout, control, |session, control| {
-            // Register before the RPC so early notifications are accepted, while
-            // holding the connection lock so subscribe/unsubscribe stay ordered.
-            let token = add_subscription(&key, &uri);
-            let subscribed = session
-                .request("resources/subscribe", json!({"uri": uri}), control)
-                .and_then(response_result);
-            if subscribed.is_err() {
-                remove_subscription(&key, &uri, Some(&token));
-            }
-            subscribed
-        })?;
+        with_session(
+            key.clone(),
+            config,
+            timeout,
+            control,
+            Some(&uri),
+            |session, control| {
+                // Register before the RPC so early notifications are accepted, while
+                // holding the connection lock so subscribe/unsubscribe stay ordered.
+                let token = add_subscription(&key, &uri);
+                let subscribed = session
+                    .request("resources/subscribe", json!({"uri": uri}), control)
+                    .and_then(response_result);
+                if subscribed.is_err() {
+                    remove_subscription(&key, &uri, Some(&token));
+                }
+                subscribed
+            },
+        )?;
         return Ok(json!({"server": name, "uri": uri, "subscribed": true}));
     }
     // read — flatten and bound the contents: a large blob must not reach the
     // model through the tool result.
-    with_session(key, config, timeout, control, |session, control| {
+    with_session(key, config, timeout, control, None, |session, control| {
         let result =
             response_result(session.request("resources/read", json!({"uri": uri}), control)?)?;
         Ok(json!({"server": name, "uri": uri, "text": resource_text(&result)}))
@@ -563,6 +620,7 @@ fn with_session<T>(
     config: McpServerConfig,
     timeout: u64,
     control: &Control,
+    skip_restore_uri: Option<&str>,
     run: impl FnOnce(&mut Session, &Control) -> Result<T, String>,
 ) -> Result<T, String> {
     let entry = {
@@ -579,7 +637,7 @@ fn with_session<T>(
                 let stop = Control::default();
                 let dispatcher = spawn_dispatcher(key.clone(), receiver, stop.clone());
                 let entry = Arc::new(Entry {
-                    session: Mutex::new(None),
+                    session: Mutex::new(ConnectionState::default()),
                     stop,
                     notifications,
                     dispatcher: Mutex::new(Some(dispatcher)),
@@ -592,22 +650,30 @@ fn with_session<T>(
     let control = control.linked(&entry.stop);
     let deadline = Deadline::new(timeout, "connection lock", &control);
     let mut state = lock_until(&entry.session, &deadline)?;
-    if state.as_ref().is_some_and(|s| s.config != config) {
-        state.take();
+    if state.config.as_ref() != Some(&config) {
+        clear_subscriptions(&key);
+        state.session.take();
+        state.config = Some(config.clone());
     }
-    if state.is_none() {
-        *state = Some(Session::start(
-            &config,
-            timeout,
-            &control,
-            &entry.notifications,
-        )?);
+    if state.session.as_ref().is_some_and(|session| session.failed) {
+        state.session.take();
     }
-    let session = state.as_mut().ok_or("MCP session unavailable")?;
+    if state.session.is_none() {
+        let mut session = Session::start(&config, timeout, &control, &entry.notifications)?;
+        if let Err(error) = restore_subscriptions(&key, &mut session, &control, skip_restore_uri) {
+            if session.failed || control.check().is_err() {
+                return Err(format!("MCP resource subscription restoration interrupted: {error}; the next call will retry"));
+            }
+            clear_subscriptions(&key);
+            return Err(format!("MCP resource subscriptions could not be restored: {error}; subscriptions cleared, subscribe again"));
+        }
+        state.session = Some(session);
+    }
+    let session = state.session.as_mut().ok_or("MCP session unavailable")?;
     session.transport.timeout(timeout);
     let result = run(session, &control);
     if session.failed {
-        state.take();
+        state.session.take();
     } // Do not retry tool calls: they may have side effects.
     result
 }
@@ -642,7 +708,7 @@ pub fn shutdown_connections() {
     }
     for entry in entries.values() {
         if let Ok(mut state) = entry.session.lock() {
-            state.take();
+            state.session.take();
         }
     }
     // Ordered teardown: every session is gone, so each dispatcher can be joined.
@@ -662,6 +728,7 @@ fn close_key(key: &str) -> Result<(), String> {
             .session
             .lock()
             .map_err(|_| "MCP connection lock poisoned")?
+            .session
             .take();
         retire_entry(&entry);
     }
@@ -789,7 +856,7 @@ pub(crate) fn call(params: &Value, control: &Control) -> Result<Value, String> {
         return Err("MCP arguments must be an object".into());
     }
     let (key, _, config, timeout) = target(params)?;
-    with_session(key, config, timeout, control, |session, control| {
+    with_session(key, config, timeout, control, None, |session, control| {
         let tools = session.tools(control)?;
         if !tools.iter().any(|t| t.name == tool) {
             return Err(format!("MCP server does not expose tool {tool:?}"));
@@ -834,7 +901,7 @@ pub(crate) fn list(params: &Value, control: &Control) -> Result<Value, String> {
         close_key(&key)?;
         return Ok(json!({"server":name,"closed":true}));
     }
-    with_session(key, config, timeout, control, |session, control| {
+    with_session(key, config, timeout, control, None, |session, control| {
         let tools = session.tools(control)?;
         Ok(
             json!({"server":name, "serverInfo":{"name":session.info.name,"version":session.info.version},"protocolVersion":session.info.protocol_version,"tools":tools}),

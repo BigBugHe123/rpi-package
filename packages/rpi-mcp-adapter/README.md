@@ -113,6 +113,13 @@ including their process tree and owned pipe workers. HTTP cancellations send a
 best-effort cancellation notification. Failed transports are discarded and the
 next invocation reinitializes; tool calls are never automatically replayed.
 
+Reinitializing the same server restores its resource subscriptions before the
+next operation. Transport failures or cancellation during restoration leave them
+available for the next invocation to retry. If the server rejects restoration,
+the adapter reports the error and clears the subscriptions; subscribe again to
+resume updates. Changing server configuration also clears the old subscriptions
+and queued updates instead of transferring them to the replacement server.
+
 Requests/responses are limited to 16 MiB. Discovery is limited to 100 pages and
 16384 tools, with repeated pagination cursors rejected. The connection registry is
 limited to 64 entries; close unused entries to free capacity. The last 8 KiB of

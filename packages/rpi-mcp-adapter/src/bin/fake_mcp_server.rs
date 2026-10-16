@@ -23,6 +23,7 @@ fn main() {
     let mut input = stdin.lock();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut calls = 0;
+    let mut subscribed = std::collections::BTreeSet::new();
     loop {
         let mut line = String::new();
         if input.read_line(&mut line).unwrap_or(0) == 0 {
@@ -96,6 +97,13 @@ fn main() {
                 }
             }
             "resources/read" => {
+                if mode("--drop-first-resource-read") {
+                    let marker = std::env::var("RPI_FAKE_RESOURCE_MARKER").unwrap();
+                    if !std::path::Path::new(&marker).exists() {
+                        std::fs::write(marker, "dropped").unwrap();
+                        break;
+                    }
+                }
                 if mode("--hang-read") {
                     eprintln!("fake server deliberately blocked in resources/read");
                     std::thread::sleep(std::time::Duration::from_secs(60));
@@ -104,6 +112,25 @@ fn main() {
                 json!({"contents":[{"uri":uri,"text":format!("value-of-{uri}")}]})
             }
             "resources/subscribe" => {
+                if mode("--reject-duplicate-subscribe")
+                    && subscribed
+                        .contains(request["params"]["uri"].as_str().unwrap_or("mem://alpha"))
+                {
+                    writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"already subscribed"}})).unwrap();
+                    stdout.flush().unwrap();
+                    continue;
+                }
+                if mode("--reject-restored-subscribe") {
+                    let marker = std::env::var("RPI_FAKE_RESOURCE_MARKER").unwrap();
+                    if std::path::Path::new(&marker).exists() {
+                        writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"resource no longer exists"}})).unwrap();
+                        stdout.flush().unwrap();
+                        continue;
+                    }
+                    std::fs::write(marker, "subscribed").unwrap();
+                }
+                let uri = request["params"]["uri"].as_str().unwrap_or("mem://alpha");
+                subscribed.insert(uri.to_string());
                 // Push the first update *before* the subscribe response, which is
                 // the ordering that used to lose it (the local subscription mark
                 // was only written after the reply arrived).
@@ -119,7 +146,12 @@ fn main() {
                 }
                 json!({})
             }
-            "resources/unsubscribe" => json!({}),
+            "resources/unsubscribe" => {
+                if let Some(uri) = request["params"]["uri"].as_str() {
+                    subscribed.remove(uri);
+                }
+                json!({})
+            }
             "tools/list" => {
                 let echo = json!({"name":"echo","description":"Echo one value","inputSchema":{"type":"object","properties":{"value":{"type":"string"}}}});
                 if mode("--paged") {
@@ -135,6 +167,15 @@ fn main() {
                 }
             }
             "tools/call" => {
+                if mode("--stateful-resources") {
+                    if request["params"]["arguments"]["value"] == "disconnect" {
+                        break;
+                    }
+                    for uri in &subscribed {
+                        writeln!(stdout, "{}", json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":uri}})).unwrap();
+                    }
+                    stdout.flush().unwrap();
+                }
                 calls += 1;
                 match request["params"]["name"].as_str().unwrap_or("") {
                     "counter" => {
