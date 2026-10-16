@@ -1,10 +1,26 @@
 use rpi_extensions::{
-    host_free_string, load_session_mixed, ActionBridge, NullDiagnostics, PanelAnchor,
-    RuntimeActionHost,
+    host_free_string, load_session_mixed, ActionBridge, ExtensionPanel, ExtensionStatusMailbox,
+    NullDiagnostics, PanelAnchor, RuntimeActionHost,
 };
 use rpi_plugin_sdk::{EventTag, StablePluginEvent, StbString, StbStringRef};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
+
+/// The status mailbox publishes panels under `component:{order}:{owner}:{id}` keys
+/// (order and owner were added for TUI layout / multi-owner disambiguation), so
+/// the id is the trailing segment rather than the whole key.
+fn find_panel(mailbox: &ExtensionStatusMailbox, id: &str) -> Option<ExtensionPanel> {
+    let suffix = format!(":{id}");
+    mailbox
+        .panels()
+        .into_iter()
+        .find(|(key, _)| key.ends_with(&suffix))
+        .map(|(_, panel)| panel)
+}
+
+fn has_panel(mailbox: &ExtensionStatusMailbox, id: &str) -> bool {
+    find_panel(mailbox, id).is_some()
+}
 
 struct NoAgentHost;
 macro_rules! no_agent_host {
@@ -40,7 +56,9 @@ no_agent_host!(
 #[ignore = "set RPI_VOICE_DLL to the installed voice DLL; does not open microphone"]
 async fn installed_pet_commands_and_events_round_trip_without_audio() {
     std::env::set_var("RPI_VOICE_AUTO_TTS", "off");
-    let dll = PathBuf::from(std::env::var("RPI_VOICE_DLL").unwrap());
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_VOICE_DLL") else {
+        return;
+    };
     let bridge = ActionBridge::new(tokio::runtime::Handle::current(), Arc::new(NoAgentHost));
     let mailbox = bridge.extension_status_mailbox();
     let session = load_session_mixed(&[], &[dll], Arc::new(NullDiagnostics), Some(bridge));
@@ -54,8 +72,10 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
         let input = json!({"command":"pet","args":args}).to_string();
         let mut out = StbString::empty();
         let rc = (pet.handler)(StbStringRef::from_str(&input), &mut out, pet.user_data);
-        let value: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
-        host_free_string(out);
+        // SAFETY: the handler returned a live SDK-owned allocation; copy it
+        // before freeing it exactly once with the host allocator.
+        let value: Value = serde_json::from_str(&unsafe { out.to_string_lossy() }).unwrap();
+        unsafe { host_free_string(out) };
         assert_eq!(rc, 0);
         value["details"]["state"].clone()
     };
@@ -63,8 +83,7 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
     assert_eq!(state["enabled"], true);
     assert_eq!(state["auto"], false);
     assert_eq!(state["mood"], "sleep");
-    let panels = mailbox.panels();
-    let panel = &panels["rpi.pet"];
+    let panel = find_panel(&mailbox, "rpi.pet").expect("rpi.pet panel registered");
     panel.validate().unwrap();
     assert_eq!(panel.anchor, PanelAnchor::Center);
     assert!(panel.lines.join("\n").contains("安静陪着你"));
@@ -75,7 +94,10 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
     assert_eq!(run("bunny")["animal"], "bunny");
     assert_eq!(run("name 团团")["name"], "团团");
     assert_eq!(run("work")["layout"], "work");
-    assert_eq!(mailbox.panels()["rpi.pet"].anchor, PanelAnchor::RightCenter);
+    assert_eq!(
+        find_panel(&mailbox, "rpi.pet").unwrap().anchor,
+        PanelAnchor::RightCenter
+    );
     assert_eq!(run("name bad\u{1b}name")["name"], "团团");
     let message = StbString::from_string(
         json!({"role":"assistant","content":[{"type":"text","text":"你好，测试成功了。"}]})
@@ -90,9 +112,12 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
             0
         );
     }
-    host_free_string(message);
+    // SAFETY: the handler borrowed `message`; it is still live and owned by this
+    // test, which releases it exactly once here.
+    unsafe { host_free_string(message) };
     assert_eq!(run("focus")["caption"], "你好，测试成功了。");
-    assert!(mailbox.panels()["rpi.pet"]
+    assert!(find_panel(&mailbox, "rpi.pet")
+        .unwrap()
         .lines
         .join("\n")
         .contains("你好，测试成功了。"));
@@ -122,14 +147,16 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
         (voice.handler)(StbStringRef::from_str(input), &mut out, voice.user_data),
         0
     );
-    let text = out.to_string_lossy();
-    host_free_string(out);
+    // SAFETY: the handler returned a live SDK-owned allocation; copy it before
+    // freeing it exactly once with the host allocator.
+    let text = unsafe { out.to_string_lossy() };
+    unsafe { host_free_string(out) };
     assert!(
         text.contains("disabled"),
         "quiet must disable speech: {text}"
     );
     assert_eq!(run("off")["enabled"], false);
-    assert!(!mailbox.panels().contains_key("rpi.pet"));
+    assert!(!has_panel(&mailbox, "rpi.pet"));
     for handler in snapshot.handlers_for(EventTag::AgentEnd) {
         assert_eq!(
             (handler.handler)(
@@ -140,9 +167,9 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
         );
     }
     assert_eq!(run("status")["enabled"], false);
-    assert!(!mailbox.panels().contains_key("rpi.pet"));
+    assert!(!has_panel(&mailbox, "rpi.pet"));
     run("quiet");
-    assert!(mailbox.panels().contains_key("rpi.pet"));
+    assert!(has_panel(&mailbox, "rpi.pet"));
     for handler in snapshot.handlers_for(EventTag::SessionShutdown) {
         assert_eq!(
             (handler.handler)(
@@ -154,7 +181,7 @@ async fn installed_pet_commands_and_events_round_trip_without_audio() {
     }
     std::thread::sleep(std::time::Duration::from_millis(400));
     assert!(
-        !mailbox.panels().contains_key("rpi.pet"),
+        !has_panel(&mailbox, "rpi.pet"),
         "shutdown must remove the panel and join the animation worker"
     );
 }

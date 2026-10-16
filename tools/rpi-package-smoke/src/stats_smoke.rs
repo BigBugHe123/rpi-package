@@ -4,7 +4,7 @@ use rpi_extensions::{
 };
 use rpi_plugin_sdk::{EventTag, StablePluginEvent, StbString, StbStringRef};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 struct Shutdown(Arc<RegistrySnapshot>);
 impl Drop for Shutdown {
@@ -16,7 +16,9 @@ impl Drop for Shutdown {
 #[test]
 #[ignore = "set RPI_STATS_DLL to the installed monitor DLL"]
 fn installed_monitor_loads_commands_and_events_and_shuts_down_cleanly() {
-    let dll = PathBuf::from(std::env::var("RPI_STATS_DLL").unwrap());
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_STATS_DLL") else {
+        return;
+    };
     let session = load_session_mixed(&[], &[dll], Arc::new(NullDiagnostics), None);
     let snapshot = session.snapshot_arc().expect("monitor DLL should load");
     let _shutdown = Shutdown(snapshot.clone());

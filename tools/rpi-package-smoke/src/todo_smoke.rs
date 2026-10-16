@@ -1,13 +1,15 @@
 use rpi_agent::{AgentTool, TextContentOrImage};
 use rpi_extensions::{load_session_mixed, NullDiagnostics, PluginToolAdapter};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 #[ignore = "set RPI_TODO_DLL to the installed todo DLL"]
 async fn installed_todo_updates_return_complete_task_states() {
-    let dll = PathBuf::from(std::env::var("RPI_TODO_DLL").unwrap());
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_TODO_DLL") else {
+        return;
+    };
     let session = load_session_mixed(&[], &[dll], Arc::new(NullDiagnostics), None);
     let snapshot = session.snapshot().unwrap();
     let tool = snapshot
