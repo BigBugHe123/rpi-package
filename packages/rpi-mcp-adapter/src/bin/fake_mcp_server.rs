@@ -77,7 +77,23 @@ fn main() {
                 json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"rpi-fake-mcp","version":"1"}})
             }
             "resources/list" => {
-                json!({"resources":[{"uri":"mem://alpha","name":"alpha"}]})
+                if let Some(pages) = modes.iter().find_map(|arg| {
+                    arg.strip_prefix("--resource-pages=")
+                        .and_then(|count| count.parse::<usize>().ok())
+                }) {
+                    let page = request["params"]["cursor"]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse::<usize>()
+                        .unwrap();
+                    let mut result = json!({"resources":[{"uri":format!("mem://page-{page}"),"name":format!("page-{page}")}]});
+                    if page + 1 < pages {
+                        result["nextCursor"] = json!((page + 1).to_string());
+                    }
+                    result
+                } else {
+                    json!({"resources":[{"uri":"mem://alpha","name":"alpha"}]})
+                }
             }
             "resources/read" => {
                 if mode("--hang-read") {

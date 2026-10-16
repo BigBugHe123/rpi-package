@@ -411,7 +411,7 @@ fn read_resource_by_key(key: &str, uri: &str) -> Result<String, String> {
 /// size, not inlined).
 fn resource_text(result: &Value) -> String {
     let Some(contents) = result.get("contents").and_then(Value::as_array) else {
-        return result.to_string();
+        return bound_resource_text(result.to_string());
     };
     let mut out = String::new();
     for item in contents {
@@ -428,6 +428,10 @@ fn resource_text(result: &Value) -> String {
         }
         out.push_str(&format!("{uri}\n{body}"));
     }
+    bound_resource_text(out)
+}
+
+fn bound_resource_text(mut out: String) -> String {
     if out.len() > MAX_RESOURCE_TEXT {
         let mut end = MAX_RESOURCE_TEXT;
         while end > 0 && !out.is_char_boundary(end) {
@@ -470,7 +474,7 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                     return Err("MCP resource list exceeded 16384 resources".into());
                 }
                 match result.get("nextCursor") {
-                    None => break,
+                    None => return Ok(json!({"server": name, "resources": resources})),
                     Some(Value::String(next)) => {
                         if !seen.insert(next.clone()) {
                             return Err(
@@ -482,7 +486,7 @@ pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, Stri
                     _ => return Err("MCP resources/list nextCursor must be a string".into()),
                 }
             }
-            Ok(json!({"server": name, "resources": resources}))
+            Err("MCP resources/list exceeded 100 pages".into())
         });
     }
 
@@ -926,6 +930,23 @@ mod tests {
         assert!(text.contains("res://a"));
         assert!(text.contains("hello"));
         assert!(text.contains("[blob, 4 base64 chars]"), "got: {text}");
+    }
+
+    #[test]
+    fn resource_text_bounds_regular_and_unexpected_responses() {
+        let huge = "中".repeat(MAX_RESOURCE_TEXT);
+        for response in [
+            json!({"contents":[{"uri":"mem://large","text":huge}]}),
+            json!({"unexpected":huge}),
+        ] {
+            let text = resource_text(&response);
+            assert!(
+                text.len() <= MAX_RESOURCE_TEXT + "\n[truncated]".len(),
+                "unbounded resource response: {} bytes",
+                text.len()
+            );
+            assert!(text.ends_with("\n[truncated]"));
+        }
     }
 
     /// The queue is process-global, so these tests must not interleave.

@@ -194,6 +194,25 @@ fn unsubscribe_and_resubscribe_keep_resource_delivery_consistent() {
     );
 }
 
+#[test]
+fn resource_pagination_does_not_report_partial_results_as_complete() {
+    for pages in [100, 101] {
+        let mode = format!("--resource-pages={pages}");
+        let path = config_with_mode(&mode);
+        let result =
+            rpi_mcp_adapter::resources_from_config(path.to_str().unwrap(), "fake", "list", None);
+        rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+        let _ = fs::remove_file(path);
+        if pages == 100 {
+            let resources = result.unwrap()["resources"].as_array().unwrap().clone();
+            assert_eq!(resources.len(), 100);
+            assert_eq!(resources[99]["uri"], "mem://page-99");
+        } else {
+            assert!(result.unwrap_err().contains("exceeded 100 pages"));
+        }
+    }
+}
+
 /// Regression: the background `resources/read` used a standalone control, so
 /// `close` waited for its timeout (up to 120 s) instead of cancelling it.
 #[test]
