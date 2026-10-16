@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const GOAL_FILE: &str = ".rpi/goals.json";
@@ -71,11 +72,23 @@ fn is_subagent_from(orchestrator_marker: bool, langfuse_parent: bool) -> bool {
     orchestrator_marker || langfuse_parent
 }
 
+static PROCESS_IS_SUBAGENT: AtomicBool = AtomicBool::new(false);
+
+// Capture inherited markers at plugin initialization. Langfuse also publishes
+// its parent trace marker in the parent process during a run, for future
+// children to inherit; reading that marker on TurnEnd misclassifies the parent.
+fn capture_process_role() {
+    PROCESS_IS_SUBAGENT.store(
+        is_subagent_from(
+            std::env::var_os(ORCHESTRATOR_SUBAGENT_ENV).is_some(),
+            std::env::var_os(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV).is_some(),
+        ),
+        Ordering::Relaxed,
+    );
+}
+
 fn is_subagent() -> bool {
-    is_subagent_from(
-        std::env::var_os(ORCHESTRATOR_SUBAGENT_ENV).is_some(),
-        std::env::var_os(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV).is_some(),
-    )
+    PROCESS_IS_SUBAGENT.load(Ordering::Relaxed)
 }
 
 /// Call a host runtime action (e.g. `AppendEntry`). Safe from any thread,
@@ -1021,6 +1034,7 @@ fn goal_command(args_json, out, _user_data) {
 // Entrypoint
 // ---------------------------------------------------------------------------
 rpi_plugin_sdk::export_plugin!(|api| {
+    capture_process_role();
     let _ = RUNTIME.set(*api);
     if let Some(register_event) = api.register_event_handler {
         let rc = register_event(
@@ -1212,6 +1226,84 @@ mod tests {
     /// the `RUNTIME` vtable, the injected-fingerprint latch).
     static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
+    struct ProcessRoleGuard {
+        markers: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        previous_role: bool,
+    }
+
+    impl ProcessRoleGuard {
+        fn parent() -> Self {
+            let markers = [
+                ORCHESTRATOR_SUBAGENT_ENV,
+                rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+            ]
+            .into_iter()
+            .map(|name| {
+                let value = std::env::var_os(name);
+                std::env::remove_var(name);
+                (name, value)
+            })
+            .collect();
+            let previous_role = is_subagent();
+            capture_process_role();
+            Self {
+                markers,
+                previous_role,
+            }
+        }
+    }
+
+    impl Drop for ProcessRoleGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.markers {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            PROCESS_IS_SUBAGENT.store(self.previous_role, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn parent_keeps_counting_and_flushing_after_langfuse_publishes_trace() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("parent-trace");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        APPENDED.lock().unwrap().clear();
+        op_start("Parent budget", "", Some(1), None).unwrap();
+
+        // BeforeAgentStart publishes this for future children after plugins load.
+        std::env::set_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV, "parent-trace");
+        turn_end();
+
+        let goal = read_goals().active.unwrap();
+        assert_eq!(goal.turns_used, 1);
+        assert_eq!(goal.status, "paused");
+        assert!(!APPENDED.lock().unwrap().is_empty());
+        assert!(pending_inject().lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn child_role_survives_langfuse_clearing_inherited_trace() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("child-trace");
+        let _role = ProcessRoleGuard::parent();
+        std::env::set_var(
+            rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+            "inherited-trace",
+        );
+        capture_process_role();
+        op_start("Parent budget", "", Some(1), None).unwrap();
+        std::env::remove_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV);
+        turn_end();
+        let goal = read_goals().active.unwrap();
+        assert_eq!(goal.turns_used, 0);
+        assert_eq!(goal.status, "active");
+    }
+
     /// Run with the process cwd pointed at a fresh temp directory, restoring it
     /// afterwards. `goals_path()` is cwd-relative, so this is the only way to
     /// exercise the real read/write path without touching the developer's project.
@@ -1252,6 +1344,7 @@ mod tests {
     fn subagent_turns_do_not_count_against_the_parent_goal() {
         let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _cwd = isolated_cwd("subagent-budget");
+        let _role = ProcessRoleGuard::parent();
         remember_injected(None);
 
         // The parent records a goal (this happens inside a tool batch).
@@ -1275,6 +1368,7 @@ mod tests {
             rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
         ] {
             std::env::set_var(marker, "1");
+            capture_process_role();
             for _ in 0..5 {
                 turn_end();
             }
@@ -1287,6 +1381,7 @@ mod tests {
         );
 
         // The parent still counts once the markers are gone.
+        capture_process_role();
         turn_end();
         assert_eq!(turns_used(), 2);
     }
@@ -1341,6 +1436,7 @@ mod tests {
     fn goal_notice_is_appended_at_the_turn_boundary_not_inside_the_batch() {
         let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _cwd = isolated_cwd("inject-boundary");
+        let _role = ProcessRoleGuard::parent();
         install_recording_runtime();
         remember_injected(None);
         APPENDED.lock().unwrap_or_else(|p| p.into_inner()).clear();
