@@ -103,9 +103,11 @@ fn mcp_resource(params: &Value, control: &Control) -> Result<Value, String> {
 /// from its `toolResult`s (the HTTP 400 that motivated this timing).
 extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
     // Only the session the host is currently serving may reach the model. The
-    // scope is latched from the latest tool call (`__rpi.sessionId`), because
-    // `TurnEnd` carries no payload; updates for any other session are dropped.
-    let scope = std::panic::catch_unwind(runtime::current_scope).unwrap_or(None);
+    // host's session environment reflects hot switches even without an MCP
+    // call; older embedders fall back to the latest tool call's session scope.
+    let Ok(scope) = std::panic::catch_unwind(runtime::current_scope) else {
+        return 0;
+    };
     let updates = std::panic::catch_unwind(|| runtime::take_pending_updates(scope.as_deref()))
         .unwrap_or_default();
     if updates.is_empty() {

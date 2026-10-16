@@ -185,9 +185,9 @@ const MAX_RESOURCE_TEXT: usize = 20_000;
 
 /// The session scope of the most recent tool call.
 ///
-/// `TurnEnd` carries no payload, so this latch is how the injection path learns
-/// which session it is serving: the host injects `__rpi.sessionId` into every
-/// plugin *tool* call, and every session-using tool goes through [`target`].
+/// Fallback for older embedders without the SDK session environment variable.
+/// Current hosts publish the active session on every hot switch, even when no
+/// MCP tool has been called in the new session.
 static CURRENT_SCOPE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 fn current_scope_slot() -> &'static Mutex<Option<String>> {
     CURRENT_SCOPE.get_or_init(|| Mutex::new(None))
@@ -198,6 +198,17 @@ fn remember_scope(scope: &str) {
         .unwrap_or_else(|p| p.into_inner()) = Some(scope.to_string());
 }
 pub(crate) fn current_scope() -> Option<String> {
+    if let Some(id) = std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV) {
+        // A present but invalid id must fail closed, never reuse the old scope
+        // or fall back to the unscoped queue drain.
+        return Some(
+            id.to_str()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("session:{id}"))
+                .unwrap_or_default(),
+        );
+    }
     current_scope_slot()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -890,6 +901,64 @@ mod tests {
 
     fn clear_queue() {
         pending().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    struct SessionEnvGuard(Option<std::ffi::OsString>, Option<String>);
+
+    impl SessionEnvGuard {
+        fn new() -> Self {
+            Self(
+                std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV),
+                current_scope_slot().lock().unwrap().clone(),
+            )
+        }
+    }
+
+    impl Drop for SessionEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, value),
+                None => std::env::remove_var(rpi_plugin_sdk::SESSION_ID_ENV),
+            }
+            *current_scope_slot().lock().unwrap() = self.1.clone();
+            clear_queue();
+        }
+    }
+
+    #[test]
+    fn hot_switch_without_an_mcp_call_does_not_deliver_previous_session_updates() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        clear_queue();
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "a");
+        remember_scope("session:a");
+        queue("session:a", "key-a", "mem://secret", "A secret");
+
+        // The host switches to B; B makes no MCP call to refresh the latch.
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "b");
+        let scope = current_scope();
+        assert_eq!(scope.as_deref(), Some("session:b"));
+        assert!(take_pending_updates(scope.as_deref()).is_empty());
+        assert!(take_pending_updates(Some("session:a")).is_empty());
+
+        queue("session:b", "key-b", "mem://b", "B");
+        let served = take_pending_updates(current_scope().as_deref());
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].text, "B");
+    }
+
+    #[test]
+    fn invalid_current_session_never_reuses_cached_scope() {
+        let _serial = queue_test_guard();
+        let _env = SessionEnvGuard::new();
+        clear_queue();
+        remember_scope("session:a");
+        queue("session:a", "key-a", "mem://a", "A");
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "  ");
+        assert!(take_pending_updates(current_scope().as_deref()).is_empty());
+
+        std::env::remove_var(rpi_plugin_sdk::SESSION_ID_ENV);
+        assert_eq!(current_scope().as_deref(), Some("session:a"));
     }
 
     /// Regression: the queue was global and `TurnEnd` drained all of it, so
