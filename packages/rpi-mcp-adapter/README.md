@@ -1,12 +1,13 @@
 # rpi-mcp-adapter
 
 MCP tools for the RPI Rust extension ABI, with persistent stdio and Streamable
-HTTP connections. The host registers three stable tools:
+HTTP connections. The host registers four stable tools:
 
 - `mcp_list`: list configured servers or discover a server's tools and schemas;
 - `mcp_call`: call a discovered tool, preserving text/images and structured results;
+- `mcp_resource`: list, read, subscribe to, or unsubscribe from a server's resources;
 - `mcp_request`: send a raw HTTP JSON-RPC request for compatibility/diagnostics.
-  This low-level tool does not manage initialization; use the other two for normal MCP calls.
+  This low-level tool does not manage initialization; use the other tools for normal MCP calls.
 
 ## Configuration and discovery
 
@@ -58,6 +59,49 @@ tab still has stale rendered content. Then call `browser_take_screenshot` with a
 filename such as `.rpi/browser-output/lightbox.png`. In extension mode, a filename
 may resolve against the workspace directory, even with `--output-dir` configured.
 
+## Resources and live updates
+
+`mcp_resource` covers the MCP resource surface (read-only by spec — writing goes
+through a server's tools):
+
+```json
+{"configPath":".rpi/mcp.json","server":"docs","action":"list"}
+{"configPath":".rpi/mcp.json","server":"docs","action":"read","uri":"file:///README.md"}
+{"configPath":".rpi/mcp.json","server":"docs","action":"subscribe","uri":"file:///README.md"}
+{"configPath":".rpi/mcp.json","server":"docs","action":"unsubscribe","uri":"file:///README.md"}
+```
+
+A subscribed server pushes `notifications/resources/updated`. The adapter reads
+the resource and shows the new content to the model as a message at the next turn
+boundary (`TurnEnd`) — never mid tool batch, so an assistant `tool_calls` message
+stays adjacent to its `toolResult`s.
+
+Updates are queued **per session scope**, not globally: only updates produced
+under the session the host is currently serving are injected, and a session
+switch drops the rest. The active session comes from the SDK environment, with
+the latest tool call's `__rpi.sessionId` as a fallback for older embedders. Otherwise
+switching sessions would leak one session's resource contents into another's
+context. Closing a connection or unsubscribing a URI drops its queued updates
+and prevents reads from that subscription lifetime from enqueueing late results.
+Subscribing again starts a new lifetime, so an older read cannot reach it.
+Only subscribed URIs trigger background reads.
+
+If the host rejects an update message, the adapter retries at a later turn
+boundary while the same session and subscription lifetime remain active. Newer
+reads supersede older failed deliveries, including reads already delivered by
+another boundary. Retries respect the 64-update queue limit and preserve newer
+queued content when it is full.
+
+A subscription is marked **before** its `subscribe` request goes out, so a server
+that pushes the first update while the handshake is still in flight is not lost;
+a failed subscribe rolls the mark back. Closing a connection cancels an in-flight
+background read instead of waiting for its timeout, and joins the connection's
+dispatcher thread. Closing or shutting down first drains in-flight operations,
+then purges their subscriptions and queued updates. The stopped connection stays
+registered until its dispatcher exits, so late work cannot reach a replacement.
+
+This works for stdio servers today; HTTP/SSE push is not wired yet.
+
 ## Connections, bounds and cancellation
 
 Connections are isolated by host session ID and canonical config path/server name
@@ -77,6 +121,13 @@ including their process tree and owned pipe workers. HTTP cancellations send a
 best-effort cancellation notification. Failed transports are discarded and the
 next invocation reinitializes; tool calls are never automatically replayed.
 
+Reinitializing the same server restores its resource subscriptions before the
+next operation. Transport failures or cancellation during restoration leave them
+available for the next invocation to retry. If the server rejects restoration,
+the adapter reports the error and clears the subscriptions; subscribe again to
+resume updates. Changing server configuration also clears the old subscriptions
+and queued updates instead of transferring them to the replacement server.
+
 Requests/responses are limited to 16 MiB. Discovery is limited to 100 pages and
 16384 tools, with repeated pagination cursors rejected. The connection registry is
 limited to 64 entries; close unused entries to free capacity. The last 8 KiB of
@@ -95,10 +146,12 @@ the original result, including structured content, is retained in result details
 
 ## Scope and validation
 
-The stable dispatcher avoids runtime tool registration. Resources, prompts,
-sampling, elicitation, OAuth, and automatic dynamic tool registration are not
-implemented. `exposure` is parsed for configuration compatibility; the stable
-dispatcher does not implement Pi's dynamic exposure modes.
+The stable dispatcher avoids runtime tool registration. Prompts, sampling,
+elicitation, OAuth, and automatic dynamic tool registration are not implemented;
+resources are supported through `mcp_resource`, but resource updates over
+HTTP/SSE push are not wired yet. `exposure` is parsed for configuration
+compatibility; the stable dispatcher does not implement Pi's dynamic exposure
+modes.
 
 Run `cargo test -p rpi-mcp-adapter` and
 `cargo clippy -p rpi-mcp-adapter --all-targets -- -D warnings`.

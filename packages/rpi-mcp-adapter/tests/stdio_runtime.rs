@@ -68,6 +68,7 @@ fn stdio_timeout_bounds_unresponsive_server() {
         &["--hang".into()],
         &Default::default(),
         None,
+        None,
     )
     .unwrap();
     transport.set_timeout(1);
@@ -89,6 +90,7 @@ fn stdio_skips_notifications_before_response() {
         &["--notify".into()],
         &Default::default(),
         None,
+        None,
     )
     .unwrap();
     transport.set_timeout(2);
@@ -102,6 +104,356 @@ fn config_with_mode(mode: &str) -> std::path::PathBuf {
     let path = config_path();
     fs::write(&path, json!({"mcpServers":{"fake":{"command":env!("CARGO_BIN_EXE_fake_mcp_server"),"args":[mode],"timeout":2}}}).to_string()).unwrap();
     path
+}
+
+fn config_with_modes(modes: &[&str]) -> std::path::PathBuf {
+    config_with_modes_and_timeout(modes, 2)
+}
+
+fn config_with_modes_and_timeout(modes: &[&str], timeout: u64) -> std::path::PathBuf {
+    let path = config_path();
+    fs::write(&path, json!({"mcpServers":{"fake":{"command":env!("CARGO_BIN_EXE_fake_mcp_server"),"args":modes,"timeout":timeout}}}).to_string()).unwrap();
+    path
+}
+
+/// The pending queue is process-global, so tests that inspect it must not run
+/// concurrently with each other.
+static RESOURCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn drain_updates_until(within: std::time::Duration) -> Vec<rpi_mcp_adapter::ResourceUpdate> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let updates = rpi_mcp_adapter::take_resource_updates(None);
+        if !updates.is_empty() || std::time::Instant::now() >= deadline {
+            return updates;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Regression: the local subscription mark used to be written *after* the
+/// `subscribe` response, so a server that pushed the first
+/// `notifications/resources/updated` while the handshake was still in flight had
+/// that update dropped by the dispatcher.
+#[test]
+fn subscribe_keeps_an_update_pushed_before_the_response() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    let subscribed = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    assert_eq!(subscribed["subscribed"], true);
+
+    let updates = drain_updates_until(std::time::Duration::from_secs(5));
+    assert_eq!(
+        updates.len(),
+        1,
+        "the update pushed before the subscribe response was lost: {updates:?}"
+    );
+    assert!(updates[0].text.contains("value-of-mem://alpha"));
+
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn unsubscribe_and_resubscribe_keep_resource_delivery_consistent() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    let resource = |action| {
+        rpi_mcp_adapter::resources_from_config(
+            path.to_str().unwrap(),
+            "fake",
+            action,
+            Some("mem://alpha"),
+        )
+        .unwrap()
+    };
+    resource("subscribe");
+    assert_eq!(
+        drain_updates_until(std::time::Duration::from_secs(5)).len(),
+        1
+    );
+    assert_eq!(resource("unsubscribe")["unsubscribed"], true);
+    assert!(rpi_mcp_adapter::take_resource_updates(None).is_empty());
+    assert_eq!(resource("subscribe")["subscribed"], true);
+    let updates = drain_updates_until(std::time::Duration::from_secs(5));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(
+        updates.len(),
+        1,
+        "new subscription failed to deliver: {updates:?}"
+    );
+}
+
+#[test]
+fn resource_pagination_does_not_report_partial_results_as_complete() {
+    for pages in [100, 101] {
+        let mode = format!("--resource-pages={pages}");
+        let path = config_with_mode(&mode);
+        let result =
+            rpi_mcp_adapter::resources_from_config(path.to_str().unwrap(), "fake", "list", None);
+        rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+        let _ = fs::remove_file(path);
+        if pages == 100 {
+            let resources = result.unwrap()["resources"].as_array().unwrap().clone();
+            assert_eq!(resources.len(), 100);
+            assert_eq!(resources[99]["uri"], "mem://page-99");
+        } else {
+            assert!(result.unwrap_err().contains("exceeded 100 pages"));
+        }
+    }
+}
+
+#[test]
+fn reconnect_restores_resource_subscriptions_without_replaying_failed_tools() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_mode("--stateful-resources");
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    call_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "echo",
+        json!({"value":"tick"}),
+    )
+    .unwrap();
+    assert_eq!(
+        drain_updates_until(std::time::Duration::from_secs(3)).len(),
+        1
+    );
+
+    // The server exits before replying. The failed tool is not retried, and the
+    // next call must reconnect and restore the existing resource subscription.
+    let disconnected = call_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "echo",
+        json!({"value":"disconnect"}),
+    );
+    assert!(disconnected.is_err());
+    let result = call_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "echo",
+        json!({"value":"tick"}),
+    );
+    let updates = drain_updates_until(std::time::Duration::from_secs(1));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(result.unwrap(), "echo:tick");
+    assert_eq!(
+        updates.len(),
+        1,
+        "connection recovered but resource subscription was lost"
+    );
+}
+
+fn resource_echo(path: &std::path::Path, value: &str) -> Result<String, String> {
+    call_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "echo",
+        json!({"value":value}),
+    )
+}
+
+#[test]
+fn explicit_resubscribe_after_disconnect_does_not_subscribe_twice() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--stateful-resources", "--reject-duplicate-subscribe"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    assert!(resource_echo(&path, "disconnect").is_err());
+    let result = rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    );
+    let tick = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_secs(3));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(result.unwrap()["subscribed"], true);
+    assert_eq!(tick.unwrap(), "echo:tick");
+    assert_eq!(updates.len(), 1);
+}
+
+fn subscribe_alpha(path: &std::path::Path) {
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn changed_server_config_does_not_inherit_subscriptions_after_a_disconnect() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_mode("--stateful-resources");
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    assert!(resource_echo(&path, "disconnect").is_err());
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["mcpServers"]["fake"]["args"] = json!(["--stateful-resources", "--new-server-config"]);
+    fs::write(&path, config.to_string()).unwrap();
+    let result = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_millis(250));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(result.unwrap(), "echo:tick");
+    assert!(
+        updates.is_empty(),
+        "subscriptions crossed a server configuration change"
+    );
+}
+
+fn resource_config_with_marker(mode: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let path = config_path();
+    let marker = path.with_extension("marker");
+    fs::write(
+        &path,
+        json!({"mcpServers":{"fake":{
+            "command":env!("CARGO_BIN_EXE_fake_mcp_server"),
+            "args":["--stateful-resources", mode], "timeout":2,
+            "env":{"RPI_FAKE_RESOURCE_MARKER":marker}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    (path, marker)
+}
+
+#[test]
+fn rejected_restore_is_reported_without_permanently_blocking_tools() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (path, marker) = resource_config_with_marker("--reject-restored-subscribe");
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    assert!(resource_echo(&path, "disconnect").is_err());
+    let restored = resource_echo(&path, "tick");
+    let next = resource_echo(&path, "tick");
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let updates = rpi_mcp_adapter::take_resource_updates(None);
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(marker);
+    let error = restored.unwrap_err();
+    assert!(error.contains("could not be restored"), "{error}");
+    assert!(error.contains("subscriptions cleared"), "{error}");
+    assert_eq!(next.unwrap(), "echo:tick");
+    assert!(updates.is_empty());
+}
+
+#[test]
+fn failed_background_resource_read_recovers_on_the_next_tool_call() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (path, marker) = resource_config_with_marker("--drop-first-resource-read");
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+    subscribe_alpha(&path);
+    resource_echo(&path, "tick").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let dropped = marker.exists();
+    let result = resource_echo(&path, "tick");
+    let updates = drain_updates_until(std::time::Duration::from_secs(3));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(marker);
+    assert!(dropped, "background read fixture did not disconnect");
+    assert_eq!(result.unwrap(), "echo:tick");
+    assert_eq!(
+        updates.len(),
+        1,
+        "background disconnect lost the subscription"
+    );
+}
+
+/// Regression: the background `resources/read` used a standalone control, so
+/// `close` waited for its timeout (up to 120 s) instead of cancelling it.
+#[test]
+fn close_cancels_a_blocked_background_read() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // A long client timeout: without the fix, close would wait for the blocked
+    // read to time out (30 s) instead of cancelling it.
+    let path = config_with_modes_and_timeout(&["--notify-early", "--hang-read"], 30);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    rpi_mcp_adapter::resources_from_config(
+        path.to_str().unwrap(),
+        "fake",
+        "subscribe",
+        Some("mem://alpha"),
+    )
+    .unwrap();
+    // Give the dispatcher a moment to enter the (blocking) read.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let started = std::time::Instant::now();
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "close waited for the blocked read instead of cancelling it: {elapsed:?}"
+    );
+    let _ = fs::remove_file(path);
+}
+
+/// Regression: closing a connection must leave no queued updates behind, so a
+/// later session cannot be shown a released connection's resource contents.
+///
+/// Deliberately per-connection (`close_from_config`) rather than the global
+/// `shutdown_connections`, which would tear down every other test's session.
+#[test]
+fn close_drops_queued_resource_updates() {
+    let _serial = RESOURCE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = config_with_modes(&["--notify-early"]);
+    let _ = rpi_mcp_adapter::take_resource_updates(None);
+
+    let subscribe = || {
+        rpi_mcp_adapter::resources_from_config(
+            path.to_str().unwrap(),
+            "fake",
+            "subscribe",
+            Some("mem://alpha"),
+        )
+        .unwrap()
+    };
+
+    // The pipeline works: the update pushed before the response is queued.
+    subscribe();
+    let first = drain_updates_until(std::time::Duration::from_secs(5));
+    assert_eq!(first.len(), 1, "expected one queued update, got {first:?}");
+
+    // Queue another and close without draining it.
+    subscribe();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    rpi_mcp_adapter::close_from_config(path.to_str().unwrap(), "fake").unwrap();
+
+    assert!(
+        rpi_mcp_adapter::take_resource_updates(None).is_empty(),
+        "close left resource updates queued for a later session"
+    );
+    let _ = fs::remove_file(path);
 }
 #[test]
 fn persistent_session_and_paginated_tools() {
@@ -146,6 +498,7 @@ fn timeout_covers_a_full_stdin_pipe() {
         &["--no-read".into()],
         &Default::default(),
         None,
+        None,
     )
     .unwrap();
     transport.set_timeout(1);
@@ -167,6 +520,7 @@ fn cancellation_interrupts_pipe_write_and_cleans_workers() {
         env!("CARGO_BIN_EXE_fake_mcp_server"),
         &["--no-read".into()],
         &Default::default(),
+        None,
         None,
     )
     .unwrap();
@@ -210,6 +564,7 @@ fn oversize_unterminated_stdout_is_rejected() {
         &["--oversize".into()],
         &Default::default(),
         None,
+        None,
     )
     .unwrap();
     transport.set_timeout(5);
@@ -235,6 +590,7 @@ fn timeout_kills_descendants_holding_inherited_pipes() {
         env!("CARGO_BIN_EXE_fake_mcp_server"),
         &["--spawn-child".into()],
         &Default::default(),
+        None,
         None,
     )
     .unwrap();
