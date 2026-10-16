@@ -60,6 +60,7 @@ mod tests {
             "mcp_call",
             "mcp_list",
             "mcp_request",
+            "mcp_resource",
             "permissions",
             "plan_mode_complete",
             "plan_mode_start",
