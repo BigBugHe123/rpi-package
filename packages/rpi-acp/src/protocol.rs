@@ -131,6 +131,13 @@ impl Writer {
             .await;
     }
 
+    /// Session startup/restore failures are ordinary server errors. ACP reserves
+    /// -32000 for authentication, which makes clients offer a login flow.
+    async fn session_error(&self, id: &Value, operation: &str, error: &str) {
+        diagln!("[rpi-acp] {operation} failed: {error}");
+        self.respond_error(id, -32603, error).await;
+    }
+
     /// Send a JSON-RPC notification (no `id`).
     pub async fn notify(&self, method: &str, params: Value) {
         let _ = self
@@ -350,7 +357,7 @@ pub async fn run(
                         sessions.lock().await.insert(session_id.clone(), session);
                         writer.respond(&id, json!({"sessionId": session_id})).await;
                     }
-                    Err(error) => writer.respond_error(&id, -32000, &error).await,
+                    Err(error) => writer.session_error(&id, "session/new", &error).await,
                 }
             }
             (Some(id), Some("session/prompt")) => {
@@ -435,11 +442,11 @@ pub async fn run(
                                 if !sessions.lock().await.contains_key(session_id) {
                                     session.kill().await;
                                 }
-                                writer.respond_error(&id, -32000, &error).await;
+                                writer.session_error(&id, method, &error).await;
                             }
                         }
                     }
-                    Err(error) => writer.respond_error(&id, -32000, &error).await,
+                    Err(error) => writer.session_error(&id, method, &error).await,
                 }
             }
             (Some(id), Some(other)) => {

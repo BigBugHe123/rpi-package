@@ -50,6 +50,9 @@ class NativeUiAdapterTests(unittest.TestCase):
                     return
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "null")
                 path = self.path
+                if records.get('fail_valves') and path.endswith('/valves/update'):
+                    self.send_error(500)
+                    return
                 if self.command == "POST":
                     if path.endswith(("/create", "/update")) and "/valves/" not in path:
                         records["function"] = {**body, "is_active": records.get("function", {}).get("is_active", False)}
@@ -82,6 +85,17 @@ class NativeUiAdapterTests(unittest.TestCase):
         self.env.update(RPI_CODING_AGENT_DIR=str(self.root / "agent"), RPI_EXTENSIONS_DIR=str(self.extensions),
                         RPI_ACP_NO_AUTO_REGISTER_ZED="1", RPI_OFFLINE="1", ANTHROPIC_API_KEY="fixture-only")
         self.env.pop("OPENWEBUI_TOKEN", None)
+        self.env['UI_ADAPTER_TEST_ADMIN_TOKEN'] = 'fixture-admin'
+        # Old environment flags must not override the UI-specific file.
+        self.env['RPI_WEBUI_URL'] = 'http://invalid-old-environment:1'
+        self.config_path = self.root / '.rpi/webui/openwebui.json'
+        self.config_path.parent.mkdir(parents=True)
+        self.config_path.write_text(json.dumps({
+            'url': f'http://127.0.0.1:{self.api.server_port}',
+            'tokenEnv': 'UI_ADAPTER_TEST_ADMIN_TOKEN',
+            'adapter': {'bind': f'127.0.0.1:{self.port}', 'url': self.base},
+            'permissions': 'bypass',
+        }), encoding='utf-8')
         self.processes = []
         self.readers = []
 
@@ -121,7 +135,7 @@ class NativeUiAdapterTests(unittest.TestCase):
             try:
                 with opener.open(self.base + "/health", timeout=.2) as response:
                     self.assertEqual(response.read(), b"rpi-ui-adapter")
-                path = self.root / "agent/ui-adapter/openwebui.json"
+                path = self.root / ".rpi/webui/.state/openwebui.json"
                 if path.exists() and json.loads(path.read_text()).get("installed"):
                     return json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
@@ -130,8 +144,8 @@ class NativeUiAdapterTests(unittest.TestCase):
         self.fail("adapter did not start: " + "".join(errors))
 
     def test_auto_install_native_acp_and_saved_restart(self):
-        process, errors = self.start("--webui=openwebui", "--webui-url", f"http://127.0.0.1:{self.api.server_port}",
-            "--webui-bind", f"127.0.0.1:{self.port}", "--webui-token", "fixture-admin", "--webui-permissions", "bypass")
+        original = self.config_path.read_bytes()
+        process, errors = self.start("--webui=openwebui")
         config = self.ready(process, errors)
         self.assertTrue(self.records["function"]["is_active"])
         self.assertEqual(self.records["valves"]["PERMISSIONS"], "bypass")
@@ -151,8 +165,36 @@ class NativeUiAdapterTests(unittest.TestCase):
         asyncio.run(probe())
         process.terminate()
         process.wait(timeout=15)
+        self.env.pop('UI_ADAPTER_TEST_ADMIN_TOKEN')
         restarted, errors = self.start("--webui=openwebui")
         self.ready(restarted, errors)
+        self.assertEqual(self.config_path.read_bytes(), original)
+        self.assertFalse((self.root/'agent/ui-adapter').exists())
+
+    def test_missing_config_creates_template_without_starting_service(self):
+        self.config_path.unlink()
+        process, errors = self.start('--webui=openwebui')
+        self.assertEqual(process.wait(timeout=15), 2)
+        self.assertEqual(json.loads(self.config_path.read_text())['tokenEnv'], 'OPENWEBUI_TOKEN')
+        self.assertFalse((self.root/'.rpi/webui/.state').exists())
+        self.assertNotIn('function', self.records)
+
+    def test_removed_flags_point_to_config_file(self):
+        process, errors = self.start('--webui=openwebui', '--webui-url', 'http://old')
+        self.assertEqual(process.wait(timeout=15), 2)
+        for reader in self.readers:
+            reader.join(timeout=5)
+        self.assertIn('moved to .rpi/webui/openwebui.json', ''.join(errors))
+
+    def test_failed_install_is_not_cached_as_success(self):
+        self.records['fail_valves'] = True
+        process, errors = self.start('--webui=openwebui')
+        self.assertEqual(process.wait(timeout=15), 1)
+        state = json.loads((self.root/'.rpi/webui/.state/openwebui.json').read_text())
+        self.assertFalse(state['installed'])
+        self.env.pop('UI_ADAPTER_TEST_ADMIN_TOKEN')
+        retry, errors = self.start('--webui=openwebui')
+        self.assertEqual(retry.wait(timeout=15), 2)
 
     def test_unknown_ui_fails_with_actionable_error(self):
         process, errors = self.start("--webui=unknown")

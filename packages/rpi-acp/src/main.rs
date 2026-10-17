@@ -31,11 +31,13 @@ const USAGE: &str = "\
 rpi-acp-bridge - ACP stdio agent for rpi
 
 USAGE:
+    rpi-acp-bridge [--bypass]
     rpi-acp-bridge [--install-zed [OPTIONS]] [--print-zed]
 
 With no arguments it serves ACP on stdin/stdout (this is how Zed launches it).
 
 COMMANDS:
+    --bypass        Serve ACP without permission-gate approvals
     --install-zed   Register rpi under `agent_servers` in Zed's settings.json
     --print-zed     Print the settings snippet instead of writing it
     -h, --help      Show this help
@@ -61,6 +63,10 @@ fn main() {
 /// `None` falls through to the ACP server so an ACP client can spawn us bare.
 fn subcommand(args: Vec<String>) -> Option<i32> {
     match args.first().map(String::as_str)? {
+        "--bypass" if args.len() == 1 => {
+            rpi_acp::session::set_permission_bypass(true);
+            None
+        }
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
             Some(0)

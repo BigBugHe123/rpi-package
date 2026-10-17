@@ -144,6 +144,27 @@ You can pass ordinary rpi flags through `args`, e.g.
 `["--acp", "--model", "gateway/model"]`. The child session inherits the process
 environment, so provider API keys work as usual.
 
+### Skip permission approvals
+
+To skip bash/write/edit approval prompts, add `--bypass` to the existing Zed
+agent's arguments:
+
+```json
+"args": ["--acp", "--bypass"]
+```
+
+Save the settings and restart Zed before starting a new rpi thread. The flag
+only affects this process and its ACP session children; it does not change
+system environment variables or saved permission settings. It overrides
+`--permission-gate` and `RPI_PERMISSION_GATE=1`. Other extensions' policies and
+ordinary user questions are unchanged. Omitting the flag keeps the default
+approval prompts. This requires a version of `rpi-acp` containing the flag.
+
+The standalone bridge accepts `rpi-acp-bridge --bypass` (Zed `args: ["--bypass"]`).
+Existing environment configuration remains supported:
+`RPI_ACP_NO_PERMISSION_GATE=1` stops ACP from adding `--permission-gate`, while
+`RPI_PERMISSION_GATE=0` disables environment-based activation of the gate.
+
 ## Standalone binary (ACP Registry)
 
 The same ACP server also builds as a standalone binary, `rpi-acp-bridge`. Unlike
@@ -235,8 +256,9 @@ It prints the sha256 and a ready-to-paste `distribution.binary` stanza; see
   dialog mid-run (e.g. the `rpi-permission-gate` extension confirming a `bash`
   command), `rpi-acp` maps it to a `session/request_permission` request and
   sends the user's choice back to the plugin. The child is launched with
-  `--permission-gate` by default so Zed shows approval prompts; set
-  `RPI_ACP_NO_PERMISSION_GATE=1` to opt out. Only `confirm`/`selector` dialogs
+  `--permission-gate` by default so Zed shows approval prompts; use `--bypass`
+  to disable that gate, or set `RPI_ACP_NO_PERMISSION_GATE=1` to opt out of
+  automatic activation only. Only `confirm`/`selector` dialogs
   with explicit `purpose: "permission"` and per-option `permission` decisions
   map to a permission request. Option titles are preserved in the returned
   answer. Ordinary questions use the negotiated extension below; clients that

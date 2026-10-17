@@ -11,7 +11,7 @@ pub(crate) fn session_directory(id: &str) -> Result<PathBuf, String> {
         .as_deref()
         != Ok(id)
     {
-        return Err("unknown sessionId: older ACP versions used temporary sessions that cannot be restored after exit".into());
+        return Err("unknown sessionId: older ACP versions used temporary sessions that cannot be restored after exit; start a new conversation".into());
     }
     let root = if let Some(path) = std::env::var_os("RPI_ACP_SESSION_DIR") {
         PathBuf::from(path)

@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
+pub mod settings;
+
 pub const PIPE: &str = include_str!("../openwebui/pipe.py");
 const ID: &str = "rpi_ui_adapter";
 
@@ -42,7 +44,7 @@ async fn call(
         .map_err(|_| "Invalid JSON from Open WebUI".into())
 }
 
-pub async fn install(config: &Config, token: &str, config_path: &Path) -> Result<(), String> {
+pub async fn install(config: &Config, token: &str, state_path: &Path) -> Result<(), String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -79,9 +81,11 @@ pub async fn install(config: &Config, token: &str, config_path: &Path) -> Result
             );
         }
     }
-    // Save the desired local configuration before the external mutation. A
-    // failed/retried install then reuses exactly the same adapter token.
-    save(config_path, config)?;
+    // Save generated state before external mutation so retries reuse the same
+    // adapter token. The user's .rpi/webui/<UI>.json is never overwritten.
+    let mut pending = config.clone();
+    pending.installed = false;
+    save(state_path, &pending)?;
     let meta = existing
         .as_ref()
         .and_then(|v| v.get("meta"))

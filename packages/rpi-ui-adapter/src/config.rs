@@ -3,23 +3,10 @@ use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-pub const FLAGS: &[(&str, &str)] = &[
-    ("webui", "UI adapter to start (openwebui)"),
-    ("webui-url", "Existing Open WebUI instance URL"),
-    ("webui-token", "Open WebUI admin token (or OPENWEBUI_TOKEN)"),
-    (
-        "webui-bind",
-        "Adapter listen address (default 127.0.0.1:5234)",
-    ),
-    (
-        "webui-adapter-url",
-        "Adapter URL reachable from Open WebUI's backend",
-    ),
-    (
-        "webui-permissions",
-        "Permission policy: ask, bypass or deny (default ask)",
-    ),
-];
+pub const FLAGS: &[(&str, &str)] = &[(
+    "webui",
+    "UI adapter to start; reads .rpi/webui/<UI>.json (openwebui)",
+)];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -38,6 +25,7 @@ pub struct Config {
 
 pub struct Launch {
     pub config: Config,
+    /// Generated state, never the user's UI configuration file.
     pub path: PathBuf,
     pub admin_token: Option<String>,
     pub executable: PathBuf,
@@ -52,17 +40,14 @@ fn text(value: Option<Value>, name: &str) -> Result<Option<String>, String> {
     }
 }
 
-pub fn directory() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("RPI_CODING_AGENT_DIR") {
-        return Ok(PathBuf::from(dir).join("ui-adapter"));
+fn check_ui(ui: &str) -> Result<(), String> {
+    match ui {
+        "openwebui" => Ok(()),
+        _ => Err(format!("Unsupported UI '{ui}'; supported: openwebui")),
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or("Cannot locate rpi configuration directory")?;
-    Ok(PathBuf::from(home).join(".rpi/agent/ui-adapter"))
 }
 
-fn endpoint(raw: &str) -> Result<String, String> {
+pub(super) fn endpoint(raw: &str) -> Result<String, String> {
     let parsed = url::Url::parse(raw).map_err(|_| "Invalid UI/adapter URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -78,78 +63,45 @@ fn endpoint(raw: &str) -> Result<String, String> {
     Ok(raw.trim_end_matches('/').to_owned())
 }
 
-pub fn resolve(mut flag: impl FnMut(&str) -> Option<Value>) -> Result<Launch, String> {
-    let ui = text(flag("webui"), "webui")?.ok_or("Use --webui=openwebui")?;
-    if ui != "openwebui" {
-        return Err(format!("Unsupported UI '{ui}'; supported: openwebui"));
-    }
-    let path = directory()?.join(format!("{ui}.json"));
+fn resolve_project(
+    ui: &str,
+    cwd: PathBuf,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Config, PathBuf, Option<String>), String> {
+    check_ui(ui)?;
+    let directory = cwd.join(".rpi/webui");
+    let source = directory.join(format!("{ui}.json"));
+    // Each UI owns its own schema and validation. More UIs do not grow a
+    // universal CLI flag list or overwrite another adapter's settings.
+    let settings = crate::openwebui::settings::load(&source)?;
+    let path = directory.join(".state").join(format!("{ui}.json"));
     let saved: Option<Config> = match std::fs::read(&path) {
         Ok(data) => Some(
-            serde_json::from_slice(&data).map_err(|e| format!("Invalid saved UI config: {e}"))?,
+            serde_json::from_slice(&data).map_err(|e| format!("Invalid UI adapter state: {e}"))?,
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("Cannot read saved UI config: {e}")),
+        Err(e) => return Err(format!("Cannot read UI adapter state: {e}")),
     };
-    let mut setting = |name: &str, env: &str| -> Result<Option<String>, String> {
-        Ok(text(flag(name), name)?.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty())))
-    };
-    let url = endpoint(
-        &setting("webui-url", "RPI_WEBUI_URL")?
-            .or_else(|| saved.as_ref().map(|s| s.url.clone()))
-            .ok_or("First start requires --webui-url <Open WebUI URL> or RPI_WEBUI_URL")?,
-    )?;
-    let bind: SocketAddr = setting("webui-bind", "RPI_WEBUI_BIND")?
-        .or_else(|| saved.as_ref().map(|s| s.bind.to_string()))
-        .unwrap_or_else(|| "127.0.0.1:5234".into())
-        .parse()
-        .map_err(|_| "Invalid --webui-bind socket address")?;
-    if bind.port() == 0 {
-        return Err("--webui-bind requires a nonzero port".into());
-    }
-    let adapter_url = endpoint(
-        &setting("webui-adapter-url", "RPI_WEBUI_ADAPTER_URL")?
-            .or_else(|| saved.as_ref().map(|s| s.adapter_url.clone()))
-            .unwrap_or_else(|| format!("http://{bind}")),
-    )?;
-    if url::Url::parse(&adapter_url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .is_some_and(|h| h == "0.0.0.0" || h == "[::]")
-    {
-        return Err(
-            "Set --webui-adapter-url to an address reachable by the Open WebUI backend".into(),
-        );
-    }
-    let permissions = setting("webui-permissions", "RPI_WEBUI_PERMISSIONS")?
-        .or_else(|| saved.as_ref().map(|s| s.permissions.clone()))
-        .unwrap_or_else(|| "ask".into());
-    if !matches!(permissions.as_str(), "ask" | "bypass" | "deny") {
-        return Err("--webui-permissions must be ask, bypass or deny".into());
-    }
-    let admin_token = setting("webui-token", "OPENWEBUI_TOKEN")?;
+    let admin_token = settings.admin_token(&env)?;
     let previous = saved.as_ref();
-    let installed = previous.is_some_and(|s| s.url == url && s.installed);
-    let installed_version = previous
-        .map(|s| s.installed_version.clone())
-        .unwrap_or_default();
     let config = Config {
-        ui,
-        url,
-        bind,
-        adapter_url,
-        permissions,
+        ui: ui.into(),
+        url: settings.url,
+        bind: settings.adapter.bind,
+        adapter_url: settings.adapter.url.expect("validated adapter URL"),
+        permissions: settings.permissions,
         adapter_token: previous
             .map(|s| s.adapter_token.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        cwd: std::env::current_dir().map_err(|e| e.to_string())?,
-        installed,
-        installed_version,
+        cwd,
+        installed: previous.is_some_and(|s| s.installed),
+        installed_version: previous
+            .map(|s| s.installed_version.clone())
+            .unwrap_or_default(),
     };
-    // Every run refreshes valves (cwd/address/policy). The admin token is read
-    // for installation only and is never persisted in this config.
     let unchanged = previous.is_some_and(|s| {
-        s.installed
+        s.ui == config.ui
+            && s.installed
             && s.installed_version == env!("CARGO_PKG_VERSION")
             && s.url == config.url
             && s.adapter_url == config.adapter_url
@@ -157,11 +109,29 @@ pub fn resolve(mut flag: impl FnMut(&str) -> Option<Value>) -> Result<Launch, St
             && s.cwd == config.cwd
     });
     if admin_token.is_none() && !unchanged {
-        return Err(
-            "Automatic UI configuration requires --webui-token <admin token> or OPENWEBUI_TOKEN"
-                .into(),
-        );
+        return Err(format!("Open WebUI installation/configuration needs an admin token: set token or tokenEnv in {}", source.display()));
     }
+    Ok((config, path, admin_token))
+}
+
+pub fn resolve(mut flag: impl FnMut(&str) -> Option<Value>) -> Result<Launch, String> {
+    let ui = text(flag("webui"), "webui")?.ok_or("Use --webui=openwebui")?;
+    check_ui(&ui)?;
+    for name in [
+        "webui-url",
+        "webui-token",
+        "webui-bind",
+        "webui-adapter-url",
+        "webui-permissions",
+    ] {
+        if flag(name).is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "--{name} moved to .rpi/webui/{ui}.json; start with --webui={ui}"
+            ));
+        }
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (config, path, admin_token) = resolve_project(&ui, cwd, |name| std::env::var(name).ok())?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut args = vec!["--acp".into()];
     for name in ["extensions-dir", "model", "provider"] {
@@ -184,9 +154,17 @@ pub fn resolve(mut flag: impl FnMut(&str) -> Option<Value>) -> Result<Launch, St
 }
 
 pub fn save(path: &Path, config: &Config) -> Result<(), String> {
+    write_json(path, config, true)
+}
+
+pub(super) fn write_json(path: &Path, value: &impl Serialize, replace: bool) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid config path")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let tmp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let target = if replace {
+        parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()))
+    } else {
+        path.to_owned()
+    };
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -196,14 +174,18 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
     }
     use std::io::Write;
     let result = (|| {
-        let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
-        file.write_all(&serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?)
+        let mut file = options.open(&target).map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        file.write_all(b"\n").map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        if replace {
+            std::fs::rename(&target, path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if result.is_err() && replace {
+        let _ = std::fs::remove_file(&target);
     }
     result
 }
@@ -211,6 +193,26 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    struct Project(PathBuf);
+    impl Project {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("rpi-webui-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn configure(&self, value: Value) -> PathBuf {
+            let path = self.0.join(".rpi/webui/openwebui.json");
+            write_json(&path, &value, false).unwrap();
+            path
+        }
+    }
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn url_validation_rejects_credential_and_query_leaks() {
         for raw in [
@@ -226,14 +228,111 @@ mod tests {
             "https://example.com/webui"
         );
     }
+
     #[test]
-    fn missing_value_is_not_a_ui_name() {
+    fn unknown_ui_and_old_flags_fail_before_creating_files() {
         assert!(text(Some(Value::Bool(true)), "webui").is_err());
-        assert!(
-            resolve(|name| (name == "webui").then(|| Value::String("unknown".into())))
+        assert!(resolve(|name| (name == "webui").then(|| json!("unknown")))
+            .err()
+            .unwrap()
+            .contains("Unsupported UI"));
+        let error = resolve(|name| match name {
+            "webui" => Some(json!("openwebui")),
+            "webui-url" => Some(json!("http://old")),
+            _ => None,
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("moved to .rpi/webui/openwebui.json"));
+    }
+
+    #[test]
+    fn first_start_creates_template_and_stops() {
+        let root = Project::new();
+        assert!(resolve_project("openwebui", root.0.clone(), |_| Some(
+            "should-not-install".into()
+        ))
+        .err()
+        .unwrap()
+        .contains("Created"));
+        let value: Value = serde_json::from_slice(
+            &std::fs::read(root.0.join(".rpi/webui/openwebui.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["tokenEnv"], "OPENWEBUI_TOKEN");
+        assert!(!root.0.join(".rpi/webui/.state").exists());
+    }
+
+    #[test]
+    fn ui_specific_json_and_custom_token_env_are_authoritative() {
+        let root = Project::new();
+        let source=root.configure(json!({"url":"https://ui.example/", "tokenEnv":"MY_UI_TOKEN", "adapter":{"bind":"0.0.0.0:7777", "url":"http://host.docker.internal:7777"},"permissions":"bypass"}));
+        let original = std::fs::read(&source).unwrap();
+        let (mut config, state, token) = resolve_project("openwebui", root.0.clone(), |name| {
+            (name == "MY_UI_TOKEN").then(|| "admin-secret".into())
+        })
+        .unwrap();
+        assert_eq!(token.as_deref(), Some("admin-secret"));
+        assert_eq!(config.bind.port(), 7777);
+        assert_eq!(config.url, "https://ui.example");
+        assert_eq!(state, root.0.join(".rpi/webui/.state/openwebui.json"));
+        config.installed = true;
+        config.installed_version = env!("CARGO_PKG_VERSION").into();
+        save(&state, &config).unwrap();
+        let (restored, _, token) = resolve_project("openwebui", root.0.clone(), |_| None).unwrap();
+        assert!(token.is_none());
+        assert_eq!(restored.adapter_token, config.adapter_token);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert!(!std::fs::read_to_string(state)
+            .unwrap()
+            .contains("admin-secret"));
+    }
+
+    #[test]
+    fn config_changes_require_installation_token() {
+        let root = Project::new();
+        let source = root.configure(json!({"url":"http://localhost:8080"}));
+        let (mut config, state, _) =
+            resolve_project("openwebui", root.0.clone(), |_| Some("first-token".into())).unwrap();
+        config.installed = true;
+        config.installed_version = env!("CARGO_PKG_VERSION").into();
+        save(&state, &config).unwrap();
+        std::fs::write(source, r#"{"url":"http://localhost:8081"}"#).unwrap();
+        assert!(resolve_project("openwebui", root.0.clone(), |_| None)
+            .err()
+            .unwrap()
+            .contains("admin token"));
+    }
+
+    #[test]
+    fn defaults_literal_token_and_bom_are_supported() {
+        let root = Project::new();
+        let source = root.configure(json!({"url":"http://localhost:8080","token":"literal"}));
+        let contents = std::fs::read_to_string(&source).unwrap();
+        std::fs::write(source, format!("\u{feff}{contents}")).unwrap();
+        let (config, _, token) =
+            resolve_project("openwebui", root.0.clone(), |_| Some("from-env".into())).unwrap();
+        assert_eq!(token.as_deref(), Some("literal"));
+        assert_eq!(config.bind.to_string(), "127.0.0.1:5234");
+        assert_eq!(config.adapter_url, "http://127.0.0.1:5234");
+        assert_eq!(config.permissions, "ask");
+    }
+
+    #[test]
+    fn invalid_ui_settings_are_rejected_without_echoing_secrets() {
+        for value in [
+            json!({"url":"http://ui","typo":"secret-value"}),
+            json!({"url":"http://ui","adapter":{"bind":"0.0.0.0:5234"}}),
+            json!({"url":"http://ui","permissions":"allow-everything"}),
+            json!({"url":"http://ui","adapter":{"bind":"127.0.0.1:0"}}),
+            json!({"url":"http://ui","token":42}),
+        ] {
+            let root = Project::new();
+            root.configure(value);
+            assert!(!resolve_project("openwebui", root.0.clone(), |_| None)
                 .err()
                 .unwrap()
-                .contains("Unsupported UI")
-        );
+                .contains("secret-value"));
+        }
     }
 }

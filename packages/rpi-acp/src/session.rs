@@ -20,7 +20,7 @@ use crate::diagln;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -28,6 +28,24 @@ use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::protocol::{ContentBlock, Writer};
+
+static PERMISSION_BYPASS: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide policy before starting the ACP server. Existing child
+/// processes retain the policy with which they were launched.
+pub fn set_permission_bypass(enabled: bool) {
+    PERMISSION_BYPASS.store(enabled, Ordering::Release);
+}
+
+fn configure_permission_gate(command: &mut Command, bypass: bool, no_auto_gate: bool) {
+    if bypass {
+        // Forward the flag to current gates, and disable environment activation
+        // for older gate versions that do not understand --bypass yet.
+        command.arg("--bypass").env("RPI_PERMISSION_GATE", "0");
+    } else if !no_auto_gate {
+        command.arg("--permission-gate");
+    }
+}
 
 /// A live ACP session backed by one `rpi --mode rpc` child process.
 pub struct Session {
@@ -69,11 +87,13 @@ impl Session {
         }
         // Ask the child to load the (optional) permission-gate extension so the
         // ACP client's approval UI is used for dangerous tools. Harmless when
-        // the extension is not installed; `RPI_ACP_NO_PERMISSION_GATE=1` opts
-        // out.
-        if !env_flag("RPI_ACP_NO_PERMISSION_GATE") {
-            command.arg("--permission-gate");
-        }
+        // the extension is not installed. --bypass explicitly disables gating;
+        // the legacy environment variable only opts out of auto-enabling it.
+        configure_permission_gate(
+            &mut command,
+            PERMISSION_BYPASS.load(Ordering::Acquire),
+            env_flag("RPI_ACP_NO_PERMISSION_GATE"),
+        );
         let mut child = command
             .spawn()
             .map_err(|e| format!("spawn `rpi --mode rpc`: {e}"))?;
@@ -952,6 +972,33 @@ fn tool_result_text(result: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bypass_reaches_children_and_overrides_environment_activation() {
+        for no_auto_gate in [false, true] {
+            let mut command = Command::new("rpi");
+            configure_permission_gate(&mut command, true, no_auto_gate);
+            let command = command.as_std();
+            assert_eq!(command.get_args().collect::<Vec<_>>(), ["--bypass"]);
+            assert!(command.get_envs().any(|(name, value)| {
+                name == "RPI_PERMISSION_GATE" && value == Some(std::ffi::OsStr::new("0"))
+            }));
+        }
+    }
+
+    #[test]
+    fn default_and_legacy_permission_policies_are_preserved() {
+        let mut command = Command::new("rpi");
+        configure_permission_gate(&mut command, false, false);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["--permission-gate"]
+        );
+        let mut command = Command::new("rpi");
+        configure_permission_gate(&mut command, false, true);
+        assert_eq!(command.as_std().get_args().count(), 0);
+        assert_eq!(command.as_std().get_envs().count(), 0);
+    }
 
     fn permission_event(id: &str) -> Value {
         json!({"type":"ui_dialog_request", "requestId":id, "toolCallId":"call-1",

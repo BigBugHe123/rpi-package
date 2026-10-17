@@ -89,10 +89,12 @@ executable. Its packaging and proposed ACP Registry entry are documented in
 
 `rpi-ui-adapter` adds `rpi --webui=openwebui` to connect an existing Open WebUI
 instance directly to rpi ACP, with streaming, progress, tool details and cancellation.
+Each UI has its own project configuration in `.rpi/webui/<UI>.json`;
+`--webui` only selects the adapter.
 It automatically installs a managed Pipe; Computer is not required. rpi and
 the project can remain outside the UI container. See the
-[Chinese setup guide](packages/rpi-ui-adapter/README.md) for first-run URL/token
-parameters, container networking and session behavior.
+[Chinese setup guide](packages/rpi-ui-adapter/README.md) for configuration examples,
+container networking and session behavior.
 
 ## Build and install
 
