@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const GOAL_FILE: &str = ".rpi/goals.json";
@@ -31,8 +31,16 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// re-injecting the same status on every `TurnEnd` (transcript bloat).
 static LAST_INJECTED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// A goal notice queued by a state change that happened inside a tool batch.
-/// Appending immediately would split an assistant tool call from its result.
+fn last_injected() -> &'static Mutex<Option<String>> {
+    LAST_INJECTED.get_or_init(|| Mutex::new(None))
+}
+
+/// A goal notice queued by a state change that happened **inside a tool batch**
+/// (the `goal` tool). Appending it immediately would place a custom message
+/// between an `assistant(tool_calls)` message and its `toolResult`, which strict
+/// OpenAI-compatible providers reject with HTTP 400 ("An assistant message with
+/// 'tool_calls' must be followed by tool messages…"). The notice is flushed at a
+/// safe boundary instead (TurnEnd, or the end of the `/goal` command handler).
 struct PendingInjection {
     revision: u64,
     goal: Goal,
@@ -41,7 +49,17 @@ struct PendingInjection {
 
 static PENDING_INJECT: OnceLock<Mutex<Option<PendingInjection>>> = OnceLock::new();
 static PENDING_STATE: OnceLock<Mutex<Option<Goals>>> = OnceLock::new();
+// Tests and older hosts may not implement GetSessionBranch. Live hosts return
+// an `entries` array, which enables session-scoped state; otherwise retain the
+// file fallback for compatibility.
+static SESSION_BRANCH_SUPPORTED: AtomicBool = AtomicBool::new(true);
+// Accessed under the queue mutex, including while its pending slot is empty
+// because a flush has taken the notice into an in-flight host callback.
 static INJECTION_REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn pending_inject() -> &'static Mutex<Option<PendingInjection>> {
+    PENDING_INJECT.get_or_init(|| Mutex::new(None))
+}
 
 fn pending_state() -> &'static Mutex<Option<Goals>> {
     PENDING_STATE.get_or_init(|| Mutex::new(None))
@@ -51,27 +69,87 @@ fn queue_state(goals: &Goals) {
     *pending_state().lock().unwrap_or_else(|p| p.into_inner()) = Some(goals.clone());
 }
 
-fn pending_inject() -> &'static Mutex<Option<PendingInjection>> {
-    PENDING_INJECT.get_or_init(|| Mutex::new(None))
+fn queue_inject(goal: &Goal) {
+    queue_notice(goal, None);
 }
 
 fn queue_notice(goal: &Goal, budget_reason: Option<String>) {
+    let mut pending = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
     let revision = INJECTION_REVISION
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
-    *pending_inject().lock().unwrap_or_else(|p| p.into_inner()) = Some(PendingInjection {
+    *pending = Some(PendingInjection {
         revision,
         goal: goal.clone(),
         budget_reason,
     });
 }
 
-fn queue_inject(goal: &Goal) {
-    queue_notice(goal, None);
+fn flush_pending_inject() {
+    if !flush_pending_state() {
+        return;
+    }
+    flush_pending_inject_with(|pending| match &pending.budget_reason {
+        Some(reason) => append_budget_message(&pending.goal, reason),
+        None => append_goal_custom_message(&pending.goal),
+    });
 }
 
-fn last_injected() -> &'static Mutex<Option<String>> {
-    LAST_INJECTED.get_or_init(|| Mutex::new(None))
+fn flush_pending_inject_with(inject: impl FnOnce(&PendingInjection) -> Result<(), String>) {
+    let pending = pending_inject()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(pending) = pending {
+        let result = inject(&pending);
+        let mut queued = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
+        // A newer notice may have been queued AND delivered while this host
+        // call was in flight. An empty slot alone cannot distinguish that
+        // from this notice still being current.
+        if INJECTION_REVISION.load(Ordering::Relaxed) != pending.revision {
+            return;
+        }
+        if result.is_ok() {
+            remember_injected(Some(fingerprint(&pending.goal)));
+        } else {
+            // Retry at a later safe boundary, but never overwrite a newer
+            // goal change queued while the host callback was in flight.
+            queued.get_or_insert(pending);
+        }
+    }
+}
+
+/// Environment markers meaning "this process is a subagent spawned by an
+/// orchestrator". Such a process shares the parent's project directory — and
+/// therefore its `.rpi/goals.json` — so its turns must not be counted against
+/// the parent's goal budget.
+///
+/// `RPI_ORCHESTRATOR_SUBAGENT` is rpi-orchestrator's marker; the `LANGFUSE_*` one
+/// is the SDK's cross-repo "I am a subagent" contract
+/// ([`rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV`]).
+const ORCHESTRATOR_SUBAGENT_ENV: &str = "RPI_ORCHESTRATOR_SUBAGENT";
+
+fn is_subagent_from(orchestrator_marker: bool, langfuse_parent: bool) -> bool {
+    orchestrator_marker || langfuse_parent
+}
+
+static PROCESS_IS_SUBAGENT: AtomicBool = AtomicBool::new(false);
+
+// Capture inherited markers at plugin initialization. Langfuse also publishes
+// its parent trace marker in the parent process during a run, for future
+// children to inherit; reading that marker on TurnEnd misclassifies the parent.
+fn capture_process_role() {
+    PROCESS_IS_SUBAGENT.store(
+        is_subagent_from(
+            std::env::var_os(ORCHESTRATOR_SUBAGENT_ENV).is_some(),
+            std::env::var_os(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV).is_some(),
+        ),
+        Ordering::Relaxed,
+    );
+}
+
+fn is_subagent() -> bool {
+    PROCESS_IS_SUBAGENT.load(Ordering::Relaxed)
 }
 
 /// Call a host runtime action (e.g. `AppendEntry`). Safe from any thread,
@@ -181,9 +259,6 @@ fn goals_path() -> PathBuf {
         .join(GOAL_FILE)
 }
 
-/// Read the latest goal state from the current session branch. The file
-/// fallback exists only for unit tests or hosts that invoke the library
-/// without a runtime; a live plugin never reads the project-scoped file.
 fn flush_pending_state() -> bool {
     let state = pending_state()
         .lock()
@@ -201,7 +276,7 @@ fn flush_pending_state() -> bool {
 }
 
 fn read_goals() -> Goals {
-    if RUNTIME.get().is_some() {
+    if RUNTIME.get().is_some() && SESSION_BRANCH_SUPPORTED.load(Ordering::Relaxed) {
         if let Some(goals) = pending_state()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -209,22 +284,22 @@ fn read_goals() -> Goals {
         {
             return goals;
         }
-        let Ok(value) = call_runtime(RuntimeActionId::GetSessionBranch, json!({})) else {
-            return Goals::default();
-        };
-        let Some(entries) = value.get("entries").and_then(Value::as_array) else {
-            return Goals::default();
-        };
-        for entry in entries.iter().rev() {
-            if entry.get("type").and_then(Value::as_str) == Some("custom")
-                && entry.get("customType").and_then(Value::as_str) == Some(GOAL_STATE_ENTRY)
-            {
-                if let Some(data) = entry.get("data") {
-                    return serde_json::from_value(data.clone()).unwrap_or_default();
+        if let Ok(value) = call_runtime(RuntimeActionId::GetSessionBranch, json!({})) {
+            if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+                SESSION_BRANCH_SUPPORTED.store(true, Ordering::Relaxed);
+                for entry in entries.iter().rev() {
+                    if entry.get("type").and_then(Value::as_str) == Some("custom")
+                        && entry.get("customType").and_then(Value::as_str) == Some(GOAL_STATE_ENTRY)
+                    {
+                        if let Some(data) = entry.get("data") {
+                            return serde_json::from_value(data.clone()).unwrap_or_default();
+                        }
+                    }
                 }
+                return Goals::default();
             }
         }
-        return Goals::default();
+        SESSION_BRANCH_SUPPORTED.store(false, Ordering::Relaxed);
     }
 
     let path = goals_path();
@@ -235,14 +310,13 @@ fn read_goals() -> Goals {
 }
 
 fn write_goals(goals: &Goals) -> Result<(), String> {
-    if RUNTIME.get().is_some() {
+    if RUNTIME.get().is_some() && SESSION_BRANCH_SUPPORTED.load(Ordering::Relaxed) {
         call_runtime(
             RuntimeActionId::AppendEntry,
             json!({"customType": GOAL_STATE_ENTRY, "data": goals}),
         )?;
         return Ok(());
     }
-
     let path = goals_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create goal directory: {e}"))?;
@@ -394,32 +468,6 @@ fn append_budget_message(goal: &Goal, reason: &str) -> Result<(), String> {
     append_custom_message(goal, text)
 }
 
-fn flush_pending_inject() {
-    if !flush_pending_state() {
-        return;
-    }
-    let pending = pending_inject()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take();
-    let Some(pending) = pending else {
-        return;
-    };
-    let result = match pending.budget_reason.as_deref() {
-        Some(reason) => append_budget_message(&pending.goal, reason),
-        None => append_goal_custom_message(&pending.goal),
-    };
-    let mut queued = pending_inject().lock().unwrap_or_else(|p| p.into_inner());
-    if INJECTION_REVISION.load(Ordering::Relaxed) != pending.revision {
-        return;
-    }
-    if result.is_ok() {
-        remember_injected(Some(fingerprint(&pending.goal)));
-    } else {
-        *queued = Some(pending);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Core operations (shared by the `goal` tool and the `/goal` command)
 // ---------------------------------------------------------------------------
@@ -456,12 +504,13 @@ fn validate_notes(notes: &str) -> Result<String, String> {
 
 /// Persist `goal` as the active goal and queue its context injection.
 ///
-/// The notice is appended at a safe boundary, never inline with a goal tool
-/// result. This preserves the provider-required tool-call/tool-result order.
+/// The notice is appended at the next safe boundary (`flush_pending_inject`),
+/// never inline: a state change from the `goal` tool runs inside a tool batch,
+/// where an immediate append would split `tool_calls` from its `toolResult`.
 fn persist_and_queue(goals: &Goals, goal: &Goal) -> Result<(), String> {
     let mut goals = goals.clone();
     goals.active = Some(goal.clone());
-    if RUNTIME.get().is_some() {
+    if RUNTIME.get().is_some() && SESSION_BRANCH_SUPPORTED.load(Ordering::Relaxed) {
         queue_state(&goals);
     } else {
         write_goals(&goals)?;
@@ -559,7 +608,7 @@ fn op_complete() -> Result<Goal, String> {
     done.updated_at = now_ms();
     goals.archived.push(done.clone());
     goals.active = None;
-    if RUNTIME.get().is_some() {
+    if RUNTIME.get().is_some() && SESSION_BRANCH_SUPPORTED.load(Ordering::Relaxed) {
         queue_state(&goals);
     } else {
         write_goals(&goals)?;
@@ -886,12 +935,17 @@ use rpi_plugin_sdk::callbacks::free_string;
 extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
     // TurnEnd carries no payload (empty event) in this ABI; ignore the struct.
     let _ = event;
-    // State changes made by the goal tool are flushed only after all tool
-    // results have been appended to the transcript.
+    // A subagent process shares the parent's cwd and therefore its
+    // `.rpi/goals.json`; counting its turns would inflate `turnsUsed` and could
+    // pause the orchestrator early. Skip accounting and injection entirely.
+    if is_subagent() {
+        return 0;
+    }
+    // Safe boundary: flush any notice queued during this turn's tool batch.
     flush_pending_inject();
-
     let mut goals = read_goals();
     let Some(mut goal) = goals.active.clone() else {
+        // No active goal — nothing to inject.
         remember_injected(None);
         return 0;
     };
@@ -899,6 +953,7 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         return 0;
     }
 
+    // Count this turn against the budget.
     goal.turns_used = goal.turns_used.saturating_add(1);
     goal.updated_at = now_ms();
 
@@ -914,6 +969,8 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
         goal.status = "paused".into();
         goals.active = Some(goal.clone());
         let _ = write_goals(&goals);
+        // This paused state supersedes an active notice whose append failed.
+        // Keep the reason too, so a retry still explains why work stopped.
         queue_notice(&goal, Some(reason));
         flush_pending_inject();
         return 0;
@@ -926,11 +983,18 @@ extern "C" fn on_turn_end(event: StablePluginEvent, _: *mut c_void) -> i32 {
     if pending_inject()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .is_none()
-        && should_inject(Some(&fp))
-        && append_goal_custom_message(&goal).is_ok()
+        .is_some()
+        || !should_inject(Some(&fp))
     {
-        remember_injected(Some(fp));
+        return 0;
+    }
+    match append_goal_custom_message(&goal) {
+        Ok(_) => {
+            remember_injected(Some(fp));
+        }
+        Err(_) => {
+            // Non-fatal: keep last-injected unset so a later TurnEnd retries.
+        }
     }
     0
 }
@@ -974,8 +1038,8 @@ const START_NEXT_STEP_HINT: &str =
 
 fn start_from_command(title: &str, notes: &str) -> Result<String, String> {
     let goal = op_start(title, notes, None, None)?;
-    // A slash command runs outside an agent/tool turn, so it is safe to flush
-    // the state and notice before submitting the first user message.
+    // Persist the session state and notice before starting the run. The full
+    // SendUserMessage call itself must not run on the TUI command thread.
     if !flush_pending_state() {
         return Err("unable to persist the goal state".into());
     }
@@ -988,11 +1052,8 @@ fn start_from_command(title: &str, notes: &str) -> Result<String, String> {
             goal.title, goal.notes
         )
     };
-    // Extension slash commands execute on the TUI command thread. A full
-    // SendUserMessage waits for the agent run to finish; calling it inline
-    // deadlocks that thread, leaving the editor populated and unresponsive.
-    // Start it after returning from the command so the host can clear and
-    // refocus the editor first.
+    // A full SendUserMessage waits for the agent run to finish. Calling it
+    // inline deadlocks the TUI, leaving the editor populated and unresponsive.
     std::thread::Builder::new()
         .name("rpi-goal-start".into())
         .spawn(move || {
@@ -1112,8 +1173,8 @@ fn goal_command(args_json, out, _user_data) {
         .unwrap_or("")
         .trim();
     let text = run_command(args);
-    // Non-start commands may also have changed the goal state; flush their
-    // notice at the end of the command, outside any tool batch.
+    // The command runs outside any tool batch, so injecting right here is safe —
+    // and necessary: the goal must be in context before the next prompt.
     flush_pending_inject();
     command_output(out, json!({"kind": "message", "text": text}))
 }
@@ -1123,6 +1184,7 @@ fn goal_command(args_json, out, _user_data) {
 // Entrypoint
 // ---------------------------------------------------------------------------
 rpi_plugin_sdk::export_plugin!(|api| {
+    capture_process_role();
     let _ = RUNTIME.set(*api);
     if let Some(register_event) = api.register_event_handler {
         let rc = register_event(
@@ -1146,7 +1208,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
     let schema = Box::new(StableToolSchema {
         name: StbString::from_string("goal".into()),
         description: StbString::from_string(
-            "Codex-style goal mode: record one session-scoped, context-injected objective and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
+            "Codex-style goal mode: record one persistent, context-injected objective per project and let the agent advance it across turns. Actions: start, update, pause, resume, complete, limit, show, list.".into(),
         ),
         parameters: StbString::from_string(
             r#"{"type":"object","properties":{"action":{"type":"string","enum":["start","update","pause","resume","complete","limit","show","list"]},"title":{"type":"string","description":"Goal title (required for start)"},"notes":{"type":"string","description":"Goal notes or progress update (start/update)"},"status":{"type":"string","enum":["active","paused"],"description":"Explicit status change (update)"},"maxTurns":{"type":"integer","minimum":1,"description":"Optional turn budget (start/limit)"},"maxMinutes":{"type":"integer","minimum":1,"description":"Optional wall-clock budget in minutes (start/limit)"}},"required":["action"]}"#.into(),
@@ -1287,5 +1349,409 @@ mod tests {
         let updated = apply_limits(&base, 1_000, None, None);
         assert_eq!(updated.max_turns, Some(10));
         assert_eq!(updated.deadline_ms, Some(5_000));
+    }
+
+    #[test]
+    fn subagent_markers_skip_turn_accounting() {
+        assert!(is_subagent_from(true, false));
+        assert!(is_subagent_from(false, true));
+        assert!(!is_subagent_from(false, false));
+    }
+
+    #[test]
+    fn start_confirmation_mentions_background_work() {
+        assert!(START_NEXT_STEP_HINT.contains("background"));
+        assert!(START_NEXT_STEP_HINT.contains("Goal recorded"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Review follow-ups: the two tests below cover the *file state* and the
+    // *event-handler path*, which the boolean-only test above does not.
+    // -----------------------------------------------------------------------
+
+    /// Serializes everything below: they mutate process-global state (cwd, env,
+    /// the `RUNTIME` vtable, the injected-fingerprint latch).
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProcessRoleGuard {
+        markers: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        previous_role: bool,
+    }
+
+    impl ProcessRoleGuard {
+        fn parent() -> Self {
+            let markers = [
+                ORCHESTRATOR_SUBAGENT_ENV,
+                rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+            ]
+            .into_iter()
+            .map(|name| {
+                let value = std::env::var_os(name);
+                std::env::remove_var(name);
+                (name, value)
+            })
+            .collect();
+            let previous_role = is_subagent();
+            capture_process_role();
+            Self {
+                markers,
+                previous_role,
+            }
+        }
+    }
+
+    impl Drop for ProcessRoleGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.markers {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            PROCESS_IS_SUBAGENT.store(self.previous_role, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn parent_keeps_counting_and_flushing_after_langfuse_publishes_trace() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("parent-trace");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        APPENDED.lock().unwrap().clear();
+        op_start("Parent budget", "", Some(1), None).unwrap();
+
+        // BeforeAgentStart publishes this for future children after plugins load.
+        std::env::set_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV, "parent-trace");
+        turn_end();
+
+        let goal = read_goals().active.unwrap();
+        assert_eq!(goal.turns_used, 1);
+        assert_eq!(goal.status, "paused");
+        assert!(!APPENDED.lock().unwrap().is_empty());
+        assert!(pending_inject().lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn child_role_survives_langfuse_clearing_inherited_trace() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("child-trace");
+        let _role = ProcessRoleGuard::parent();
+        std::env::set_var(
+            rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+            "inherited-trace",
+        );
+        capture_process_role();
+        op_start("Parent budget", "", Some(1), None).unwrap();
+        std::env::remove_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV);
+        turn_end();
+        let goal = read_goals().active.unwrap();
+        assert_eq!(goal.turns_used, 0);
+        assert_eq!(goal.status, "active");
+    }
+
+    /// Run with the process cwd pointed at a fresh temp directory, restoring it
+    /// afterwards. `goals_path()` is cwd-relative, so this is the only way to
+    /// exercise the real read/write path without touching the developer's project.
+    struct CwdGuard {
+        previous: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn isolated_cwd(tag: &str) -> CwdGuard {
+        let dir = std::env::temp_dir().join(format!("rpi-goal-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp cwd");
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&dir).expect("enter temp cwd");
+        CwdGuard { previous, dir }
+    }
+
+    fn turn_end() {
+        on_turn_end(
+            StablePluginEvent::empty(EventTag::TurnEnd),
+            std::ptr::null_mut(),
+        );
+    }
+
+    /// Regression: a subagent process shares the parent's cwd — and therefore
+    /// its `.rpi/goals.json` — so its `TurnEnd` used to increment the parent's
+    /// `turnsUsed`. A wave of subagents could exhaust any `/goal turns N` budget
+    /// on its own. The parent must keep counting; subagents under *either* marker
+    /// must not.
+    #[test]
+    fn subagent_turns_do_not_count_against_the_parent_goal() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("subagent-budget");
+        let _role = ProcessRoleGuard::parent();
+        remember_injected(None);
+
+        // The parent records a goal (this happens inside a tool batch).
+        op_start("Ship it", "", None, None).expect("goal starts");
+
+        let turns_used = || {
+            read_goals()
+                .active
+                .expect("goal is still active")
+                .turns_used
+        };
+
+        // A normal parent turn counts, and lands in the real file.
+        turn_end();
+        assert_eq!(turns_used(), 1, "the parent's own turn must count");
+
+        // Subagents in the same cwd run several turns each. Neither marker may
+        // add to the parent's budget.
+        for marker in [
+            ORCHESTRATOR_SUBAGENT_ENV,
+            rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV,
+        ] {
+            std::env::set_var(marker, "1");
+            capture_process_role();
+            for _ in 0..5 {
+                turn_end();
+            }
+            std::env::remove_var(marker);
+        }
+        assert_eq!(
+            turns_used(),
+            1,
+            "a subagent's turns leaked into the parent's goal budget"
+        );
+
+        // The parent still counts once the markers are gone.
+        capture_process_role();
+        turn_end();
+        assert_eq!(turns_used(), 2);
+    }
+
+    /// Records the `AppendEntry` payloads the plugin asks the host for, in order.
+    static APPENDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static FAIL_APPENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    rpi_plugin_sdk::string_handler! {
+    fn recording_runtime_action(action, args, out, _user_data) {
+        if action == RuntimeActionId::AppendEntry as u32 {
+            if FAIL_APPENDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1)).is_ok() {
+                return 1;
+            }
+            APPENDED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(args.to_owned());
+        }
+        let _ = out;
+        0
+    }
+    }
+
+    /// Install the recording runtime. `RUNTIME` is a `OnceLock`, so the first
+    /// caller wins; the recorder is deterministic regardless of which test it is.
+    fn install_recording_runtime() {
+        let _ = RUNTIME.set(rpi_plugin_sdk::PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
+            free_string: rpi_plugin_sdk::callbacks::free_string,
+            register_tool: None,
+            register_command: None,
+            register_shortcut: None,
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: None,
+            register_resources_discover: None,
+            runtime_action: recording_runtime_action,
+            dispatch_event: None,
+            user_data: std::ptr::null_mut(),
+            declare: None,
+            register_before_agent_start: None,
+            register_oauth_provider: None,
+        });
+    }
+
+    /// Regression for the HTTP 400: a `goal` tool call runs *inside* a tool
+    /// batch, so appending its notice immediately placed a custom message
+    /// between `assistant(tool_calls)` and its `toolResult`. The notice must be
+    /// queued and flushed only at the turn boundary.
+    #[test]
+    fn goal_notice_is_appended_at_the_turn_boundary_not_inside_the_batch() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("inject-boundary");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        APPENDED.lock().unwrap_or_else(|p| p.into_inner()).clear();
+
+        // Inside the batch: none of these may append anything.
+        op_start("Ship it", "", None, None).expect("start");
+        op_update(None, Some("active")).expect("update");
+        op_complete().expect("complete");
+        assert!(
+            APPENDED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "a goal tool call inside a batch must not append a message"
+        );
+
+        // The turn boundary is where the queued notice lands.
+        turn_end();
+        let appended = APPENDED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            appended.len(),
+            1,
+            "exactly one notice at the boundary, got {appended:?}"
+        );
+        assert!(appended[0].contains("Ship it"), "got {}", appended[0]);
+    }
+
+    #[test]
+    fn queued_goal_notices_retry_after_host_append_failure() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-retry");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        for status in ["active", "paused", "complete"] {
+            remember_injected(None);
+            op_start("Retry notice", "", None, None).unwrap();
+            match status {
+                "paused" => {
+                    op_set_status("paused").unwrap();
+                }
+                "complete" => {
+                    op_complete().unwrap();
+                }
+                _ => {}
+            }
+            APPENDED.lock().unwrap().clear();
+            FAIL_APPENDS.store(1, Ordering::SeqCst);
+            turn_end();
+            let delivered = APPENDED.lock().unwrap().clone();
+            assert!(
+                delivered.is_empty(),
+                "retry ran twice at one boundary: {delivered:?}"
+            );
+            assert!(
+                pending_inject().lock().unwrap().is_some(),
+                "{status} notice was lost after AppendEntry failed"
+            );
+            assert!(
+                last_injected().lock().unwrap().is_none(),
+                "{status} notice was marked delivered before AppendEntry succeeded"
+            );
+            turn_end();
+            let delivered = APPENDED.lock().unwrap().clone();
+            assert_eq!(delivered.len(), 1, "{status}: {delivered:?}");
+            let message: Value = serde_json::from_str(&delivered[0]).unwrap();
+            assert_eq!(message["message"]["data"]["details"]["status"], status);
+            assert!(pending_inject().lock().unwrap().is_none());
+            turn_end();
+            assert_eq!(
+                APPENDED.lock().unwrap().len(),
+                1,
+                "duplicate {status} notice"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_budget_notice_retries_without_replaying_stale_active_goal() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("budget-notice-retry");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Budget notice", "", Some(1), None).unwrap();
+        APPENDED.lock().unwrap().clear();
+        // Fail both the queued active notice and the subsequent budget notice.
+        FAIL_APPENDS.store(2, Ordering::SeqCst);
+        turn_end();
+        assert_eq!(read_goals().active.unwrap().status, "paused");
+        assert!(APPENDED.lock().unwrap().is_empty());
+        assert!(
+            pending_inject().lock().unwrap().is_some(),
+            "budget notice was lost"
+        );
+        turn_end();
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("turn budget reached (1)"));
+        assert!(!delivered[0].contains("Active goal"));
+        turn_end();
+        assert_eq!(APPENDED.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newer_goal_change_supersedes_a_notice_waiting_for_retry() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-superseded");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Latest notice", "", None, None).unwrap();
+        op_set_status("paused").unwrap();
+        APPENDED.lock().unwrap().clear();
+        FAIL_APPENDS.store(1, Ordering::SeqCst);
+        turn_end();
+        assert!(APPENDED.lock().unwrap().is_empty());
+
+        // The user resumes and updates the goal before its failed pause notice
+        // can be retried. Only the current active state should reach context.
+        op_update(Some("new progress"), Some("active")).unwrap();
+        turn_end();
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        let message: Value = serde_json::from_str(&delivered[0]).unwrap();
+        let details = &message["message"]["data"]["details"];
+        assert_eq!(details["status"], "active");
+        assert_eq!(details["notes"], "new progress");
+        assert!(pending_inject().lock().unwrap().is_none());
+        assert_eq!(read_goals().active.unwrap().turns_used, 1);
+    }
+
+    #[test]
+    fn older_failed_flush_cannot_requeue_after_a_newer_notice_was_delivered() {
+        let _serial = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _cwd = isolated_cwd("notice-in-flight");
+        let _role = ProcessRoleGuard::parent();
+        install_recording_runtime();
+        remember_injected(None);
+        op_start("Concurrent notice", "old progress", None, None).unwrap();
+        APPENDED.lock().unwrap().clear();
+        flush_pending_inject_with(|_| {
+            // Interleave another safe-boundary flush while the older callback
+            // is still in flight, then let the older callback report failure.
+            op_update(Some("new progress"), None).unwrap();
+            flush_pending_inject();
+            Err("older host callback failed".into())
+        });
+        assert!(
+            pending_inject().lock().unwrap().is_none(),
+            "stale notice was requeued"
+        );
+        let delivered = APPENDED.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("new progress"));
+        assert_eq!(
+            *last_injected().lock().unwrap(),
+            Some(fingerprint(&read_goals().active.unwrap()))
+        );
+        turn_end();
+        assert_eq!(
+            APPENDED.lock().unwrap().len(),
+            1,
+            "stale notice reached context"
+        );
     }
 }

@@ -3,7 +3,6 @@ use rpi_extensions::{
     load_session_mixed, ExtensionSession, NullDiagnostics, PluginToolAdapter, ToolCallContext,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -27,8 +26,12 @@ fn text(result: &rpi_agent::types::AgentToolResult) -> &str {
 #[tokio::test]
 #[ignore = "set RPI_MCP_DLL and RPI_FAKE_MCP_SERVER to the built binaries"]
 async fn mcp_dll_persistent_scoped_calls_images_and_cancellation() {
-    let dll = PathBuf::from(std::env::var("RPI_MCP_DLL").unwrap());
-    let fake = std::env::var("RPI_FAKE_MCP_SERVER").unwrap();
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_MCP_DLL") else {
+        return;
+    };
+    let Some(fake) = crate::smoke_fixtures::fixture_var("RPI_FAKE_MCP_SERVER") else {
+        return;
+    };
     let guard = Shutdown(load_session_mixed(
         &[],
         &[dll],
@@ -135,8 +138,12 @@ async fn mcp_dll_persistent_scoped_calls_images_and_cancellation() {
 #[tokio::test]
 #[ignore = "set RPI_MCP_DLL and RPI_REAL_MCP_CONFIG for an actual Playwright probe"]
 async fn mcp_dll_real_playwright_probe() {
-    let dll = PathBuf::from(std::env::var("RPI_MCP_DLL").unwrap());
-    let config = std::env::var("RPI_REAL_MCP_CONFIG").unwrap();
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_MCP_DLL") else {
+        return;
+    };
+    let Some(config) = crate::smoke_fixtures::fixture_var("RPI_REAL_MCP_CONFIG") else {
+        return;
+    };
     let guard = Shutdown(load_session_mixed(
         &[],
         &[dll],
@@ -192,8 +199,12 @@ async fn mcp_dll_real_playwright_probe() {
 #[tokio::test]
 #[ignore = "requires a configured Playwright extension token and an open Chrome profile"]
 async fn mcp_dll_real_playwright_authenticated_browser() {
-    let dll = PathBuf::from(std::env::var("RPI_MCP_DLL").unwrap());
-    let config = std::env::var("RPI_REAL_MCP_CONFIG").unwrap();
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_MCP_DLL") else {
+        return;
+    };
+    let Some(config) = crate::smoke_fixtures::fixture_var("RPI_REAL_MCP_CONFIG") else {
+        return;
+    };
     let config_value: Value =
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     let secret = config_value["mcpServers"]["playwright"]["env"]["PLAYWRIGHT_MCP_EXTENSION_TOKEN"]
@@ -296,8 +307,12 @@ async fn mcp_dll_real_playwright_authenticated_browser() {
 #[tokio::test]
 #[ignore = "requires configured Playwright, Chrome, and a screenshot test page"]
 async fn mcp_dll_real_playwright_screenshot() {
-    let dll = PathBuf::from(std::env::var("RPI_MCP_DLL").unwrap());
-    let config = std::env::var("RPI_REAL_MCP_CONFIG").unwrap();
+    let Some(dll) = crate::smoke_fixtures::fixture_path("RPI_MCP_DLL") else {
+        return;
+    };
+    let Some(config) = crate::smoke_fixtures::fixture_var("RPI_REAL_MCP_CONFIG") else {
+        return;
+    };
     let config_value: Value =
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     let secret = config_value["mcpServers"]["playwright"]["env"]["PLAYWRIGHT_MCP_EXTENSION_TOKEN"]

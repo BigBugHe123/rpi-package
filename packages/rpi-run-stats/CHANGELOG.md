@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Group monochrome, single-column icons into counts, response performance and usage, with a space before each value.
+- Use compact numbers and three-decimal USD costs; preserve configured-pricing visibility.
+
+### Fixed
+
+- Retain the latest valid timing and token speed across prompts and tool continuations instead of briefly showing missing values.
+- Keep slow first-token waiting separate from retained measurements and use theme colors for warnings and errors.
+
+## [0.1.3](https://github.com/pi-rust/rpi-package/compare/rpi-run-stats-v0.1.2...rpi-run-stats-v0.1.3) - 2026-10-15
+
+### Added
+
+- *(run-stats)* stabilize metrics and show tool calls and priced costs ([#17](https://github.com/pi-rust/rpi-package/pull/17))
+
 ### Added
 
 - Count actual tool executions in a fixed-width Tools column.

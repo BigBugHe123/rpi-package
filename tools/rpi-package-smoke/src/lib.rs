@@ -1,6 +1,12 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+// The integration tests drive host-side ABI trampolines directly: they must read
+// a plugin-produced `StbString` and release it exactly once, which the SDK
+// exposes as explicit `unsafe` operations. Library code stays safe; each test
+// module that touches the ABI opts in locally.
 
 #[cfg(test)]
+#[allow(unsafe_code)] // host-side ABI reads/releases in this test module
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -14,11 +20,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "run with `task smoke` after the release cdylibs are built"]
     async fn release_plugins_load_and_execute() {
-        let release_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("release");
+        // Load the workspace's own cdylibs, not every DLL in `target/release`:
+        // the tests key off the exact tool set, so a stale artifact from another
+        // branch must not be able to change the result. `task smoke` stages the
+        // directory; fall back to the build dir for a direct `cargo test`.
+        let release_dir = std::env::var_os("RPI_SMOKE_PLUGIN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target")
+                    .join("release")
+            });
         let session = load_session(&[release_dir], Arc::new(NullDiagnostics), None);
         let snapshot = session.snapshot().expect("package registry should exist");
         let names: BTreeSet<&str> = snapshot
@@ -27,25 +41,43 @@ mod tests {
             .map(|tool| tool.tool.name.as_str())
             .collect();
         let expected = BTreeSet::from([
-            "code_lens",
-            "delegate_task",
-            "mcp_request",
-            "codegraph",
-            "todo",
-            "goal",
-            "plan_mode_start",
-            "plan_mode_complete",
             "ask_user",
-            "permissions",
-            "websearch",
-            "webfetch",
+            "code_lens",
+            "codegraph_callees",
+            "codegraph_callers",
+            "codegraph_explore",
+            "codegraph_files",
+            "codegraph_impact",
+            "codegraph_node",
+            "codegraph_search",
+            "codegraph_status",
+            "delegate_task",
+            "dispatch",
+            "goal",
             "im_message_server",
+            "langfuse_prompt",
+            "langfuse_score",
+            "langfuse_trace",
+            "mcp_call",
+            "mcp_list",
+            "mcp_request",
+            "mcp_resource",
+            "permissions",
+            "plan",
+            "plan_mode_complete",
+            "plan_mode_start",
+            "rpc_client",
+            "rpc_server",
+            "subagent",
+            "todo",
+            "webfetch",
+            "websearch",
         ]);
         assert_eq!(names, expected);
         assert_eq!(
             session.loaded_paths().len(),
-            12,
-            "all twelve cdylibs should load"
+            19,
+            "all nineteen cdylibs should load"
         );
         let tool = snapshot
             .tools()
@@ -104,10 +136,12 @@ mod tests {
                 cmd.user_data,
             );
             assert_eq!(rc, 0, "/voice {args} rc");
-            let text = out.to_string_lossy();
+            // SAFETY: the callback returned a live SDK-owned allocation; copy
+            // it before freeing it exactly once with the host allocator.
+            let text = unsafe { out.to_string_lossy() };
             assert!(text.contains(needle), "/voice {args} -> {text}");
             eprintln!("/voice {args}: {text}");
-            host_free_string(out);
+            unsafe { host_free_string(out) };
         }
 
         let handlers = snapshot.handlers_for(EventTag::MessageEnd);
@@ -129,10 +163,18 @@ mod tests {
         let handler = &handlers[0];
         let rc = (handler.handler)(event, handler.user_data);
         assert_eq!(rc, 0, "MessageEnd handler rc");
-        // The original allocation remains host-owned during handler fan-out.
-        host_free_string(message);
+        // SAFETY: the handler borrows `message`; it is still live and owned by
+        // this test, which releases it exactly once here.
+        unsafe { host_free_string(message) };
     }
 }
+
+/// Fixture lookup for the `--ignored` smoke tests; see the module for why a
+/// missing fixture skips rather than fails. Also compiled into
+/// `tests/run_stats.rs`, which is why it lives in its own file.
+#[cfg(test)]
+#[path = "fixtures.rs"]
+pub(crate) mod smoke_fixtures;
 
 #[cfg(test)]
 mod mcp_smoke;
@@ -141,10 +183,13 @@ mod mcp_smoke;
 mod todo_smoke;
 
 #[cfg(test)]
+#[allow(unsafe_code)] // host-side ABI reads/releases in this test module
 mod plan_smoke;
 
 #[cfg(test)]
+#[allow(unsafe_code)] // host-side ABI reads/releases in this test module
 mod pet_smoke;
 
 #[cfg(test)]
+#[allow(unsafe_code)] // host-side ABI reads/releases in this test module
 mod stats_smoke;

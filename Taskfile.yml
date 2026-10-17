@@ -1,5 +1,15 @@
 version: "3"
 
+# cdylib / executable naming, so the smoke task can point the artifact-specific
+# tests at the files `task build` just produced on any platform.
+vars:
+  DLL_PREFIX:
+    sh: python -c "import sys; print('' if sys.platform=='win32' else 'lib')"
+  DLL_SUFFIX:
+    sh: python -c "import sys; print({'win32':'.dll','darwin':'.dylib'}.get(sys.platform,'.so'))"
+  EXE_SUFFIX:
+    sh: python -c "import sys; print('.exe' if sys.platform=='win32' else '')"
+
 tasks:
   default:
     cmds:
@@ -65,8 +75,31 @@ tasks:
   smoke:
     desc: Load all built packages through the pi-rust extension loader
     deps: [build]
+    vars:
+      # `task smoke` runs every `--ignored` test, so point the artifact-specific
+      # ones at the cdylibs this task just built; otherwise they skip.
+      RELEASE:
+        sh: python tools/rpi-package-smoke/stage_plugins.py --print-release-dir
+      PLUGIN_DIR: "{{.ROOT_DIR}}/target/smoke-plugins"
     cmds:
-      - cargo test --manifest-path tools/rpi-package-smoke/Cargo.toml -- --ignored --nocapture
+      - python -m unittest discover -s tools/rpi-package-smoke -p test_stage_plugins.py
+      # Stage exactly this workspace's cdylibs so the loaded set depends on the
+      # checkout, not on whatever else was built into target/release.
+      - python tools/rpi-package-smoke/stage_plugins.py --out "{{.PLUGIN_DIR}}"
+      # Single-threaded on purpose: every test here loads plugins into the *same*
+      # process, and the host-side registries (MCP connections, status mailbox,
+      # todo/goal state) are process-global. Running them concurrently makes one
+      # test's shutdown cancel another's in-flight call.
+      - cargo test --manifest-path tools/rpi-package-smoke/Cargo.toml -- --ignored --test-threads=1
+    env:
+      RPI_SMOKE_PLUGIN_DIR: "{{.PLUGIN_DIR}}"
+      RPI_TODO_DLL: "{{.RELEASE}}/{{.DLL_PREFIX}}rpi_todo{{.DLL_SUFFIX}}"
+      RPI_PLAN_DLL: "{{.RELEASE}}/{{.DLL_PREFIX}}rpi_plan_mode{{.DLL_SUFFIX}}"
+      RPI_STATS_DLL: "{{.RELEASE}}/{{.DLL_PREFIX}}rpi_run_stats{{.DLL_SUFFIX}}"
+      RPI_VOICE_DLL: "{{.RELEASE}}/{{.DLL_PREFIX}}rpi_voice{{.DLL_SUFFIX}}"
+      RPI_VOICE_AUTO_TTS: "off"
+      RPI_MCP_DLL: "{{.RELEASE}}/{{.DLL_PREFIX}}rpi_mcp_adapter{{.DLL_SUFFIX}}"
+      RPI_FAKE_MCP_SERVER: "{{.RELEASE}}/fake_mcp_server{{.EXE_SUFFIX}}"
 
   publish-dry-run:
     desc: Verify all extensions can be packaged for crates.io
