@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Start `/goal` work in the background so the command returns and the TUI can
+  clear the submitted draft and keep accepting input. Add an ABI regression
+  test for explicit and shorthand starts while the first run is still active.
+
 ## [0.1.7](https://github.com/pi-rust/rpi-package/compare/rpi-goal-v0.1.6...rpi-goal-v0.1.7) - 2026-10-14
 
 ### Added

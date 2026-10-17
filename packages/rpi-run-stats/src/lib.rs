@@ -22,6 +22,7 @@ fn state() -> &'static Mutex<Stats> {
 struct Stats {
     last_publication: Option<String>,
     last_visibility: Option<bool>,
+    supports_highlights: Option<bool>,
     enabled: bool,
     anchor: String,
     running: bool,
@@ -47,6 +48,7 @@ impl Default for Stats {
         Self {
             last_publication: None,
             last_visibility: None,
+            supports_highlights: None,
             enabled: false,
             anchor: "top-right".into(),
             running: false,
@@ -202,27 +204,50 @@ fn metric(v: &Value, key: &str, precision: usize, suffix: &str, width: usize) ->
             if text.chars().count() <= width {
                 text
             } else {
-                // Keep unusually large values from shifting every later column.
+                // Bound unusually large values without reserving blank columns.
                 format!("{n:.0e}{suffix}")
             }
         })
         .unwrap_or_else(|| "—".into());
-    format!("{text:>width$}")
+    text
 }
 fn panel(snapshot: &Value, _anchor: &str) -> Value {
     let cost = if snapshot["pricingAvailable"].as_bool() == Some(true) {
-        format!(" · USD {}", metric(snapshot, "cost", 4, "", 9))
+        format!(" ${}", metric(snapshot, "cost", 3, "", 7))
     } else {
         String::new()
     };
+    let status = if snapshot["running"].as_bool() == Some(true) {
+        "●"
+    } else {
+        "○"
+    };
+    let errors = format!("Err{}", compact(count(snapshot, "errors")));
+    // Show elapsed first-token wait while the request is still silent.
+    let mut timing = snapshot.clone();
+    if timing["ttft"].is_null() && timing["waiting"].as_f64().is_some() {
+        timing["ttft"] = timing["waiting"].clone();
+    }
+    let ttft = format!("TTFT{}", metric(&timing, "ttft", 1, "s", 6));
+    let mut highlights = Vec::new();
+    if count(snapshot, "errors") > 0 {
+        highlights.push(json!({"text":errors,"color":"error"}));
+    }
+    if let Some(seconds) = timing["ttft"]
+        .as_f64()
+        .filter(|s| s.is_finite() && *s >= 10.0)
+    {
+        highlights.push(json!({"text":ttft,"color":if seconds >= 30.0 {"error"} else {"warning"}}));
+    }
     json!({"version":1,"layout":"footer","width":240,"maxHeight":1,"border":false,
-        // All values (including missing data) occupy stable terminal columns.
-        "lines":[format!("Turns {:>6} · LLM Calls {:>6} · Tools {:>6}{} · TPS {} · TTFT {} · Latency {} · TPM {:>6} · Err {:>6}",
+        "highlights":highlights,
+        // Separate counts, response performance, and usage with only two dividers.
+        "lines":[format!("{status} Turn{} LLM{} Tool{}{} │ {}t/s {} Lat{} │ {}/m{}",
             compact(count(snapshot,"rounds")),compact(count(snapshot,"steps")),
-            compact(count(snapshot,"tools")),cost,
-            metric(snapshot,"speed",0,"",6),metric(snapshot,"ttft",2,"s",7),
-            metric(snapshot,"latency",2,"s",7),compact(count(snapshot,"tpm")),
-            compact(count(snapshot,"errors")))]})
+            compact(count(snapshot,"tools")),
+            if count(snapshot,"errors") > 0 { format!(" {errors}") } else { String::new() },
+            metric(snapshot,"speed",0,"",5),ttft,
+            metric(snapshot,"latency",1,"s",6),compact(count(snapshot,"tpm")),cost)]})
 }
 fn compact(n: u64) -> String {
     if n < 1_000 {
@@ -231,12 +256,16 @@ fn compact(n: u64) -> String {
     let mut value = n as f64 / 1_000.0;
     let units = ["k", "M", "G", "T", "P", "E"];
     let mut unit = 0;
-    // Promote before rounding would produce a seven-column value like 1000.0k.
-    while value >= 999.95 && unit + 1 < units.len() {
+    // Promote before rounding would exceed the four-column counter budget.
+    while value >= 999.5 && unit + 1 < units.len() {
         value /= 1_000.0;
         unit += 1;
     }
-    format!("{value:.1}{}", units[unit])
+    if value < 9.95 {
+        format!("{value:.1}{}", units[unit])
+    } else {
+        format!("{value:.0}{}", units[unit])
+    }
 }
 fn component_action(runtime: &rpi_plugin_sdk::PluginApi, args: Value) -> bool {
     let args = args.to_string();
@@ -264,7 +293,10 @@ fn publish(stats: &mut Stats) {
         stats.last_visibility = Some(false);
     }
     let value = panel(&stats.snapshot(Instant::now()), &stats.anchor);
-    let args = json!({"op":"update","id":KEY,"text":value["lines"][0]}).to_string();
+    let mut args = json!({"op":"update","id":KEY,"text":value["lines"][0]});
+    if stats.supports_highlights != Some(false) {
+        args["highlights"] = value["highlights"].clone();
+    }
     if stats.last_visibility != Some(stats.enabled)
         && component_action(
             runtime,
@@ -273,19 +305,19 @@ fn publish(stats: &mut Stats) {
     {
         stats.last_visibility = Some(stats.enabled);
     }
-    if stats.last_publication.as_deref() == Some(args.as_str()) {
+    if stats.last_publication.as_deref() == Some(args.to_string().as_str()) {
         return;
     }
-    let mut out = StbString::empty();
-    let rc = (runtime.runtime_action)(
-        RuntimeActionId::UiComponent as u32,
-        StbStringRef::from_str(&args),
-        &mut out,
-        runtime.user_data,
-    );
-    (runtime.free_string)(out);
-    if rc == 0 {
-        stats.last_publication = Some(args);
+    if component_action(runtime, args.clone()) {
+        stats.supports_highlights.get_or_insert(true);
+        stats.last_publication = Some(args.to_string());
+    } else if stats.supports_highlights.is_none() {
+        // Older text-component hosts can still display the compact plain row.
+        args.as_object_mut().unwrap().remove("highlights");
+        if component_action(runtime, args.clone()) {
+            stats.supports_highlights = Some(false);
+            stats.last_publication = Some(args.to_string());
+        }
     }
 }
 rpi_plugin_sdk::event_handler! {
@@ -496,47 +528,90 @@ mod tests {
         assert_eq!(view["layout"], "footer");
         assert_eq!(view["maxHeight"], 1);
         assert_eq!(view["lines"].as_array().unwrap().len(), 1);
-        assert!(view["lines"][0].as_str().unwrap().contains("TTFT"));
+        assert!(view["lines"][0].as_str().unwrap().starts_with("○ Turn0"));
+        stats.running = true;
+        assert!(
+            panel(&stats.snapshot(Instant::now()), "top-right")["lines"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("● Turn0")
+        );
     }
     #[test]
-    fn monitor_columns_stay_fixed_for_missing_values_digit_changes_and_large_usage() {
-        let layout = |snapshot: &Value| {
+    fn compact_row_uses_theme_highlights_for_errors_and_first_token_wait() {
+        let view = panel(
+            &json!({"rounds":7,"steps":12,"tools":18,"cost":0.086,
+            "pricingAvailable":true,"speed":42,"ttft":1.2,"latency":8.4,"tpm":192_000}),
+            "top-right",
+        );
+        let line = view["lines"][0].as_str().unwrap();
+        assert_eq!(
+            line,
+            "○ Turn7 LLM12 Tool18 │ 42t/s TTFT1.2s Lat8.4s │ 192k/m $0.086"
+        );
+        assert!(line.chars().count() <= 60);
+        assert_eq!(view["highlights"], json!([]));
+        for (wait, color) in [(10.0, "warning"), (30.0, "error")] {
+            let view = panel(&json!({"waiting":wait,"errors":1}), "top-right");
+            assert_eq!(
+                view["highlights"][0],
+                json!({"text":"Err1","color":"error"})
+            );
+            assert_eq!(view["highlights"][1]["color"], color);
+            assert!(view["lines"][0]
+                .as_str()
+                .unwrap()
+                .contains(view["highlights"][1]["text"].as_str().unwrap()));
+        }
+        // A long streaming response is not a long first-token wait.
+        let view = panel(&json!({"waiting":90,"ttft":1.2,"latency":90}), "top-right");
+        assert_eq!(view["highlights"], json!([]));
+    }
+    #[test]
+    fn monitor_has_no_padding_and_bounds_large_or_missing_values() {
+        let check = |snapshot: &Value| {
             let view = panel(snapshot, "top-right");
             let line = view["lines"][0].as_str().unwrap();
-            let positions = [
-                "Turns",
-                "LLM Calls",
-                "Tools",
-                "TPS",
-                "TTFT",
-                "Latency",
-                "TPM",
-                "Err",
-            ]
-            .map(|label| line[..line.find(label).unwrap()].chars().count());
-            (positions, line.chars().count())
+            assert_eq!(line, line.trim());
+            assert!(!line.contains("  "));
+            assert!(line.chars().count() <= 80, "row too long: {line}");
+            assert_eq!(line.contains('$'), snapshot["pricingAvailable"] == true);
+            assert_eq!(line.contains(" Err"), count(snapshot, "errors") > 0);
+            let groups: Vec<_> = line.split(" │ ").collect();
+            assert_eq!(groups.len(), 3);
+            assert!(
+                groups[0].contains("Turn")
+                    && groups[0].contains("LLM")
+                    && groups[0].contains("Tool")
+            );
+            assert!(
+                groups[1].contains("t/s")
+                    && groups[1].contains("TTFT")
+                    && groups[1].contains("Lat")
+            );
+            assert!(groups[2].contains("/m"));
+            assert!(!groups[0].contains('$') && !groups[1].contains('$'));
+            assert_eq!(
+                line.split_whitespace().count(),
+                10 + usize::from(snapshot["pricingAvailable"] == true)
+                    + usize::from(count(snapshot, "errors") > 0)
+            );
         };
         for priced in [false, true] {
-            let expected = layout(&json!({"pricingAvailable":priced}));
+            check(&json!({"pricingAvailable":priced}));
             for n in [0, 9, 10, 999, 1_000, 999_949, 999_950, 1_000_000, u64::MAX] {
-                assert_eq!(
-                    layout(&json!({"rounds":n,"steps":n,"tools":n,"speed":n,"ttft":n,
-                    "latency":n,"tpm":n,"errors":n,"cost":n,"pricingAvailable":priced})),
-                    expected,
-                    "column positions changed for {n}"
-                );
+                check(&json!({"rounds":n,"steps":n,"tools":n,"speed":n,"ttft":n,
+                    "latency":n,"tpm":n,"errors":n,"cost":n,"pricingAvailable":priced}));
             }
-            assert_eq!(
-                layout(&json!({"speed":f64::MAX,"ttft":f64::MAX,
-                "latency":f64::MAX,"cost":f64::MAX,"pricingAvailable":priced})),
-                expected
-            );
+            check(&json!({"speed":f64::MAX,"ttft":f64::MAX,
+                "latency":f64::MAX,"cost":f64::MAX,"pricingAvailable":priced}));
         }
-        assert_eq!(metric(&json!({"ttft":1.25}), "ttft", 2, "s", 7), "  1.25s");
-        assert_eq!(metric(&json!({}), "ttft", 2, "s", 7), "      —");
-        assert_eq!(compact(999_949), "999.9k");
+        assert_eq!(metric(&json!({"ttft":1.25}), "ttft", 2, "s", 7), "1.25s");
+        assert_eq!(metric(&json!({}), "ttft", 2, "s", 7), "—");
+        assert_eq!(compact(999_499), "999k");
+        assert_eq!(compact(999_500), "1.0M");
         assert_eq!(compact(999_950), "1.0M");
-        assert_eq!(compact(u64::MAX), "18.4E");
+        assert_eq!(compact(u64::MAX), "18E");
     }
     #[test]
     fn command_accepts_host_envelope_and_rejects_unknown_arguments() {
@@ -635,7 +710,7 @@ mod tests {
         assert_eq!(snapshot["tools"], 2);
         let view = panel(&snapshot, "top-right");
         let line = view["lines"][0].as_str().unwrap();
-        assert!(line.contains("LLM Calls      1 · Tools      2"));
+        assert!(line.contains("LLM1 Tool2"));
         stats.update(EventTag::SessionStart, &Value::Null, now);
         assert_eq!(stats.snapshot(now)["tools"], 0);
     }
@@ -653,9 +728,9 @@ mod tests {
         assert!((stats.cost.unwrap() - 0.0223).abs() < 1e-12);
         let view = panel(&stats.snapshot(now), "top-right");
         let line = view["lines"][0].as_str().unwrap();
-        assert!(line.contains("USD    0.0223"));
+        assert!(line.contains("$0.022"));
         // Keep costs visible even when a narrow terminal clips later metrics.
-        assert!(line[..line.find("0.0223").unwrap()].chars().count() + 6 <= 80);
+        assert!(line[..line.find("0.022").unwrap()].chars().count() + 6 <= 80);
         stats.update(EventTag::SessionStart, &Value::Null, now);
         assert!(stats.snapshot(now)["cost"].is_null());
     }
@@ -665,7 +740,7 @@ mod tests {
         let now = Instant::now();
         let shows_usd = |stats: &mut Stats| {
             let view = panel(&stats.snapshot(now), "top-right");
-            view["lines"][0].as_str().unwrap().contains("USD")
+            view["lines"][0].as_str().unwrap().contains('$')
         };
         assert!(!shows_usd(&mut stats));
         // Default zero usage from an older host is not evidence of pricing.
