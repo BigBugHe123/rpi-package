@@ -1,0 +1,8 @@
+{
+  "url": "http://127.0.0.1:8080",
+  "tokenEnv": "OPENWEBUI_TOKEN",
+  "adapter": {
+    "bind": "127.0.0.1:5234"
+  },
+  "permissions": "ask"
+}

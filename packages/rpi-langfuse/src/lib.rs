@@ -346,8 +346,8 @@ fn config_path() -> Result<std::path::PathBuf, String> {
         return Ok(project);
     }
     home_dir()
-        .map(|home| home.join(".pi").join("agent").join("langfuse.json"))
-        .ok_or_else(|| "cannot resolve home directory for ~/.pi/agent/langfuse.json".into())
+        .map(|home| home.join(".rpi").join("agent").join("langfuse.json"))
+        .ok_or_else(|| "cannot resolve home directory for ~/.rpi/agent/langfuse.json".into())
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {

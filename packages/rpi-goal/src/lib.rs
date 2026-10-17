@@ -86,7 +86,9 @@ fn queue_notice(goal: &Goal, budget_reason: Option<String>) {
 }
 
 fn flush_pending_inject() {
-    flush_pending_state();
+    if !flush_pending_state() {
+        return;
+    }
     flush_pending_inject_with(|pending| match &pending.budget_reason {
         Some(reason) => append_budget_message(&pending.goal, reason),
         None => append_goal_custom_message(&pending.goal),
@@ -257,16 +259,19 @@ fn goals_path() -> PathBuf {
         .join(GOAL_FILE)
 }
 
-fn flush_pending_state() {
+fn flush_pending_state() -> bool {
     let state = pending_state()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take();
     let Some(goals) = state else {
-        return;
+        return true;
     };
-    if write_goals(&goals).is_err() {
+    if write_goals(&goals).is_ok() {
+        true
+    } else {
         *pending_state().lock().unwrap_or_else(|p| p.into_inner()) = Some(goals);
+        false
     }
 }
 
@@ -1035,7 +1040,9 @@ fn start_from_command(title: &str, notes: &str) -> Result<String, String> {
     let goal = op_start(title, notes, None, None)?;
     // Persist the session state and notice before starting the run. The full
     // SendUserMessage call itself must not run on the TUI command thread.
-    flush_pending_state();
+    if !flush_pending_state() {
+        return Err("unable to persist the goal state".into());
+    }
     flush_pending_inject();
     let prompt = if goal.notes.trim().is_empty() {
         format!("Work on the active goal: {}", goal.title)

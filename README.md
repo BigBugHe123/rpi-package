@@ -32,10 +32,19 @@ either way).
 `rpi-run-stats` adds a live monitoring row below the usage footer: turns, LLM calls, tool executions,
 output tok/s, time to first token, response time, rolling 60-second TPM,
 input/output/cache tokens, errors and USD cost. Use `/stats on`, `/stats off`
-or `/stats` to toggle it, or press F8. Values use fixed-width columns to keep
-the row stable. USD accumulates model usage costs calculated by the host from
+or `/stats` to toggle it, or press F8. The row uses compact monochrome symbols
+in three groups and retains measured timing between requests. USD accumulates model usage costs calculated by the host from
 model pricing. It uses the host's generic `UiComponent` text interface.
 See [rpi-run-stats](packages/rpi-run-stats/README.md) for measurement definitions.
+
+## Provider integrations
+
+`rpi-providers` is one independently loaded package for DeepSeek, OpenRouter,
+llama.cpp and Proxy. It keeps a single native plugin entry and separate
+provider IDs, model catalogs and authentication policies. Install or upgrade
+one package; maintain vendor implementations in separate modules. It currently
+requires the provider-package host branch and source linking. See
+[the package guide](packages/rpi-providers/README.md) for migration and tests.
 
 ## Native ACP integration
 
@@ -75,6 +84,17 @@ The standalone bridge owns stdin/stdout and starts `rpi --mode rpc` itself.
 Build its archive with `task pack-acp`; use `RPI_BIN` to select the backend
 executable. Its packaging and proposed ACP Registry entry are documented in
 [registry/README.md](registry/README.md).
+
+## UI adapters
+
+`rpi-ui-adapter` adds `rpi --webui=openwebui` to connect an existing Open WebUI
+instance directly to rpi ACP, with streaming, progress, tool details and cancellation.
+Each UI has its own project configuration in `.rpi/webui/<UI>.json`;
+`--webui` only selects the adapter.
+It automatically installs a managed Pipe; Computer is not required. rpi and
+the project can remain outside the UI container. See the
+[Chinese setup guide](packages/rpi-ui-adapter/README.md) for configuration examples,
+container networking and session behavior.
 
 ## Build and install
 

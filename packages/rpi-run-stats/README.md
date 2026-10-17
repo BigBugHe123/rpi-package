@@ -25,16 +25,40 @@ of function-key settings.
 - TPM is reported token usage from requests completed within the last 60 seconds, including input, output and cache tokens. It is not a provider rate-limit quota or an extrapolated speed.
 - Input, output, cache read/write, errors/aborts and USD cost accumulate in the current session. Missing timing is displayed as `—`. USD is hidden when the current model has no pricing.
 
-Labels: **TPS** (output tokens per second), **TTFT** (time to first token),
-**Latency** (request duration), **TPM** (rolling tokens per minute), **Err**
-(model request errors/aborts), and **USD** (cumulative model usage cost). Input/output/cache usage remains
-in the built-in footer above, without being duplicated. Counts use `k` and `M`
-abbreviations (and larger units for very large totals). **Turns** counts agent
-runs; **LLM Calls** counts provider requests; **Tools** counts tool executions.
-USD appears next to the counters so costs remain visible in narrower terminals.
-Values are right-aligned in fixed-width
-columns, including missing values, so digit and unit changes do not move labels.
-Unusually large timing, speed or cost values use scientific notation to fit.
+The compact row has three groups: counts, response performance, and usage/cost.
+Only the two group boundaries have dividers; fields have no fixed-width padding:
+
+```text
+↻ 1 ◇ 3 ⌘ 2 │ 39t/s ◴ 2.4s ◷ 16.2s │ 319k/m
+```
+
+The icons are single-cell monochrome text symbols, with one space between each
+icon and its number. They do not use emoji presentation or font-specific glyphs.
+**↻** counts agent runs, **◇** counts provider requests, and **⌘** counts tool
+executions. **t/s** is output tokens per second, **◴** is time to first token
+(TTFT), **◷** is request duration, and **/m** is rolling tokens per minute (TPM).
+**!** counts model request errors/aborts and appears in the counts group only
+when nonzero. **$** shows cumulative model usage cost next to usage in the last
+group, and is omitted without pricing. Input/output/cache/context usage remains
+in the built-in footer above. Counts use at most four
+columns with `k`, `M` and larger units. Unusually large timing, speed or cost
+values use scientific notation to fit. Costs use three decimal places.
+
+Normal fields use the theme's dim color. A nonzero **!** is red. **◴** (TTFT) uses
+the warning color at 10 seconds and the error color at 30 seconds; these are
+waiting-time hints, not proof that the provider failed. Timing and speed retain
+their latest measured values when sending another message or starting a tool
+continuation. TTFT updates on the next first token; duration and speed update
+when new measurements are available at completion. Missing usage or a zero-time
+response does not erase a measured speed. Only starting a new session resets
+these values to `—`.
+
+Before the first-ever token, TTFT shows elapsed waiting time and refreshes each
+second. On later requests it retains measured TTFT; if the new request stays
+silent for 10 seconds, a separate `…10s` wait hint appears in the response group
+(warning at 10 seconds, error at 30 seconds). That hint disappears on the first
+token or when the request ends. A long streaming response does not trigger a
+wait warning. Request duration and token speed are not treated as errors.
 
 The USD total comes from each response's `usage.cost.total`. The host calculates
 this from token usage and model rates, including input, output, cache read/write
@@ -57,7 +81,7 @@ add a `cost` block to the model entry in `~/.rpi/agent/models.json` (or
 These example rates are **USD per million tokens**. USD shows accumulated usage
 cost, rather than the model's unit price. Restart rpi after changing the config.
 USD is shown only for models with known pricing (built-in rates or an explicit
-`cost` block). Explicit zero rates show `0.0000`; missing pricing hides the entire
+`cost` block). Explicit zero rates show `$0.000`; missing pricing hides the entire
 USD field, including when switching from a priced model to an unpriced model.
 Accumulated costs are retained and shown again when using a priced model.
 Older hosts without pricing metadata only show USD after a positive reported cost.
@@ -71,6 +95,10 @@ the host does not interpret monitor metrics or know this plugin's identity.
 It requires a host with `UiComponent` action 22 support. Older hosts do not display the
 panel. Headless runs collect data without displaying a panel. Counts start on
 load and reset at session start, rather than replaying history.
+Colors require the optional `highlights` field on text updates, containing
+literal `{ "text": "...", "color": "warning" | "error" }` entries. The host
+applies its theme colors after sanitizing text and clips the styled row to the
+terminal width. Hosts without highlights fall back to the compact plain row.
 
 Build: `cargo build --release -p rpi-run-stats`; install the platform cdylib in `~/.rpi/agent/extensions` and restart rpi.
 

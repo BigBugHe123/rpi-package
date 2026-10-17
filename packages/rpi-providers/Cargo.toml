@@ -1,0 +1,36 @@
+[package]
+name = "rpi-providers"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Unified DeepSeek, OpenRouter, llama.cpp and proxy provider extension for rpi"
+readme = "README.md"
+
+# GitHub prebuilt releases are independent of crates.io publication.
+[package.metadata.rpi]
+prebuilt = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Provider registration and manifests require the provider-package host API.
+# Keep all three dependencies on the same reviewed core revision. Do not change
+# the SDK used by unrelated extensions in this workspace.
+[dependencies]
+rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af", features = ["providers"] }
+rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+rpi-provider-runtime = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
+
+[dev-dependencies]
+rpi-extensions = { git = "https://github.com/bigfish1913/pi-rust", rev = "cf4241d2ecef274dabec0b60108fe1ba14c738af" }
+tokio = { workspace = true, features = ["macros", "net", "io-util"] }
+tempfile = "3"

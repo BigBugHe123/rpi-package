@@ -376,6 +376,17 @@ On Windows the variable must be set for Zed's own environment (`setx
 RPI_ACP_DEBUG 1`, then restart Zed); setting it in a terminal only affects runs
 started from that terminal.
 
+If Zed shows only the first tool or reply and never completes the turn, test
+with `rpi-goal` loaded as well as ACP. A host runtime-action bridge that blocks
+its Tokio worker can deadlock when goal's `TurnEnd` observer reads the session
+branch. This requires updating the **rpi host**, then restarting the ACP process;
+updating only the ACP plugin does not repair the host's scheduler bridge.
+
+The optional native regression uses a local model fixture and no provider calls.
+Set `RPI_TEST_HOST`, `RPI_TEST_PLUGIN` (ACP library), and `RPI_TEST_GOAL_PLUGIN`,
+then run `python -m unittest discover -s packages/rpi-acp/tests -p test_native_turns.py -v`.
+It checks consecutive prompts and a real tool execution followed by another reply.
+
 ## Manual smoke test
 ```powershell
 $ext = "target\debug"   # dir containing rpi_acp.dll / librpi_acp.so
