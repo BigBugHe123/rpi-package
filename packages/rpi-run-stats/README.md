@@ -29,22 +29,22 @@ The compact row has three groups: counts, response performance, and usage/cost.
 Only the two group boundaries have dividers; fields have no fixed-width padding:
 
 ```text
-○ Turn1 LLM3 Tool2 │ 39t/s TTFT2.4s Lat16.2s │ 319k/m
+↻ 1 ◇ 3 ⌘ 2 │ 39t/s ◴ 2.4s ◷ 16.2s │ 319k/m
 ```
 
-**●** means running and **○** means idle. This pair is the row's only status
-icon; metrics use short text labels without emoji or font-specific glyphs.
-**Turn** counts agent runs, **LLM** counts provider requests, and **Tool** counts
-tool executions. **t/s** is output tokens per second, **TTFT** is time to first
-token, **Lat** is request duration, and **/m** is rolling tokens per minute (TPM).
-**Err** counts model request errors/aborts and appears in the counts group only
+The icons are single-cell monochrome text symbols, with one space between each
+icon and its number. They do not use emoji presentation or font-specific glyphs.
+**↻** counts agent runs, **◇** counts provider requests, and **⌘** counts tool
+executions. **t/s** is output tokens per second, **◴** is time to first token
+(TTFT), **◷** is request duration, and **/m** is rolling tokens per minute (TPM).
+**!** counts model request errors/aborts and appears in the counts group only
 when nonzero. **$** shows cumulative model usage cost next to usage in the last
 group, and is omitted without pricing. Input/output/cache/context usage remains
 in the built-in footer above. Counts use at most four
 columns with `k`, `M` and larger units. Unusually large timing, speed or cost
 values use scientific notation to fit. Costs use three decimal places.
 
-Normal fields use the theme's dim color. A nonzero **Err** is red. **TTFT** uses
+Normal fields use the theme's dim color. A nonzero **!** is red. **◴** (TTFT) uses
 the warning color at 10 seconds and the error color at 30 seconds; these are
 waiting-time hints, not proof that the provider failed. Before the first token,
 TTFT shows elapsed waiting time and refreshes each second. After the first

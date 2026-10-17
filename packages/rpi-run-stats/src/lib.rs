@@ -217,18 +217,15 @@ fn panel(snapshot: &Value, _anchor: &str) -> Value {
     } else {
         String::new()
     };
-    let status = if snapshot["running"].as_bool() == Some(true) {
-        "●"
-    } else {
-        "○"
-    };
-    let errors = format!("Err{}", compact(count(snapshot, "errors")));
+    // Single-cell text symbols share a quiet monochrome style. Give each
+    // symbol its own cell and a space before the value, especially tools.
+    let errors = format!("! {}", compact(count(snapshot, "errors")));
     // Show elapsed first-token wait while the request is still silent.
     let mut timing = snapshot.clone();
     if timing["ttft"].is_null() && timing["waiting"].as_f64().is_some() {
         timing["ttft"] = timing["waiting"].clone();
     }
-    let ttft = format!("TTFT{}", metric(&timing, "ttft", 1, "s", 6));
+    let ttft = format!("◴ {}", metric(&timing, "ttft", 1, "s", 6));
     let mut highlights = Vec::new();
     if count(snapshot, "errors") > 0 {
         highlights.push(json!({"text":errors,"color":"error"}));
@@ -242,7 +239,7 @@ fn panel(snapshot: &Value, _anchor: &str) -> Value {
     json!({"version":1,"layout":"footer","width":240,"maxHeight":1,"border":false,
         "highlights":highlights,
         // Separate counts, response performance, and usage with only two dividers.
-        "lines":[format!("{status} Turn{} LLM{} Tool{}{} │ {}t/s {} Lat{} │ {}/m{}",
+        "lines":[format!("↻ {} ◇ {} ⌘ {}{} │ {}t/s {} ◷ {} │ {}/m{}",
             compact(count(snapshot,"rounds")),compact(count(snapshot,"steps")),
             compact(count(snapshot,"tools")),
             if count(snapshot,"errors") > 0 { format!(" {errors}") } else { String::new() },
@@ -528,14 +525,10 @@ mod tests {
         assert_eq!(view["layout"], "footer");
         assert_eq!(view["maxHeight"], 1);
         assert_eq!(view["lines"].as_array().unwrap().len(), 1);
-        assert!(view["lines"][0].as_str().unwrap().starts_with("○ Turn0"));
-        stats.running = true;
-        assert!(
-            panel(&stats.snapshot(Instant::now()), "top-right")["lines"][0]
-                .as_str()
-                .unwrap()
-                .starts_with("● Turn0")
-        );
+        assert!(view["lines"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("↻ 0 ◇ 0 ⌘ 0"));
     }
     #[test]
     fn compact_row_uses_theme_highlights_for_errors_and_first_token_wait() {
@@ -545,18 +538,11 @@ mod tests {
             "top-right",
         );
         let line = view["lines"][0].as_str().unwrap();
-        assert_eq!(
-            line,
-            "○ Turn7 LLM12 Tool18 │ 42t/s TTFT1.2s Lat8.4s │ 192k/m $0.086"
-        );
-        assert!(line.chars().count() <= 60);
+        assert_eq!(line, "↻ 7 ◇ 12 ⌘ 18 │ 42t/s ◴ 1.2s ◷ 8.4s │ 192k/m $0.086");
         assert_eq!(view["highlights"], json!([]));
         for (wait, color) in [(10.0, "warning"), (30.0, "error")] {
             let view = panel(&json!({"waiting":wait,"errors":1}), "top-right");
-            assert_eq!(
-                view["highlights"][0],
-                json!({"text":"Err1","color":"error"})
-            );
+            assert_eq!(view["highlights"][0], json!({"text":"! 1","color":"error"}));
             assert_eq!(view["highlights"][1]["color"], color);
             assert!(view["lines"][0]
                 .as_str()
@@ -576,25 +562,21 @@ mod tests {
             assert!(!line.contains("  "));
             assert!(line.chars().count() <= 80, "row too long: {line}");
             assert_eq!(line.contains('$'), snapshot["pricingAvailable"] == true);
-            assert_eq!(line.contains(" Err"), count(snapshot, "errors") > 0);
+            assert_eq!(line.contains(" ! "), count(snapshot, "errors") > 0);
             let groups: Vec<_> = line.split(" │ ").collect();
             assert_eq!(groups.len(), 3);
             assert!(
-                groups[0].contains("Turn")
-                    && groups[0].contains("LLM")
-                    && groups[0].contains("Tool")
+                groups[0].contains("↻ ") && groups[0].contains("◇ ") && groups[0].contains("⌘ ")
             );
             assert!(
-                groups[1].contains("t/s")
-                    && groups[1].contains("TTFT")
-                    && groups[1].contains("Lat")
+                groups[1].contains("t/s") && groups[1].contains("◴ ") && groups[1].contains("◷ ")
             );
             assert!(groups[2].contains("/m"));
             assert!(!groups[0].contains('$') && !groups[1].contains('$'));
             assert_eq!(
                 line.split_whitespace().count(),
-                10 + usize::from(snapshot["pricingAvailable"] == true)
-                    + usize::from(count(snapshot, "errors") > 0)
+                14 + usize::from(snapshot["pricingAvailable"] == true)
+                    + 2 * usize::from(count(snapshot, "errors") > 0)
             );
         };
         for priced in [false, true] {
@@ -710,7 +692,7 @@ mod tests {
         assert_eq!(snapshot["tools"], 2);
         let view = panel(&snapshot, "top-right");
         let line = view["lines"][0].as_str().unwrap();
-        assert!(line.contains("LLM1 Tool2"));
+        assert!(line.contains("◇ 1 ⌘ 2"));
         stats.update(EventTag::SessionStart, &Value::Null, now);
         assert_eq!(stats.snapshot(now)["tools"], 0);
     }
