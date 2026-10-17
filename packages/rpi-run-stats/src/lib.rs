@@ -107,9 +107,8 @@ impl Stats {
                 }
                 self.request = Some(now);
                 self.first = None;
-                self.ttft = None;
-                self.latency = None;
-                self.speed = None;
+                // Keep the latest measured values until this request supplies
+                // replacements. Reset only the current request's clock/latch.
             }
             EventTag::ToolExecutionStart => self.tools += 1,
             EventTag::MessageUpdate => {
@@ -169,10 +168,11 @@ impl Stats {
                         });
                     self.recent.push_back((now, total));
                     // Include TTFT in throughput: true end-to-end output tokens / request second.
-                    self.speed = self
-                        .latency
-                        .filter(|seconds| *seconds > 0.0)
-                        .map(|seconds| output as f64 / seconds);
+                    if let Some(seconds) = self.latency.filter(|seconds| *seconds > 0.0) {
+                        if let Some(output) = usage.get("output").and_then(Value::as_u64) {
+                            self.speed = Some(output as f64 / seconds);
+                        }
+                    }
                 }
                 self.first = None;
             }
@@ -192,7 +192,8 @@ impl Stats {
             "cacheWrite":self.cache_write,"cost":self.cost,"ttft":self.ttft,"latency":self.latency,
             "pricingAvailable":self.pricing_available.unwrap_or(false),
             "speed":self.speed,"tpm":self.recent.iter().map(|(_,tokens)|tokens).sum::<u64>(),
-            "waiting":self.request.map(|start|now.duration_since(start).as_secs_f64())})
+            "waiting":self.request.filter(|_|self.first.is_none())
+                .map(|start|now.duration_since(start).as_secs_f64())})
     }
 }
 fn metric(v: &Value, key: &str, precision: usize, suffix: &str, width: usize) -> String {
@@ -220,7 +221,8 @@ fn panel(snapshot: &Value, _anchor: &str) -> Value {
     // Single-cell text symbols share a quiet monochrome style. Give each
     // symbol its own cell and a space before the value, especially tools.
     let errors = format!("! {}", compact(count(snapshot, "errors")));
-    // Show elapsed first-token wait while the request is still silent.
+    // Until the first measurement exists, show the current first-token wait.
+    // Later requests retain measured TTFT and use a separate slow-wait hint.
     let mut timing = snapshot.clone();
     if timing["ttft"].is_null() && timing["waiting"].as_f64().is_some() {
         timing["ttft"] = timing["waiting"].clone();
@@ -236,15 +238,25 @@ fn panel(snapshot: &Value, _anchor: &str) -> Value {
     {
         highlights.push(json!({"text":ttft,"color":if seconds >= 30.0 {"error"} else {"warning"}}));
     }
+    let waiting = snapshot["waiting"]
+        .as_f64()
+        .filter(|s| s.is_finite() && *s >= 10.0 && snapshot["ttft"].as_f64().is_some());
+    let wait_hint = if let Some(seconds) = waiting {
+        let hint = format!("…{}", metric(snapshot, "waiting", 0, "s", 6));
+        highlights.push(json!({"text":hint,"color":if seconds >= 30.0 {"error"} else {"warning"}}));
+        format!(" {hint}")
+    } else {
+        String::new()
+    };
     json!({"version":1,"layout":"footer","width":240,"maxHeight":1,"border":false,
         "highlights":highlights,
         // Separate counts, response performance, and usage with only two dividers.
-        "lines":[format!("↻ {} ◇ {} ⌘ {}{} │ {}t/s {} ◷ {} │ {}/m{}",
+        "lines":[format!("↻ {} ◇ {} ⌘ {}{} │ {}t/s {} ◷ {}{} │ {}/m{}",
             compact(count(snapshot,"rounds")),compact(count(snapshot,"steps")),
             compact(count(snapshot,"tools")),
             if count(snapshot,"errors") > 0 { format!(" {errors}") } else { String::new() },
             metric(snapshot,"speed",0,"",5),ttft,
-            metric(snapshot,"latency",1,"s",6),compact(count(snapshot,"tpm")),cost)]})
+            metric(snapshot,"latency",1,"s",6),wait_hint,compact(count(snapshot,"tpm")),cost)]})
 }
 fn compact(n: u64) -> String {
     if n < 1_000 {
@@ -550,7 +562,10 @@ mod tests {
                 .contains(view["highlights"][1]["text"].as_str().unwrap()));
         }
         // A long streaming response is not a long first-token wait.
-        let view = panel(&json!({"waiting":90,"ttft":1.2,"latency":90}), "top-right");
+        let view = panel(
+            &json!({"waiting":null,"ttft":1.2,"latency":90}),
+            "top-right",
+        );
         assert_eq!(view["highlights"], json!([]));
     }
     #[test]
@@ -670,6 +685,106 @@ mod tests {
             s.snapshot(now + std::time::Duration::from_secs(62))["tpm"],
             0
         );
+    }
+    #[test]
+    fn measurements_persist_across_turns_and_tool_continuations_until_replaced() {
+        let mut s = Stats::default();
+        let start = Instant::now();
+        let at = |seconds| start + std::time::Duration::from_secs(seconds);
+        let delta = json!({"type":"text_delta","delta":"hello"});
+        s.update(EventTag::AgentStart, &Value::Null, at(0));
+        s.update(EventTag::BeforeProviderRequest, &Value::Null, at(0));
+        s.update(EventTag::MessageUpdate, &delta, at(1));
+        s.update(
+            EventTag::MessageEnd,
+            &json!({"role":"assistant","usage":{"output":120}}),
+            at(4),
+        );
+        s.update(EventTag::AgentEnd, &Value::Null, at(4));
+        let previous = panel(&s.snapshot(at(4)), "top-right");
+        let previous_metrics = previous["lines"][0]
+            .as_str()
+            .unwrap()
+            .split(" │ ")
+            .nth(1)
+            .unwrap();
+
+        s.update(EventTag::AgentStart, &Value::Null, at(5));
+        s.update(EventTag::BeforeProviderRequest, &Value::Null, at(6));
+        for seconds in [6, 15] {
+            assert_eq!(
+                (s.ttft, s.latency, s.speed),
+                (Some(1.0), Some(4.0), Some(30.0))
+            );
+            let view = panel(&s.snapshot(at(seconds)), "top-right");
+            assert_eq!(
+                view["lines"][0]
+                    .as_str()
+                    .unwrap()
+                    .split(" │ ")
+                    .nth(1)
+                    .unwrap(),
+                previous_metrics
+            );
+        }
+        let waiting = panel(&s.snapshot(at(18)), "top-right");
+        assert!(waiting["lines"][0]
+            .as_str()
+            .unwrap()
+            .contains("30t/s ◴ 1.0s ◷ 4.0s …12s"));
+        assert_eq!(
+            waiting["highlights"],
+            json!([{"text":"…12s","color":"warning"}])
+        );
+        s.update(EventTag::MessageUpdate, &delta, at(19));
+        assert_eq!(
+            (s.ttft, s.latency, s.speed),
+            (Some(13.0), Some(4.0), Some(30.0))
+        );
+        assert!(s.snapshot(at(25))["waiting"].is_null());
+        s.update(
+            EventTag::MessageEnd,
+            &json!({"role":"assistant","usage":{"output":100}}),
+            at(26),
+        );
+        assert_eq!(
+            (s.ttft, s.latency, s.speed),
+            (Some(13.0), Some(20.0), Some(5.0))
+        );
+
+        // A tool continuation without streamed deltas or output usage retains
+        // the latest measured TTFT/speed while updating known duration.
+        s.update(EventTag::ToolExecutionStart, &Value::Null, at(27));
+        s.update(EventTag::BeforeProviderRequest, &Value::Null, at(27));
+        assert_eq!(
+            (s.ttft, s.latency, s.speed),
+            (Some(13.0), Some(20.0), Some(5.0))
+        );
+        s.update(
+            EventTag::MessageEnd,
+            &json!({"role":"assistant","usage":{}}),
+            at(30),
+        );
+        assert_eq!(
+            (s.ttft, s.latency, s.speed),
+            (Some(13.0), Some(3.0), Some(5.0))
+        );
+        s.update(EventTag::BeforeProviderRequest, &Value::Null, at(31));
+        s.update(
+            EventTag::MessageEnd,
+            &json!({"role":"assistant","usage":{"output":100}}),
+            at(31),
+        );
+        assert_eq!(s.speed, Some(5.0));
+        s.update(EventTag::BeforeProviderRequest, &Value::Null, at(32));
+        s.update(EventTag::AgentEnd, &Value::Null, at(33));
+        assert!(s.snapshot(at(33))["waiting"].is_null());
+        assert_eq!(
+            (s.ttft, s.latency, s.speed),
+            (Some(13.0), Some(0.0), Some(5.0))
+        );
+        s.update(EventTag::SessionStart, &Value::Null, at(34));
+        assert_eq!((s.ttft, s.latency, s.speed), (None, None, None));
     }
     #[test]
     fn tool_executions_count_once_per_start_including_failures_and_reset_with_the_session() {

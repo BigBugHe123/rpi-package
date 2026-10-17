@@ -46,10 +46,19 @@ values use scientific notation to fit. Costs use three decimal places.
 
 Normal fields use the theme's dim color. A nonzero **!** is red. **◴** (TTFT) uses
 the warning color at 10 seconds and the error color at 30 seconds; these are
-waiting-time hints, not proof that the provider failed. Before the first token,
-TTFT shows elapsed waiting time and refreshes each second. After the first
-token it stays fixed, so a long streaming response does not trigger a wait
-warning. Request duration and token speed are not treated as errors.
+waiting-time hints, not proof that the provider failed. Timing and speed retain
+their latest measured values when sending another message or starting a tool
+continuation. TTFT updates on the next first token; duration and speed update
+when new measurements are available at completion. Missing usage or a zero-time
+response does not erase a measured speed. Only starting a new session resets
+these values to `—`.
+
+Before the first-ever token, TTFT shows elapsed waiting time and refreshes each
+second. On later requests it retains measured TTFT; if the new request stays
+silent for 10 seconds, a separate `…10s` wait hint appears in the response group
+(warning at 10 seconds, error at 30 seconds). That hint disappears on the first
+token or when the request ends. A long streaming response does not trigger a
+wait warning. Request duration and token speed are not treated as errors.
 
 The USD total comes from each response's `usage.cost.total`. The host calculates
 this from token usage and model rates, including input, output, cache read/write
