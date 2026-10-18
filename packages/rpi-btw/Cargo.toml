@@ -1,0 +1,19 @@
+[package]
+name = "rpi-btw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Ask a read-only side question without interrupting or adding to the main rpi conversation"
+readme = "README.md"
+keywords = ["rpi", "btw", "plugin", "assistant"]
+categories = ["development-tools"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-plugin-sdk = { workspace = true }
+serde_json = { workspace = true }

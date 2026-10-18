@@ -107,6 +107,7 @@ tasks:
       - task: test
       - cargo publish --dry-run --allow-dirty -p rpi-mcp-adapter
       - cargo publish --dry-run --allow-dirty -p rpi-subagents
+      - cargo publish --dry-run --allow-dirty -p rpi-btw
       - cargo publish --dry-run --allow-dirty -p rpi-lens
       - cargo publish --dry-run --allow-dirty -p rpi-todo
       - cargo publish --dry-run --allow-dirty -p rpi-goal
@@ -130,6 +131,7 @@ tasks:
       - task: test
       - cargo publish --allow-dirty -p rpi-mcp-adapter
       - cargo publish --allow-dirty -p rpi-subagents
+      - cargo publish --allow-dirty -p rpi-btw
       - cargo publish --allow-dirty -p rpi-lens
       - cargo publish --allow-dirty -p rpi-todo
       - cargo publish --allow-dirty -p rpi-goal
