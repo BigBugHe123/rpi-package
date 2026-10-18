@@ -2,7 +2,16 @@
 
 `/btw` 打开独立的旁路聊天区：Markdown 回答、独立滚动、连续追问，不中断主任务，也不把旁路问答写入主会话。
 
-> 需要配套宿主实现 **SideQuestion protocol v2**。仅更新插件无法获得新的聊天视图；插件会先检查协议，旧宿主明确提示升级，不静默退回无历史的一次性请求。
+> 需要 **rpi 0.6.0 或更高版本**（SideQuestion protocol v2）。仅更新插件无法获得新的聊天视图；插件会先检查协议，旧宿主明确提示升级，不静默退回无历史的一次性请求。
+
+## 安装
+
+```sh
+rpi update
+rpi install rpi-btw
+```
+
+安装后重启 rpi，使宿主和插件均加载新版本。
 
 ## 用法
 
@@ -61,7 +70,7 @@ cargo test -p rpi-btw
 cargo build -p rpi-btw
 ```
 
-配套宿主开发分支在 `pi-rust-btw` worktree 中。宿主定向验证：
+配套宿主实现已随 rpi 0.6.0 发布。在宿主源码仓库中可运行定向验证：
 
 ```sh
 cargo test -p rpi-cli --lib side_questions
@@ -77,4 +86,4 @@ cargo test -p rpi-cli --test btw_package
 
 Windows 库名为 `rpi_btw.dll`，Linux 为 `librpi_btw.so`，macOS 为 `librpi_btw.dylib`。未设置环境变量时集成测试跳过。测试使用本地假 provider，无需真实 API key。
 
-该包尚未发布；开发修改不代表已更新当前运行的宿主或已安装插件。实际使用前需构建并同时更新宿主和插件，重启后再进行真实终端交互验收。
+源码构建或发布成功不代表已更新当前运行的宿主或已安装插件。实际使用前需同时更新宿主和插件，重启后再进行真实终端交互验收。
