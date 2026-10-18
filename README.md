@@ -20,6 +20,9 @@ The workspace also includes local-first workflow packages: `rpi-todo`
 (`todo`), `rpi-goal` (`goal`, a Codex-style persistent, context-injected
 objective per project), `rpi-plan-mode` (`/plan`, `plan_mode_start`,
 `plan_mode_complete`),
+`rpi-btw` (`/btw`, independent read-only side questions that do not interrupt
+or enter the main conversation; requires the SideQuestion-capable host — see
+[usage and local build](packages/rpi-btw/README.md)),
 `rpi-codegraph` (`codegraph`),
 `rpi-ask-user`, `rpi-permissions`,
 `rpi-websearch`, `rpi-webfetch`, plus `rpi-im-message` (`im_message_server`), plus
