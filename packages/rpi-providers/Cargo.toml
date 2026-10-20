@@ -21,8 +21,8 @@ crate-type = ["cdylib", "rlib"]
 # Keep all three dependencies on the same reviewed core revision. Do not change
 # the SDK used by unrelated extensions in this workspace.
 [dependencies]
-rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "a711da68981d20540a67e1411cd9aac0f9f0138b", features = ["providers"] }
-rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", rev = "a711da68981d20540a67e1411cd9aac0f9f0138b", features = ["provider"] }
+rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "5f3a552ef12b03266f83cd99c97ed9ac2d0e6f6b", features = ["providers"] }
+rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", rev = "5f3a552ef12b03266f83cd99c97ed9ac2d0e6f6b", features = ["provider"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +30,6 @@ reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
 
 [dev-dependencies]
-rpi-extensions = { git = "https://github.com/bigfish1913/pi-rust", rev = "a711da68981d20540a67e1411cd9aac0f9f0138b" }
+rpi-extensions = { git = "https://github.com/bigfish1913/pi-rust", rev = "5f3a552ef12b03266f83cd99c97ed9ac2d0e6f6b" }
 tokio = { workspace = true, features = ["macros", "net", "io-util"] }
 tempfile = "3"
