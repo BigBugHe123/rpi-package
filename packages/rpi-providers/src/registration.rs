@@ -7,7 +7,7 @@ macro_rules! register_provider {
             _: *mut std::ffi::c_void,
         ) -> i32 {
             unsafe {
-                rpi_provider_runtime::drive(
+                rpi_plugin_sdk::provider::drive(
                     $factory,
                     req,
                     None,
@@ -28,11 +28,11 @@ macro_rules! register_provider {
             out: *mut rpi_plugin_sdk::StbString,
             _: *mut std::ffi::c_void,
         ) -> i32 {
-            unsafe { rpi_provider_runtime::drive($factory, req, emit, data, control, out) }
+            unsafe { rpi_plugin_sdk::provider::drive($factory, req, emit, data, control, out) }
         }
 
         pub(crate) fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
-            rpi_provider_runtime::register(api, $id, $base, $api, $manifest, request, stream)
+            rpi_plugin_sdk::provider::register(api, $id, $base, $api, $manifest, request, stream)
         }
     };
 }

@@ -143,7 +143,7 @@ impl Provider for LlamaCppProvider {
         if options.api_key.is_none() {
             options.api_key = self.config.api_key.clone();
         }
-        rpi_provider_runtime::completions(&model, &options, true)
+        rpi_plugin_sdk::provider::completions(&model, &options, true)
             .stream_simple(&model, context, &options)
             .await
     }

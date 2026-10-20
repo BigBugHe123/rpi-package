@@ -135,7 +135,7 @@ impl Provider for DeepSeekProvider {
         if options.api_key.is_none() {
             options.api_key = self.api_key.clone();
         }
-        let protocol = rpi_provider_runtime::completions(&model, &options, false);
+        let protocol = rpi_plugin_sdk::provider::completions(&model, &options, false);
         protocol.stream_simple(&model, context, &options).await
     }
 }
