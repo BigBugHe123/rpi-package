@@ -17,8 +17,8 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 ## 安装、升级与迁移
 
-当前依赖固定到 pi-rust 的 provider-package 实现提交，需要使用
-[`feature-stream-porider` 分支宿主](https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider)。
+当前依赖固定到 pi-rust 中包含 SDK `provider` feature 的实现提交，宿主按
+`packages/rpi-providers/Cargo.toml` 中同一 `rev` 构建。
 相关核心依赖发布前，本包设置 `publish = false`，不发布到 crates.io；预编译包通过 GitHub Release 分发，其他扩展的 SDK 依赖不变。
 
 安装预编译包（需要上述兼容宿主）：
@@ -61,7 +61,7 @@ rpi --provider proxy --model default --base-url http://localhost:8080/v1
 
 ```text
 src/lib.rs             # 唯一 export_plugin! 入口，登记所有模块
-src/registration.rs    # 各模块共用 ABI 适配，复用 rpi-provider-runtime
+src/registration.rs    # 各模块共用 ABI 适配，复用 rpi_plugin_sdk::provider
 src/deepseek.rs        # DeepSeek 目录、思考和工具续轮
 src/openrouter.rs      # OpenRouter 目录及 HTTP-Referer / X-Title
 src/llama_cpp/         # 本地推理、模型查询、服务管理
@@ -73,6 +73,9 @@ src/bin/rpi-llama.rs   # 原有本地服务管理程序
 对应模型 / 认证策略。不新增供应商 crate，不重复导出插件入口，不修改 CLI 的供应商表。
 包内模块使用 `register_provider!` 生成请求适配，只有根模块调用一次 `export_plugin!`。
 通用协议与 ABI 桥接留在核心库中，供应商策略留在本包。
+桥接使用 `rpi-plugin-sdk` 的可选 `provider` feature，不再依赖独立的
+`rpi-provider-runtime` crate；多供应商共用 `provider::register` 和 `provider::drive`，
+OpenAI-compatible 协议复用 `provider::completions`。
 
 llama.cpp 管理命令保持原有行为，构建入口改为：
 

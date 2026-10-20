@@ -49,7 +49,7 @@ impl Provider for OpenRouterProvider {
                 headers.insert(name.into(), value.into());
             }
         }
-        rpi_provider_runtime::completions(model, &options, false)
+        rpi_plugin_sdk::provider::completions(model, &options, false)
             .stream_simple(model, context, &options)
             .await
     }

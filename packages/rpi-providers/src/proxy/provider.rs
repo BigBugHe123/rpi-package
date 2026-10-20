@@ -150,7 +150,7 @@ impl Provider for ProxyProvider {
                     .or_insert_with(|| value.clone());
             }
         }
-        rpi_provider_runtime::completions(&model, &options, true)
+        rpi_plugin_sdk::provider::completions(&model, &options, true)
             .stream_simple(&model, context, &options)
             .await
     }
