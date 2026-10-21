@@ -146,6 +146,7 @@ pub(crate) async fn run_until(
         .route("/api/v1/health", get(health))
         .route("/api/v1/capabilities", get(capabilities))
         .route("/api/v1/projects", get(list_projects).post(create_project))
+        .route("/api/v1/project-folders", get(list_project_folders))
         .route("/api/v1/projects/{id}/files", get(project_files))
         .route("/api/v1/projects/{id}/file", get(project_file))
         .route("/api/v1/projects/{id}/git/status", get(project_status))
@@ -313,6 +314,18 @@ async fn list_projects(State(state): State<AppState>) -> Json<Value> {
     Json(
         json!({"projects":projects.entries, "defaultProjectId":state.default_project_id,"projectsRoot":projects.root.to_string_lossy().trim_start_matches(r"\\?\")}),
     )
+}
+
+async fn list_project_folders(State(state): State<AppState>) -> workspace::Reply {
+    let root = state.projects.read().await.root.clone();
+    let folders = workspace::child_directories(&root).await?;
+    Ok(Json(json!({
+        "root": root.to_string_lossy().trim_start_matches(r"\\?\"),
+        "folders": folders
+            .into_iter()
+            .map(|(name, path)| json!({"name": name, "path": path}))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 async fn project_by_id(state: &AppState, id: &str) -> Result<Project, (StatusCode, Json<Value>)> {

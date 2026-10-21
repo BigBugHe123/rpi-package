@@ -260,6 +260,10 @@ export const api = {
       defaultProjectId: string;
       projectsRoot?: string;
     }>("/projects"),
+  projectFolders: () =>
+    request<{ root: string; folders: { name: string; path: string }[] }>(
+      "/project-folders",
+    ),
   createProject: (name: string, initGit: boolean, path?: string) =>
     request<{ project: Project }>("/projects", {
       method: "POST",

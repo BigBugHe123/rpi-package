@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-21
+
+### Added
+
+- Advertise ACP Session Config Options — a `model` and a `thought_level` selector — so clients (e.g. Zed) can offer a model picker, and implement `session/set_config_option` to switch model or thinking level without reconnecting.
+- Advertise `logout` and `session/delete`, implementing both: log out the default provider, and tear down a session's backend plus its persisted files.
+
+### Fixed
+
+- Forward the host's `--model` / `--provider` flags to the spawned `rpi --mode rpc` child so a Zed `args: ["--acp", "--model", "gateway/model"]` actually selects that model for the session.
+
 ## [0.1.10] - 2026-10-21
 
 ### Fixed

@@ -118,7 +118,29 @@ export function ProjectDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState<Project | null>(null);
+  const [folders, setFolders] = useState<{ name: string; path: string }[]>([]);
+  const [foldersLoading, setFoldersLoading] = useState(false);
   const mounted = useMountedFlag();
+  useEffect(() => {
+    if (mode !== "open") return;
+    let cancelled = false;
+    setFoldersLoading(true);
+    api
+      .projectFolders()
+      .then((result) => {
+        if (!cancelled) setFolders(result.folders);
+      })
+      .catch((cause) => {
+        if (!cancelled)
+          setError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => {
+        if (!cancelled) setFoldersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || !name.trim() || (mode === "open" && !path.trim())) return;
@@ -197,19 +219,37 @@ export function ProjectDialog({
         {mode === "open" ? (
           <>
             <label htmlFor="project-path">
-              {zh ? "目录路径" : "Folder path"}
+              {zh ? "选择文件夹" : "Choose a folder"}
             </label>
-            <input
+            <select
               id="project-path"
               value={path}
               onChange={(event) => setPath(event.target.value)}
-              placeholder={root}
               required
-              disabled={busy || !!created}
-            />
+              disabled={busy || !!created || foldersLoading}
+            >
+              <option value="" disabled>
+                {foldersLoading
+                  ? zh
+                    ? "加载中…"
+                    : "Loading…"
+                  : folders.length
+                    ? zh
+                      ? "选择一个文件夹"
+                      : "Select a folder"
+                    : zh
+                      ? "没有可用的文件夹"
+                      : "No folders available"}
+              </option>
+              {folders.map((folder) => (
+                <option key={folder.path} value={folder.path}>
+                  {folder.name}
+                </option>
+              ))}
+            </select>
             <p className="form-hint">
               {zh
-                ? "选择项目目录中的已有文件夹："
+                ? "在以下目录中选择已有文件夹："
                 : "Choose an existing folder inside:"}{" "}
               <code>{root}</code>
             </p>

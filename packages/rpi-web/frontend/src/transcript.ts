@@ -129,6 +129,254 @@ export function stopToolTimers(rows: Row[]): Row[] {
   );
 }
 
+const SHELL_TOOLS = new Set([
+  "bash",
+  "shell",
+  "sh",
+  "zsh",
+  "run_command",
+  "exec",
+  "powershell",
+  "pwsh",
+]);
+
+/** Shell tools render as a command card instead of a generic JSON call. */
+export function isShellTool(name: string): boolean {
+  return SHELL_TOOLS.has(name.trim().toLowerCase());
+}
+
+const COMMAND_KEYS = ["command", "cmd", "script"] as const;
+const COMMAND_KEY_SET = new Set<string>(COMMAND_KEYS);
+
+/** Split shell arguments into the command line and its scalar extras. */
+export function shellCommand(args: unknown): {
+  command: string;
+  meta: string;
+} {
+  if (typeof args === "string") return { command: args.trim(), meta: "" };
+  if (!args || typeof args !== "object" || Array.isArray(args))
+    return { command: "", meta: "" };
+  const record = args as Record<string, unknown>;
+  let command = "";
+  for (const key of COMMAND_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      command = value;
+      break;
+    }
+  }
+  const meta = Object.entries(record)
+    .filter(
+      ([key, value]) =>
+        !COMMAND_KEY_SET.has(key) &&
+        (typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean") &&
+        String(value).trim().length > 0,
+    )
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" · ");
+  return { command, meta };
+}
+
+const ANSI_ESCAPE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+/** Terminal output is plain text: drop colour codes and normalise newlines. */
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE, "").replace(/\r\n/g, "\n");
+}
+
+function blocksToText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((block) =>
+      block && typeof block === "object"
+        ? String((block as Record<string, unknown>).text ?? "")
+        : typeof block === "string"
+          ? block
+          : "",
+    )
+    .filter((text) => text.length > 0)
+    .join("\n");
+}
+
+/** Shell results are text or `{stdout, stderr}` objects, not JSON payloads. */
+export function shellOutput(result: unknown): string {
+  if (result === undefined || result === null) return "";
+  let text = "";
+  if (typeof result === "string") {
+    text = result;
+  } else if (typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    const streams = [record.stdout, record.stderr].filter(
+      (value): value is string => typeof value === "string" && !!value.trim(),
+    );
+    if (streams.length > 0) {
+      text = streams.join("\n");
+    } else if (Array.isArray(record.content)) {
+      text = blocksToText(record.content);
+    } else {
+      for (const key of ["output", "text", "result"]) {
+        const value = record[key];
+        if (typeof value === "string" && value.trim()) {
+          text = value;
+          break;
+        }
+      }
+      if (!text.trim()) {
+        try {
+          text = JSON.stringify(result, null, 2);
+        } catch {
+          text = String(result);
+        }
+      }
+    }
+  } else {
+    text = String(result);
+  }
+  const cleaned = stripAnsi(text).replace(/\n+$/, "");
+  return cleaned.trim().length > 0 ? cleaned : "";
+}
+
+export interface PlanInfo {
+  plan: string;
+  outline: string[];
+  active: boolean;
+}
+
+function outlineFromMarkdown(plan: string): string[] {
+  const lines = plan.split("\n");
+  const list: string[] = [];
+  const headings: string[] = [];
+  for (const line of lines) {
+    const item = line.match(/^\s*(?:[-*+]\s+|\d+\.\s+)(.+)$/);
+    if (item) list.push(item[1].trim());
+    const heading = line.match(/^\s*#{1,3}\s+(.+)$/);
+    if (heading) headings.push(heading[1].trim());
+    if (list.length >= 10) break;
+  }
+  return (list.length > 0 ? list : headings).slice(0, 10);
+}
+
+/** Extract a structured plan from a `plan` tool call or its result. */
+export function planInfo(args: unknown, result: unknown): PlanInfo | null {
+  let plan = "";
+  let outline: string[] = [];
+  let active = false;
+  const read = (value: unknown) =>
+    value && typeof value === "object"
+      ? (value as Record<string, unknown>)
+      : null;
+  const res = read(result);
+  const details = res?.details;
+  if (details && typeof details === "object") {
+    const record = details as Record<string, unknown>;
+    if (record.kind === "plan") {
+      if (typeof record.plan === "string") plan = record.plan;
+      if (Array.isArray(record.outline))
+        outline = record.outline.filter(
+          (item): item is string => typeof item === "string",
+        );
+      active = record.active === true;
+    }
+  }
+  if (!plan && res && Array.isArray(res.content)) {
+    plan = blocksToText(res.content);
+  }
+  if (!plan && typeof result === "string") plan = result;
+  if (!plan) {
+    const argObj = read(args);
+    if (argObj && typeof argObj.plan === "string") plan = argObj.plan;
+  }
+  if (!plan.trim()) return null;
+  if (outline.length === 0) outline = outlineFromMarkdown(plan);
+  return { plan, outline, active };
+}
+
+export interface TodoItem {
+  text: string;
+  done: boolean;
+}
+
+/** Parse the `todo` tool's `[x] #id: text` list into a checklist. */
+export function todoItems(result: unknown): TodoItem[] | null {
+  let text = "";
+  if (typeof result === "string") text = result;
+  else if (result && typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.content)) text = blocksToText(record.content);
+    else if (typeof record.text === "string") text = record.text;
+  }
+  if (!text.trim()) return null;
+  const items: TodoItem[] = [];
+  let matched = 0;
+  for (const line of text.split("\n")) {
+    const match = line.match(
+      /^\s*\[([\u2713\u2714xX\u2022 ])\]\s*(?:#\d+:\s*)?(.+)$/,
+    );
+    if (match) {
+      const mark = match[1];
+      items.push({
+        done: /[\u2713\u2714xX]/.test(mark),
+        text: match[2].trim(),
+      });
+      matched++;
+    }
+  }
+  return matched > 0 ? items : null;
+}
+
+export interface EditInfo {
+  path: string;
+  edits: { oldText: string; newText: string }[];
+}
+
+function stringField(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** Extract `edit`/`write` tool arguments into a diff-shaped view. */
+export function editInfo(name: string, args: unknown): EditInfo | null {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const record = args as Record<string, unknown>;
+  const path = stringField(record.path ?? record.filePath);
+
+  if (name === "write") {
+    const content = stringField(record.content);
+    if (!content) return null;
+    return { path, edits: [{ oldText: "", newText: content }] };
+  }
+
+  if (name !== "edit") return null;
+  const edits: { oldText: string; newText: string }[] = [];
+  if (Array.isArray(record.edits)) {
+    for (const edit of record.edits) {
+      if (!edit || typeof edit !== "object") continue;
+      const item = edit as Record<string, unknown>;
+      edits.push({
+        oldText: stringField(item.oldText),
+        newText: stringField(item.newText),
+      });
+    }
+  } else if (
+    typeof record.oldText === "string" ||
+    typeof record.newText === "string"
+  ) {
+    edits.push({
+      oldText: stringField(record.oldText),
+      newText: stringField(record.newText),
+    });
+  }
+  if (!path && edits.length === 0) return null;
+  return { path, edits };
+}
+
+/** Heuristic for tool results that are prose worth rendering as Markdown. */
+export function isMarkdownText(text: string): boolean {
+  if (/\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)/.test(text)) return true;
+  return /(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+\.\s|```|>\s|\|.*\|)/.test(text);
+}
+
 export type ToolStatus = "pending" | "running" | "done" | "error";
 
 export type Row =

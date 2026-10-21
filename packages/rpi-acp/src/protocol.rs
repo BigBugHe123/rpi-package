@@ -257,7 +257,8 @@ pub fn initialize_result() -> Value {
         "agentCapabilities": {
             "_meta": {"pi-rust/questions": 1},
             "loadSession": true,
-            "sessionCapabilities": {"resume": {}},
+            "auth": {"logout": {}},
+            "sessionCapabilities": {"resume": {}, "delete": {}},
             "promptCapabilities": {
                 // `--mode rpc` takes a single text prompt; no multimodal input.
                 "image": false,
@@ -400,8 +401,13 @@ pub async fn run(
                     .respond(&id, initialize_result_for(terminal_auth))
                     .await;
             }
-            // No auth methods are advertised, but tolerate a stray call.
+            // `authenticate` is not advertised (we use terminal auth), but tolerate
+            // a stray call.
             (Some(id), Some("authenticate")) => writer.respond(&id, json!({})).await,
+            (Some(id), Some("logout")) => match crate::auth::logout() {
+                Ok(()) => writer.respond(&id, json!({})).await,
+                Err(error) => writer.respond_error(&id, -32603, &error).await,
+            },
             (Some(id), Some("session/new")) => {
                 let cwd = message
                     .pointer("/params/cwd")
@@ -410,9 +416,13 @@ pub async fn run(
                     .to_string();
                 let session_id = uuid::Uuid::new_v4().to_string();
                 match open_session(&session_id, PathBuf::from(&cwd), None).await {
-                    Ok((session, _)) => {
+                    Ok((session, state)) => {
+                        let mut result = json!({"sessionId": session_id});
+                        if let Ok(config) = config_options_for(&session, &state).await {
+                            result["configOptions"] = config["configOptions"].clone();
+                        }
                         sessions.lock().await.insert(session_id.clone(), session);
-                        writer.respond(&id, json!({"sessionId": session_id})).await;
+                        writer.respond(&id, result).await;
                     }
                     Err(error) => writer.session_error(&id, "session/new", &error).await,
                 }
@@ -483,6 +493,10 @@ pub async fn run(
                         };
                         match updates {
                             Ok(updates) => {
+                                let mut result = json!({});
+                                if let Ok(config) = config_options_for(&session, &state).await {
+                                    result["configOptions"] = config["configOptions"].clone();
+                                }
                                 sessions.lock().await.insert(session_id.to_owned(), session);
                                 for update in updates {
                                     writer
@@ -492,7 +506,7 @@ pub async fn run(
                                         )
                                         .await;
                                 }
-                                writer.respond(&id, json!({})).await;
+                                writer.respond(&id, result).await;
                             }
                             Err(error) => {
                                 // Keep an already attached backend alive on a replay error.
@@ -504,6 +518,97 @@ pub async fn run(
                         }
                     }
                     Err(error) => writer.session_error(&id, method, &error).await,
+                }
+            }
+            (Some(id), Some("session/set_config_option")) => {
+                let session_id = message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let config_id = message
+                    .pointer("/params/configId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let value = message
+                    .pointer("/params/value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let session = sessions.lock().await.get(&session_id).cloned();
+                match session {
+                    Some(session) => {
+                        let applied: Result<(), String> = match config_id.as_str() {
+                            "model" => match value.as_str() {
+                                Some(selected) => {
+                                    let (provider, model_id) = split_model_value(selected);
+                                    session.set_model(model_id, provider).await
+                                }
+                                None => Err("model value must be a string".to_string()),
+                            },
+                            "thinking" => match value.as_str() {
+                                Some(level) => session.set_thinking_level(level).await,
+                                None => Err("thinking value must be a string".to_string()),
+                            },
+                            other => Err(format!("unknown config option: {other}")),
+                        };
+                        match applied {
+                            Ok(()) => {
+                                // ACP requires the complete configuration state in
+                                // the response, reflecting the just-applied value.
+                                // Read it without the prompt lock so a switch can
+                                // also complete while a run is in progress.
+                                match session.state_unlocked().await {
+                                    Ok(state) => match config_options_for(&session, &state).await {
+                                        Ok(config) => writer.respond(&id, config).await,
+                                        Err(error) => {
+                                            writer
+                                                .session_error(
+                                                    &id,
+                                                    "session/set_config_option",
+                                                    &error,
+                                                )
+                                                .await
+                                        }
+                                    },
+                                    Err(error) => {
+                                        writer
+                                            .session_error(&id, "session/set_config_option", &error)
+                                            .await
+                                    }
+                                }
+                            }
+                            Err(error) => writer.respond_error(&id, -32602, &error).await,
+                        }
+                    }
+                    None => writer.respond_error(&id, -32602, "unknown sessionId").await,
+                }
+            }
+            (Some(id), Some("session/delete")) => {
+                let session_id = message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // Detach a live backend first, then drop its persisted files.
+                // Deleting is idempotent: a session that is no longer running
+                // (or was never saved) still answers successfully.
+                if let Some(session) = sessions.lock().await.remove(&session_id) {
+                    session.kill().await;
+                }
+                match crate::history::session_directory(&session_id) {
+                    Ok(directory) => match std::fs::remove_dir_all(&directory) {
+                        Ok(()) => writer.respond(&id, json!({})).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            writer.respond(&id, json!({})).await
+                        }
+                        Err(error) => {
+                            writer
+                                .respond_error(&id, -32603, &format!("delete session: {error}"))
+                                .await
+                        }
+                    },
+                    Err(error) => writer.respond_error(&id, -32602, &error).await,
                 }
             }
             (Some(id), Some(other)) => {
@@ -545,6 +650,110 @@ pub async fn run(
     // is what a client's "transport closed" actually corresponds to.
     diagln!("[rpi-acp] server stopping ({reason}, exit {exit_code})");
     exit_code
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Split a `provider/model` config value back into its two parts. A value
+/// without a slash is treated as a bare model id.
+fn split_model_value(value: &str) -> (Option<&str>, &str) {
+    match value.split_once('/') {
+        Some((provider, model_id)) if !provider.is_empty() && !model_id.is_empty() => {
+            (Some(provider), model_id)
+        }
+        _ => (None, value),
+    }
+}
+
+/// Map rpi's `get_available_models` + `get_available_thinking_levels` output and
+/// the current `get_state` onto ACP v1 Session Config Options: a `model`
+/// selector and a `thought_level` selector.
+fn config_options(models: &Value, thinking: &Value, state: &Value) -> Value {
+    let current_model_id = state.get("modelId").and_then(Value::as_str).unwrap_or("");
+    let current_provider = state.get("provider").and_then(Value::as_str).unwrap_or("");
+    let current_thinking = state
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .unwrap_or("medium");
+
+    let model_options: Vec<Value> = models
+        .as_array()
+        .map(|array| {
+            array
+                .iter()
+                .map(|model| {
+                    let id = model.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
+                    let provider = model.get("provider").and_then(Value::as_str).unwrap_or("");
+                    let context = model
+                        .get("contextWindow")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    // `provider/id` keeps same-named models distinct; `set_model`
+                    // splits it back apart before forwarding.
+                    let value = format!("{provider}/{id}");
+                    let description = if context > 0 {
+                        format!("{provider} · {context} tokens")
+                    } else {
+                        provider.to_string()
+                    };
+                    json!({ "value": value, "name": name, "description": description })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let thinking_options: Vec<Value> = thinking
+        .as_array()
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|level| {
+                    level
+                        .as_str()
+                        .map(|level| json!({ "value": level, "name": capitalize(level) }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut options = Vec::new();
+    if !model_options.is_empty() {
+        options.push(json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": format!("{current_provider}/{current_model_id}"),
+            "options": model_options,
+        }));
+    }
+    if !thinking_options.is_empty() {
+        options.push(json!({
+            "id": "thinking",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": current_thinking,
+            "options": thinking_options,
+        }));
+    }
+    json!({ "configOptions": options })
+}
+
+/// Fetch the child's model catalog and thinking levels, then build the ACP
+/// `configOptions` object. `state` is the `get_state` result already held by
+/// the caller, so it is not re-read here.
+async fn config_options_for(session: &Arc<Session>, state: &Value) -> Result<Value, String> {
+    let models = session.available_models().await?;
+    let thinking = session.available_thinking_levels().await?;
+    Ok(config_options(&models, &thinking, state))
 }
 
 async fn open_session(
@@ -593,8 +802,13 @@ mod tests {
         let result = initialize_result();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        assert_eq!(result["agentCapabilities"]["auth"]["logout"], json!({}));
         assert_eq!(
             result["agentCapabilities"]["sessionCapabilities"]["resume"],
+            json!({})
+        );
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["delete"],
             json!({})
         );
         assert_eq!(
@@ -691,5 +905,66 @@ mod tests {
             serde_json::from_value(json!({"type":"image","data":"...","mimeType":"image/png"}))
                 .unwrap();
         assert!(matches!(image, ContentBlock::Other));
+    }
+
+    #[test]
+    fn split_model_value_splits_provider_and_id() {
+        assert_eq!(
+            split_model_value("anthropic/claude-sonnet-5"),
+            (Some("anthropic"), "claude-sonnet-5")
+        );
+        assert_eq!(split_model_value("claude"), (None, "claude"));
+        assert_eq!(split_model_value("a/b/c"), (Some("a"), "b/c"));
+        // Malformed values fall back to a bare model id.
+        assert_eq!(split_model_value("a/"), (None, "a/"));
+        assert_eq!(split_model_value("/"), (None, "/"));
+    }
+
+    #[test]
+    fn config_options_maps_models_and_thinking() {
+        let models = json!({
+            "models": [
+                {"id": "sonnet", "name": "Claude Sonnet", "provider": "anthropic",
+                 "contextWindow": 200000},
+                {"id": "opus", "name": "Claude Opus", "provider": "anthropic",
+                 "contextWindow": 200000},
+            ]
+        });
+        let thinking = json!(["off", "medium", "high"]);
+        let state = json!({"modelId": "sonnet", "provider": "anthropic", "thinkingLevel": "high"});
+
+        let config = config_options(&models["models"], &thinking, &state);
+        let options = config["configOptions"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+
+        let model = &options[0];
+        assert_eq!(model["id"], "model");
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["type"], "select");
+        assert_eq!(model["currentValue"], "anthropic/sonnet");
+        let model_options = model["options"].as_array().unwrap();
+        assert_eq!(model_options.len(), 2);
+        assert_eq!(model_options[0]["value"], "anthropic/sonnet");
+        assert_eq!(model_options[0]["name"], "Claude Sonnet");
+        assert_eq!(model_options[0]["description"], "anthropic · 200000 tokens");
+
+        let thinking_option = &options[1];
+        assert_eq!(thinking_option["id"], "thinking");
+        assert_eq!(thinking_option["category"], "thought_level");
+        assert_eq!(thinking_option["currentValue"], "high");
+        let thinking_options = thinking_option["options"].as_array().unwrap();
+        assert_eq!(thinking_options.len(), 3);
+        assert_eq!(thinking_options[0]["value"], "off");
+        assert_eq!(thinking_options[0]["name"], "Off");
+    }
+
+    #[test]
+    fn config_options_omits_empty_groups() {
+        let config = config_options(
+            &json!([]),
+            &json!([]),
+            &json!({"modelId": "x", "provider": "y"}),
+        );
+        assert_eq!(config["configOptions"].as_array().unwrap().len(), 0);
     }
 }

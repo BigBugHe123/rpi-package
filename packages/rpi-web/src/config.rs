@@ -11,10 +11,35 @@ pub const HELP: &str = "rpi-web [--config PATH] [--init]
        [--add-project PATH]... [--projects-root PATH] [--assets PATH]
        [--session-dir PATH] [--registry PATH] [--version]
 
-Reads ~/.rpi/web.json, then <startup-project>/.rpi/web.json.
+Reads ~/.rpi/agent/web.json ($RPI_CODING_AGENT_DIR/web.json), then
+<startup-project>/.rpi/web.json. A legacy ~/.rpi/web.json is read first and
+overridden by the agent-dir file.
 --config loads only the specified file. CLI options override file settings.
 --init creates a project config without overwriting an existing file.
 Paths in JSON are relative to the config file; a bare rpiBin uses PATH.";
+
+pub const AGENT_DIR_ENV: &str = "RPI_CODING_AGENT_DIR";
+
+/// Preferred global configuration: `<agent dir>/web.json`, where the agent dir
+/// is `$RPI_CODING_AGENT_DIR` or `~/.rpi/agent`, matching the host layout.
+pub fn global_config_path(agent_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    agent_dir
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|home| home.join(".rpi/agent")))
+        .map(|dir| dir.join("web.json"))
+}
+
+/// Global configs in load order, lowest precedence first: the legacy
+/// `~/.rpi/web.json`, then the preferred `<agent dir>/web.json`.
+fn global_config_paths(agent_dir: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = home
+        .map(|home| home.join(".rpi/web.json"))
+        .into_iter()
+        .collect();
+    paths.extend(global_config_path(agent_dir, home));
+    paths.dedup();
+    paths
+}
 
 #[derive(Debug)]
 pub enum Launch {
@@ -123,13 +148,27 @@ pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, Strin
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from);
-    configure(args, &cwd, home.as_deref())
+    let agent_dir = std::env::var_os(AGENT_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    configure_with_agent(args, &cwd, home.as_deref(), agent_dir.as_deref())
 }
 
+#[cfg(test)]
 fn configure(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
     home: Option<&Path>,
+    agent_dir: Option<&Path>,
+) -> Result<Launch, String> {
+    configure_with_agent(args, cwd, home, agent_dir)
+}
+
+fn configure_with_agent(
+    args: impl IntoIterator<Item = String>,
+    cwd: &Path,
+    home: Option<&Path>,
+    agent_dir: Option<&Path>,
 ) -> Result<Launch, String> {
     let mut args = args.into_iter();
     let mut cli = FileConfig::default();
@@ -242,8 +281,7 @@ fn configure(
     if let Some(path) = explicit {
         load(&path, &mut config, true)?;
     } else {
-        if let Some(home) = home {
-            let global = home.join(".rpi/web.json");
+        for global in global_config_paths(agent_dir, home) {
             if global != local {
                 load(&global, &mut config, false)?;
             }
@@ -293,6 +331,7 @@ mod tests {
                 args.iter().map(|s| s.to_string()),
                 &self.0.join("work"),
                 Some(&self.0.join("home")),
+                Some(&self.0.join("home/.rpi/agent")),
             )
         }
         fn run(&self, args: &[&str]) -> AppConfig {
@@ -343,14 +382,14 @@ mod tests {
     fn layers_files_and_cli_with_paths_bound_to_each_file() {
         let f = Fixture::new();
         f.write(
-            "home/.rpi/web.json",
+            "home/.rpi/agent/web.json",
             r#"{"port":3100,"assets":"ui","rpiBin":"rpi","projects":["global-repo"]}"#,
         );
         f.write("work/.rpi/web.json", "\u{feff}{\"port\":3200,\"project\":\"..\",\"projectsRoot\":\"managed\",\"sessionDir\":\"history\",\"registry\":\"state/sessions.json\",\"allowedHosts\":[\" example.test \"],\"projects\":[\"local-repo\"]}");
         let local = f.run(&[]);
         assert_eq!(local.port, 3200);
         assert_eq!(local.project, f.0.join("work/.rpi/.."));
-        assert_eq!(local.assets, Some(f.0.join("home/.rpi/ui")));
+        assert_eq!(local.assets, Some(f.0.join("home/.rpi/agent/ui")));
         assert_eq!(local.projects_root, Some(f.0.join("work/.rpi/managed")));
         assert_eq!(local.session_dir, Some(f.0.join("work/.rpi/history")));
         assert_eq!(local.registry, f.0.join("work/.rpi/state/sessions.json"));
@@ -388,6 +427,21 @@ mod tests {
             assert_eq!(config.project, f.0.join("work/repo"));
             assert_eq!(config.assets, Some(f.0.join("work/repo/.rpi/ui")));
         }
+    }
+
+    #[test]
+    fn agent_dir_config_is_the_default_global_and_overrides_the_legacy_file() {
+        let f = Fixture::new();
+        f.write("home/.rpi/web.json", r#"{"port":3100,"bind":"0.0.0.0"}"#);
+        let legacy = f.run(&[]);
+        assert_eq!(legacy.port, 3100);
+        assert_eq!(legacy.bind, "0.0.0.0");
+        f.write("home/.rpi/agent/web.json", r#"{"port":3150}"#);
+        let layered = f.run(&[]);
+        assert_eq!(layered.port, 3150);
+        assert_eq!(layered.bind, "0.0.0.0");
+        // A host `--port` (forwarded as `--port N`) wins over every file.
+        assert_eq!(f.run(&["--port", "3031"]).port, 3031);
     }
 
     #[test]

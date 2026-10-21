@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import {
   useCallback,
   useEffect,
@@ -6,11 +7,14 @@ import {
   useState,
   type FormEvent,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import {
   AlertTriangle,
   ArrowUp,
   Bot,
+  Check,
+  ClipboardList,
   CircleStop,
   ChevronDown,
   Code2,
@@ -32,7 +36,9 @@ import {
   Settings2,
   ShieldCheck,
   Sparkles,
+  SquarePen,
   Sun,
+  Terminal,
   Wrench,
   X,
 } from "lucide-react";
@@ -77,6 +83,16 @@ import {
   withoutPrefix,
   eventsAfterSnapshot,
   toolTiming,
+  isShellTool,
+  shellCommand,
+  shellOutput,
+  planInfo,
+  todoItems,
+  editInfo,
+  isMarkdownText,
+  type PlanInfo,
+  type TodoItem,
+  type EditInfo,
   elapsedMs,
   stopToolTimers,
   type ToolTiming,
@@ -259,6 +275,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
+  const localMessageSeq = useRef(0);
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
   const diagnosticsRevision = useRef(0);
@@ -312,6 +329,8 @@ export default function App() {
   const [mutationPending, setMutationPending] = useState(false);
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [levels, setLevels] = useState<string[]>([]);
+  const [modelPending, setModelPending] = useState(false);
+  const [thinkingPending, setThinkingPending] = useState(false);
   const [language, setLanguage] = useState<Language>(() => detectLanguage());
   const [dialog, setDialog] = useState<UiDialog | null>(null);
   const dialogRequests = useRef(new Map<string, UiDialog>());
@@ -1381,6 +1400,49 @@ export default function App() {
     setRows((previous) => [...previous, { kind: "note", id, text }]);
   }
 
+  async function selectModel(entry: ModelDescriptor) {
+    if (!sessionId || modelPending) return;
+    setModelPending(true);
+    setError("");
+    try {
+      await commandData(sessionId, "set_model", {
+        modelId: entry.id,
+        provider: entry.provider,
+      });
+      const state = await api.runtimeState(sessionId);
+      setRuntime(state);
+      note(
+        language === "zh"
+          ? `模型 → ${entry.name} (${entry.provider})`
+          : `Model → ${entry.name} (${entry.provider})`,
+      );
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setModelPending(false);
+    }
+  }
+
+  async function selectThinkingLevel(level: string) {
+    if (!sessionId || thinkingPending) return;
+    setThinkingPending(true);
+    setError("");
+    try {
+      await commandData(sessionId, "set_thinking_level", { level });
+      const state = await api.runtimeState(sessionId);
+      setRuntime(state);
+      note(
+        language === "zh"
+          ? `思考深度 → ${valueLabel(language, level)}`
+          : `Thinking level → ${level}`,
+      );
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setThinkingPending(false);
+    }
+  }
+
   /**
    * Slash commands are a browser-side affordance over the same RPC commands the
    * Runtime panel uses; nothing here reaches the model as a prompt.
@@ -1541,7 +1603,7 @@ export default function App() {
     draftBySession.current.delete(sessionId);
     setError("");
     setInterrupted(false);
-    const key = `local-${crypto.randomUUID()}`;
+    const key = `local-${++localMessageSeq.current}`;
     if (!wasBusy)
       setRows((previous) => [
         ...previous,
@@ -2306,30 +2368,29 @@ export default function App() {
             </div>
           </div>
           <div className="toolbar-actions">
-            {runtime?.modelId && (
-              <button
-                className="badge"
-                onClick={() => {
-                  setPanel(true);
-                  setInspector(false);
-                }}
-                title={t("changeModel")}
-              >
-                <Cpu size={12} /> {runtime.modelId}
-              </button>
+            {supported.has("set_model") && (
+              <ModelPicker
+                language={language}
+                runtime={runtime}
+                models={models}
+                supported={supported}
+                pending={modelPending}
+                className="badge selectable"
+                icon={<Cpu size={12} />}
+                onSelect={(entry) => void selectModel(entry)}
+              />
             )}
-            {normalizeLevel(runtime?.thinkingLevel) && (
-              <button
-                className="badge"
-                onClick={() => {
-                  setPanel(true);
-                  setInspector(false);
-                }}
-                title={t("changeThinking")}
-              >
-                <Gauge size={12} />{" "}
-                {valueLabel(language, normalizeLevel(runtime?.thinkingLevel))}
-              </button>
+            {supported.has("set_thinking_level") && (
+              <ThinkingPicker
+                language={language}
+                runtime={runtime}
+                levels={levels}
+                supported={supported}
+                pending={thinkingPending}
+                className="badge selectable"
+                icon={<Gauge size={12} />}
+                onSelect={(level) => void selectThinkingLevel(level)}
+              />
             )}
             <span
               className={`connection ${status === "error" ? "offline" : ""}`}
@@ -2596,34 +2657,25 @@ export default function App() {
                     >
                       <Folder size={12} /> {project?.name ?? t("workspace")}
                     </button>
-                    {runtime?.modelId && (
-                      <button
-                        type="button"
-                        className="composer-model"
-                        onClick={() => {
-                          setPanel(true);
-                          setInspector(false);
-                        }}
-                      >
-                        <span>{runtime.modelId}</span>
-                        <ChevronDown size={11} />
-                      </button>
+                    {supported.has("set_model") && (
+                      <ModelPicker
+                        language={language}
+                        runtime={runtime}
+                        models={models}
+                        supported={supported}
+                        pending={modelPending}
+                        onSelect={(entry) => void selectModel(entry)}
+                      />
                     )}
-                    {normalizeLevel(runtime?.thinkingLevel) && (
-                      <button
-                        type="button"
-                        className="composer-thinking"
-                        onClick={() => {
-                          setPanel(true);
-                          setInspector(false);
-                        }}
-                      >
-                        {valueLabel(
-                          language,
-                          normalizeLevel(runtime?.thinkingLevel),
-                        )}
-                        <ChevronDown size={11} />
-                      </button>
+                    {supported.has("set_thinking_level") && (
+                      <ThinkingPicker
+                        language={language}
+                        runtime={runtime}
+                        levels={levels}
+                        supported={supported}
+                        pending={thinkingPending}
+                        onSelect={(level) => void selectThinkingLevel(level)}
+                      />
                     )}
                     {busy && (
                       <span className="composer-queue-hint">
@@ -3241,6 +3293,237 @@ function DialogOverlay({
   );
 }
 
+function groupModels(models: ModelDescriptor[]): [string, ModelDescriptor[]][] {
+  const order: string[] = [];
+  const map = new Map<string, ModelDescriptor[]>();
+  for (const model of models) {
+    const list = map.get(model.provider);
+    if (list) list.push(model);
+    else {
+      order.push(model.provider);
+      map.set(model.provider, [model]);
+    }
+  }
+  return order.map((provider) => [provider, map.get(provider) ?? []]);
+}
+
+function Dropdown({
+  label,
+  className,
+  disabled = false,
+  align = "start",
+  trigger,
+  children,
+}: {
+  label: string;
+  className?: string;
+  disabled?: boolean;
+  align?: "start" | "end";
+  trigger: ReactNode;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const anchor = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState({ top: 0, left: 0, width: 220 });
+  useEffect(() => {
+    if (!open) return;
+    const closeOnPointer = (event: PointerEvent) => {
+      const target = event.target as Element;
+      if (
+        !target.closest("[data-dropdown]") &&
+        !target.closest(".dropdown-popover")
+      )
+        setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    const closeOnScroll = () => setOpen(false);
+    document.addEventListener("pointerdown", closeOnPointer);
+    document.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnScroll);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointer);
+      document.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnScroll);
+    };
+  }, [open]);
+  function toggle() {
+    if (disabled) return;
+    if (!open && anchor.current) {
+      const box = anchor.current.getBoundingClientRect();
+      const width = Math.max(box.width, 224);
+      const left = align === "end" ? box.right - width : box.left;
+      setPosition({
+        top: Math.max(8, Math.min(box.bottom + 6, window.innerHeight - 220)),
+        left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+        width,
+      });
+    }
+    setOpen((value) => !value);
+  }
+  return (
+    <div className="dropdown-anchor" data-dropdown ref={anchor}>
+      <button
+        type="button"
+        className={className}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={label}
+        title={label}
+        disabled={disabled}
+        onClick={toggle}
+      >
+        {trigger}
+      </button>
+      {open &&
+        createPortal(
+          <div
+            className="dropdown-popover"
+            role="listbox"
+            aria-label={label}
+            style={{
+              position: "fixed",
+              top: position.top,
+              left: position.left,
+              width: position.width,
+            }}
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+function ModelPicker({
+  language,
+  runtime,
+  models,
+  supported,
+  pending,
+  className = "composer-model",
+  icon,
+  onSelect,
+}: {
+  language: Language;
+  runtime: RuntimeState | null;
+  models: ModelDescriptor[];
+  supported: Set<string>;
+  pending: boolean;
+  className?: string;
+  icon?: ReactNode;
+  onSelect: (model: ModelDescriptor) => void;
+}) {
+  const t = (key: MessageKey) => translate(language, key);
+  const currentKey = runtime?.modelId
+    ? modelKey({ id: runtime.modelId, provider: runtime.provider })
+    : "";
+  const current = models.find((entry) => modelKey(entry) === currentKey);
+  return (
+    <Dropdown
+      label={t("chooseModel")}
+      className={className}
+      disabled={!supported.has("set_model") || pending || models.length === 0}
+      trigger={
+        <>
+          {icon}
+          <span>{current?.name ?? runtime?.modelId ?? t("model")}</span>
+          <ChevronDown size={11} />
+        </>
+      }
+    >
+      {models.length === 0 ? (
+        <p className="dropdown-empty muted">{t("noModels")}</p>
+      ) : (
+        groupModels(models).map(([provider, entries]) => (
+          <div className="dropdown-group" key={provider}>
+            <div className="dropdown-group-label">{provider}</div>
+            {entries.map((entry) => {
+              const key = modelKey(entry);
+              const selected = key === currentKey;
+              return (
+                <button
+                  key={key}
+                  role="option"
+                  aria-selected={selected}
+                  className="dropdown-item"
+                  onClick={() => onSelect(entry)}
+                >
+                  <span>{entry.name}</span>
+                  {selected && <Check size={13} />}
+                </button>
+              );
+            })}
+          </div>
+        ))
+      )}
+    </Dropdown>
+  );
+}
+
+function ThinkingPicker({
+  language,
+  runtime,
+  levels,
+  supported,
+  pending,
+  className = "composer-thinking",
+  icon,
+  onSelect,
+}: {
+  language: Language;
+  runtime: RuntimeState | null;
+  levels: string[];
+  supported: Set<string>;
+  pending: boolean;
+  className?: string;
+  icon?: ReactNode;
+  onSelect: (level: string) => void;
+}) {
+  const t = (key: MessageKey) => translate(language, key);
+  const current = normalizeLevel(runtime?.thinkingLevel);
+  return (
+    <Dropdown
+      label={t("chooseThinking")}
+      className={className}
+      disabled={
+        !supported.has("set_thinking_level") || pending || levels.length === 0
+      }
+      trigger={
+        <>
+          {icon}
+          <span>
+            {current ? valueLabel(language, current) : t("thinkingLevel")}
+          </span>
+          <ChevronDown size={11} />
+        </>
+      }
+    >
+      {levels.length === 0 ? (
+        <p className="dropdown-empty muted">{t("noModels")}</p>
+      ) : (
+        levels.map((level) => {
+          const selected = level === current;
+          return (
+            <button
+              key={level}
+              role="option"
+              aria-selected={selected}
+              className="dropdown-item"
+              onClick={() => onSelect(level)}
+            >
+              <span>{valueLabel(language, level)}</span>
+              {selected && <Check size={13} />}
+            </button>
+          );
+        })
+      )}
+    </Dropdown>
+  );
+}
+
 function RowView({ row, language }: { row: Row; language: Language }) {
   const t = (key: MessageKey) => translate(language, key);
   if (row.kind === "note") {
@@ -3280,7 +3563,16 @@ function RowView({ row, language }: { row: Row; language: Language }) {
   }
 
   if (row.kind === "tool") {
-    const detail = row.result ?? row.args;
+    const plan = row.name === "plan" ? planInfo(row.args, row.result) : null;
+    if (plan) return <PlanCard plan={plan} language={language} />;
+    const todos = row.name === "todo" ? todoItems(row.result) : null;
+    if (todos) return <TodoCard items={todos} language={language} />;
+    if (isShellTool(row.name))
+      return <ShellCard row={row} language={language} />;
+    const edits = editInfo(row.name, row.args);
+    if (edits) return <EditCard row={row} edits={edits} language={language} />;
+    const resultText = typeof row.result === "string" ? row.result : null;
+    const showArgs = row.result === undefined && row.args !== undefined;
     return (
       <details
         className={`tool-card tool-${row.status} ${row.status === "error" ? "failed" : ""}`}
@@ -3297,19 +3589,22 @@ function RowView({ row, language }: { row: Row; language: Language }) {
           </span>
         </summary>
         <div className="tool-detail">
-          {row.args !== undefined && (
+          {showArgs ? (
             <>
               <h4>{t("input")}</h4>
               <pre>{safeJson(row.args)}</pre>
             </>
+          ) : resultText !== null ? (
+            isMarkdownText(resultText) ? (
+              <MarkdownBody text={resultText} language={language} />
+            ) : (
+              <pre className="tool-result-pre">{resultText}</pre>
+            )
+          ) : row.result !== undefined ? (
+            <pre>{safeJson(row.result)}</pre>
+          ) : (
+            <pre className="muted">{t("noOutput")}</pre>
           )}
-          {row.result !== undefined && (
-            <>
-              <h4>{t("result")}</h4>
-              <pre>{safeJson(row.result)}</pre>
-            </>
-          )}
-          {detail === undefined && <pre className="muted">{t("noOutput")}</pre>}
         </div>
       </details>
     );
@@ -3333,6 +3628,234 @@ function RowView({ row, language }: { row: Row; language: Language }) {
         </div>
       )}
     </article>
+  );
+}
+
+function PlanCard({ plan, language }: { plan: PlanInfo; language: Language }) {
+  const t = (key: MessageKey) => translate(language, key);
+  return (
+    <details className="tool-card plan-card" open={plan.active}>
+      <summary>
+        <ClipboardList size={14} />
+        <strong>{t("plan")}</strong>
+        <span className={`tool-status ${plan.active ? "" : "done"}`}>
+          {plan.active ? t("planActive") : t("planDone")}
+        </span>
+      </summary>
+      <div className="tool-detail plan-detail">
+        {plan.outline.length > 0 && (
+          <ol className="plan-outline">
+            {plan.outline.map((step, index) => (
+              <li key={`${index}-${step.slice(0, 16)}`}>
+                <span className="plan-outline-index">{index + 1}</span>
+                <span>{step}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+        <MarkdownBody text={plan.plan} language={language} />
+      </div>
+    </details>
+  );
+}
+
+function TodoCard({
+  items,
+  language,
+}: {
+  items: TodoItem[];
+  language: Language;
+}) {
+  const t = (key: MessageKey, values?: Record<string, string | number>) =>
+    translate(language, key, values);
+  const done = items.filter((item) => item.done).length;
+  return (
+    <details className="tool-card todo-card" open>
+      <summary>
+        <ListTodo size={14} />
+        <strong>{t("todos")}</strong>
+        <span className="tool-status">
+          {t("todoDone", { done, total: items.length })}
+        </span>
+      </summary>
+      <div className="tool-detail todo-detail">
+        <ul className="todo-list">
+          {items.map((item, index) => (
+            <li
+              key={`${index}-${item.text.slice(0, 16)}`}
+              className={item.done ? "done" : ""}
+            >
+              <span className="todo-check" aria-hidden="true">
+                {item.done ? <Check size={12} /> : null}
+              </span>
+              <span>{item.text}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </details>
+  );
+}
+
+function EditCard({
+  row,
+  edits,
+  language,
+}: {
+  row: ToolRow;
+  edits: EditInfo;
+  language: Language;
+}) {
+  return (
+    <details
+      className={`tool-card edit-card tool-${row.status} ${row.status === "error" ? "failed" : ""}`}
+      open={row.status === "error"}
+    >
+      <summary>
+        <SquarePen size={14} />
+        <code className="shell-command" title={edits.path || row.name}>
+          {edits.path || row.name}
+        </code>
+        {row.timing && <ToolElapsed timing={row.timing} language={language} />}
+        <span className="tool-status">
+          {toolStatusLabel(row.status, language)}
+        </span>
+      </summary>
+      <div className="tool-detail edit-detail">
+        {edits.path && <div className="edit-path">{edits.path}</div>}
+        {edits.edits.map((edit, index) => {
+          const oldLines = edit.oldText ? edit.oldText.split("\n") : [];
+          const newLines = edit.newText ? edit.newText.split("\n") : [];
+          return (
+            <div
+              className="edit-hunk"
+              key={`${index}-${edit.oldText.slice(0, 12)}-${edit.newText.slice(0, 12)}`}
+            >
+              {oldLines.map((line, lineIndex) => (
+                <div className="edit-line remove" key={`o-${lineIndex}`}>
+                  <span className="edit-marker" aria-hidden="true">
+                    -
+                  </span>
+                  <code>{line || " "}</code>
+                </div>
+              ))}
+              {newLines.map((line, lineIndex) => (
+                <div className="edit-line add" key={`n-${lineIndex}`}>
+                  <span className="edit-marker" aria-hidden="true">
+                    +
+                  </span>
+                  <code>{line || " "}</code>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+        {typeof row.result === "string" && row.result.trim() && (
+          <div className="edit-result">{row.result}</div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ShellCard({ row, language }: { row: ToolRow; language: Language }) {
+  const t = (key: MessageKey) => translate(language, key);
+  const { command, meta } = shellCommand(row.args);
+  const output = shellOutput(row.result);
+  const resultObj =
+    row.result && typeof row.result === "object" && !Array.isArray(row.result)
+      ? (row.result as Record<string, unknown>)
+      : null;
+  const exitCode =
+    resultObj && typeof resultObj.exitCode === "number"
+      ? String(resultObj.exitCode)
+      : resultObj && typeof resultObj.code === "number"
+        ? String(resultObj.code)
+        : "";
+  const hasStderr =
+    resultObj &&
+    typeof resultObj.stderr === "string" &&
+    !!resultObj.stderr.trim();
+  const isPowerShell = /powershell|pwsh/i.test(row.name);
+  const metaParts = [
+    meta,
+    exitCode ? `exit ${exitCode}` : "",
+    hasStderr ? "stderr" : "",
+  ].filter(Boolean);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  async function copyCommand() {
+    if (!command) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be denied; the command stays selectable.
+    }
+  }
+  return (
+    <details
+      className={`tool-card shell-card tool-${row.status} ${row.status === "error" ? "failed" : ""}`}
+      open={row.status === "error"}
+    >
+      <summary>
+        <Terminal size={14} />
+        <span className="shell-summary-prompt" aria-hidden="true">
+          {isPowerShell ? "PS" : "$"}
+        </span>
+        <code className="shell-command" title={command || row.name}>
+          {command ? command.replace(/\s+/g, " ").trim() : row.name}
+        </code>
+        {row.timing && <ToolElapsed timing={row.timing} language={language} />}
+        <span className="tool-status">
+          {toolStatusLabel(row.status, language)}
+        </span>
+      </summary>
+      <div className="tool-detail shell-detail">
+        <div className="shell-window">
+          <div className="shell-titlebar">
+            <span className="shell-dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+            <span className="shell-title">{row.name}</span>
+            {command && (
+              <button
+                type="button"
+                className="shell-copy"
+                onClick={() => void copyCommand()}
+              >
+                {copied ? <Check size={12} /> : <Copy size={12} />}
+                {copied ? t("copied") : t("copyCommand")}
+              </button>
+            )}
+          </div>
+          <div className="shell-body">
+            {command && (
+              <pre className="shell-input">
+                <span className="shell-prompt" aria-hidden="true">
+                  {isPowerShell ? "PS> " : "$ "}
+                </span>
+                <code>{command}</code>
+              </pre>
+            )}
+            {output ? (
+              <pre className="shell-output">{output}</pre>
+            ) : (
+              <pre className="shell-empty muted">{t("noOutput")}</pre>
+            )}
+          </div>
+        </div>
+        {metaParts.length > 0 && (
+          <p className="shell-meta">{metaParts.join(" · ")}</p>
+        )}
+      </div>
+    </details>
   );
 }
 

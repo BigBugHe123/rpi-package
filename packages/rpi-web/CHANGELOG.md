@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-21
+
+### Changed
+
+- Render shell tool calls as terminal cards: the command stays on one summary line with the elapsed time, the full command is shown with a copy button, and output is displayed as cleaned plain text (ANSI colours removed) instead of JSON. Long commands and output stay contained on narrow screens.
+
+### Added
+
+- Accept `rpi --web --port N` and `rpi --web --bind ADDR`: the extension reads the host's parsed CLI flags and applies them after every configuration file, matching the standalone `--port` / `--bind` behavior.
+- Read global Web settings from `~/.rpi/agent/web.json`, honoring `RPI_CODING_AGENT_DIR`, so Web configuration lives beside the host's other agent files. A legacy `~/.rpi/web.json` is still read first and overridden by the agent-dir file.
+
 ## [0.1.4](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.3...rpi-web-v0.1.4) - 2026-10-21
 
 ### Added

@@ -773,13 +773,13 @@ code {
   margin: auto;
 }
 .message {
-  padding: 0 0 29px;
+  padding: 0 0 24px;
 }
 .message-heading {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-bottom: 13px;
+  margin-bottom: 10px;
 }
 .message-heading strong {
   font-size: 12px;
@@ -861,15 +861,22 @@ details[open] > summary:before {
 }
 .tool-card {
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--soft);
-  margin: 8px 0 12px;
+  border-radius: 10px;
+  background: transparent;
+  margin: 0 0 14px;
   max-width: 100%;
   overflow: hidden;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s;
+}
+.tool-card:hover,
+.tool-card[open] {
+  background: var(--soft);
 }
 .tool-card > summary {
-  padding: 4px 12px;
-  min-height: 40px;
+  padding: 3px 11px;
+  min-height: 36px;
   gap: 8px;
   color: var(--muted);
 }
@@ -879,13 +886,14 @@ details[open] > summary:before {
   font-weight: 500;
   color: var(--text);
 }
-.shell-card > summary code {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  min-width: 0;
+.shell-card > summary code.shell-command {
   flex: 1;
-}
-.shell-card .tool-status {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--mono);
+  font-size: 12px;
   color: var(--text);
 }
 .tool-status {
@@ -919,6 +927,259 @@ details[open] > summary:before {
   margin: 0;
   color: var(--text);
   padding: 4px;
+}
+.tool-card pre.tool-result-pre {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.tool-detail .prose {
+  font-size: 13px;
+  line-height: 1.75;
+}
+/* Shell commands render as a terminal window: title bar, prompt line, output. */
+.shell-detail {
+  padding-top: 10px;
+}
+.shell-summary-prompt {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--green);
+  flex-shrink: 0;
+}
+.shell-window {
+  border: 1px solid #262732;
+  border-radius: 9px;
+  overflow: hidden;
+  background: #1d1e26;
+  color: #e7e8f0;
+}
+.shell-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  background: #262732;
+  border-bottom: 1px solid #30313d;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #a7abc0;
+}
+.shell-dots {
+  display: inline-flex;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.shell-dots i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.shell-dots i:nth-child(1) {
+  background: #ff5f57;
+}
+.shell-dots i:nth-child(2) {
+  background: #febc2e;
+}
+.shell-dots i:nth-child(3) {
+  background: #28c840;
+}
+.shell-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shell-body {
+  padding: 9px 12px 11px;
+  display: grid;
+  gap: 8px;
+}
+.shell-card .shell-window .shell-input,
+.shell-card .shell-window .shell-output {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 340px;
+  overflow: auto;
+  margin: 0;
+  color: #e7e8f0;
+}
+.shell-input {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.shell-window .shell-prompt {
+  color: #57d364;
+  user-select: none;
+  flex-shrink: 0;
+}
+.shell-window .shell-copy {
+  border: 1px solid #3a3b48;
+  background: #2c2d3a;
+  color: #c3c6d8;
+}
+.shell-window .shell-copy:hover:not(:disabled) {
+  color: #fff;
+  background: #353646;
+}
+.shell-empty {
+  color: #8a8fa5;
+  font-family: inherit;
+  font-size: 12px;
+  margin: 0;
+}
+.shell-meta {
+  margin: 7px 0 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+/* Plan and todo activities render as structured, read-only checklists. */
+.plan-detail,
+.todo-detail {
+  padding-top: 10px;
+}
+.plan-card .tool-status {
+  color: var(--blue-text);
+}
+.plan-card .tool-status.done {
+  color: var(--green);
+}
+.plan-outline {
+  margin: 0 0 12px;
+  padding: 10px 12px 10px 12px;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.plan-outline li {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.plan-outline-index {
+  flex: 0 0 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  transform: translateY(-1px);
+}
+.todo-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.todo-list li {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 7px 9px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.todo-list li.done {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+.todo-check {
+  flex: 0 0 18px;
+  height: 18px;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--green);
+}
+/* Edit/write tools render as a file diff instead of a JSON dump. */
+.edit-detail {
+  padding-top: 10px;
+}
+.edit-path {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.edit-hunk {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.edit-hunk + .edit-hunk {
+  margin-top: 8px;
+}
+.edit-line {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  padding: 1px 9px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.edit-line code {
+  font-family: inherit;
+  min-width: 0;
+}
+.edit-line.remove {
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+.edit-line.add {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+.edit-marker {
+  flex: 0 0 12px;
+  font-weight: 700;
+  user-select: none;
+  font-family: var(--mono);
+}
+.edit-line.remove .edit-marker {
+  color: var(--danger);
+}
+.edit-line.add .edit-marker {
+  color: var(--green);
+}
+.edit-result {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
 }
 .working-indicator {
   max-width: 760px;
@@ -1038,6 +1299,87 @@ details[open] > summary:before {
   box-shadow: var(--shadow);
   padding: 5px;
   min-width: 178px;
+}
+/* Inline model / thinking pickers anchored in the toolbar and composer. */
+.dropdown-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.dropdown-anchor > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  min-width: 0;
+}
+.dropdown-anchor > button > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dropdown-popover {
+  z-index: 60;
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  box-shadow: var(--shadow);
+  padding: 5px;
+  box-sizing: border-box;
+}
+.dropdown-group + .dropdown-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.dropdown-group-label {
+  padding: 6px 9px 3px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.dropdown-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.dropdown-item:hover,
+.dropdown-item:focus-visible {
+  background: var(--hover);
+}
+.dropdown-item[aria-selected="true"] {
+  color: var(--blue-text);
+  font-weight: 600;
+}
+.dropdown-item svg {
+  color: var(--blue-text);
+  flex-shrink: 0;
+}
+.dropdown-empty {
+  margin: 4px 6px;
+  font-size: 12px;
+}
+@media (max-width: 767px) {
+  .dropdown-anchor > button {
+    max-width: 150px;
+  }
+  .dropdown-popover {
+    max-width: calc(100vw - 16px);
+  }
 }
 .session-menu button,
 .session-menu a {
@@ -2085,21 +2427,28 @@ details[open] > summary:before {
   max-width: 760px;
   margin: 0 auto 14px;
   color: var(--muted);
+  border-radius: 9px;
 }
 .thinking-row > summary {
   color: var(--muted);
   font-size: 12px;
 }
+.thinking-row[open] {
+  background: var(--soft);
+  padding: 6px 12px 10px;
+}
 .thinking-row > .prose {
-  padding: 8px 0 8px 16px;
+  padding: 4px 0 0 8px;
   border-left: 2px solid var(--line);
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.75;
   white-space: pre-wrap;
 }
 .transcript-note {
   max-width: 760px;
   margin: 0 auto 14px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
   font-size: 11px;
   letter-spacing: 0.2px;
 }
