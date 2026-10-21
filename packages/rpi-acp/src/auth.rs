@@ -162,6 +162,27 @@ fn login(provider: &str) -> Result<i32, String> {
     Ok(status.code().unwrap_or(1))
 }
 
+/// `rpi auth logout` for the default provider — backs ACP's `logout` method.
+///
+/// Logs out the provider `--setup` configures by default. An OAuth provider
+/// first revokes its remote token through its OAuth extension; a plain API key
+/// is simply removed from `auth.json`.
+pub fn logout() -> Result<(), String> {
+    let status = std::process::Command::new(crate::session::resolve_rpi_executable())
+        .arg("auth")
+        .arg("logout")
+        .status()
+        .map_err(|error| format!("spawn `rpi auth logout`: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`rpi auth logout` exited {}",
+            status.code().unwrap_or(1)
+        ))
+    }
+}
+
 /// What `rpi auth check` reported about the provider.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {

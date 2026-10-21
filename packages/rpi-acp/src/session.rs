@@ -48,6 +48,37 @@ fn configure_permission_gate(command: &mut Command, bypass: bool, no_auto_gate: 
     }
 }
 
+/// Read `--model` / `--provider` from this process's own argv. A Zed launch
+/// such as `rpi --acp --model gateway/model` carries the model in the host's
+/// command line; the child `rpi --mode rpc` does not inherit it automatically,
+/// so it is forwarded here. Supports both `--flag value` and `--flag=value`.
+fn forwarded_model_provider() -> (Option<String>, Option<String>) {
+    forwarded_model_provider_from(&std::env::args().collect::<Vec<_>>())
+}
+
+/// Parse `--model` / `--provider` from an argv slice (testable, no env access).
+fn forwarded_model_provider_from(args: &[String]) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut provider = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--model=") {
+            model = Some(value.to_string());
+        } else if arg == "--model" {
+            model = args.get(index + 1).cloned();
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--provider=") {
+            provider = Some(value.to_string());
+        } else if arg == "--provider" {
+            provider = args.get(index + 1).cloned();
+            index += 1;
+        }
+        index += 1;
+    }
+    (model, provider)
+}
+
 /// A live ACP session backed by one `rpi --mode rpc` child process.
 pub struct Session {
     /// The child process. `kill`-ed on shutdown.
@@ -96,6 +127,16 @@ impl Session {
             PERMISSION_BYPASS.load(Ordering::Acquire),
             env_flag("RPI_ACP_NO_PERMISSION_GATE"),
         );
+        // Seed the child with the model/provider the host was launched with, so
+        // a Zed `args: ["--acp", "--model", "gateway/model"]` actually applies
+        // to the session instead of silently falling back to the default model.
+        let (model, provider) = forwarded_model_provider();
+        if let Some(model) = model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(provider) = provider {
+            command.arg("--provider").arg(provider);
+        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("spawn `rpi --mode rpc`: {e}"))?;
@@ -210,6 +251,85 @@ impl Session {
         })
         .await
         .map_err(|_| "timed out waiting for rpi session startup".to_string())?
+    }
+
+    /// Send an RPC command and await its matching `response` object. Reads the
+    /// child's event stream on a fresh subscription, so it can run while a
+    /// prompt is active (the `id` filters out unrelated events).
+    async fn command(&self, kind: &str, mut params: Value) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let object = params
+            .as_object_mut()
+            .ok_or_else(|| format!("{kind}: params must be an object"))?;
+        object.insert("id".to_string(), json!(id));
+        object.insert("type".to_string(), json!(kind));
+        // Subscribe before sending: the child can answer before the next line
+        // runs, and `broadcast` drops events for subscribers that join late.
+        let mut events = self.events.subscribe();
+        self.send(params).await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .map_err(|e| format!("backend disconnected: {e}"))?;
+                if event["type"] == "session_end" {
+                    return Err(format!("rpi exited while running {kind}"));
+                }
+                if event["type"] == "response" && event["id"] == id {
+                    if event["success"] != true {
+                        return Err(format!(
+                            "{kind}: {}",
+                            event["error"].as_str().unwrap_or("invalid RPC response")
+                        ));
+                    }
+                    return Ok(event["data"].clone());
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("timed out waiting for {kind}"))?
+    }
+
+    /// The model catalog the child can switch to (`get_available_models`).
+    pub async fn available_models(&self) -> Result<Value, String> {
+        Ok(self.command("get_available_models", json!({})).await?["models"].clone())
+    }
+
+    /// Read the child's state without acquiring the prompt lock. Used by
+    /// `session/set_config_option`, which must also work while a prompt runs
+    /// (the locked [`Self::state`] would reject it).
+    pub async fn state_unlocked(&self) -> Result<Value, String> {
+        self.command("get_state", json!({})).await
+    }
+
+    /// Switch the child's active model (`set_model`).
+    pub async fn set_model(&self, model_id: &str, provider: Option<&str>) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("modelId".to_string(), json!(model_id));
+        if let Some(provider) = provider {
+            params.insert("provider".to_string(), json!(provider));
+        }
+        self.command("set_model", Value::Object(params)).await?;
+        Ok(())
+    }
+
+    /// The thinking levels the current model supports (`get_available_thinking_levels`).
+    pub async fn available_thinking_levels(&self) -> Result<Value, String> {
+        Ok(self
+            .command("get_available_thinking_levels", json!({}))
+            .await?["levels"]
+            .clone())
+    }
+
+    /// Switch the child's thinking level (`set_thinking_level`).
+    pub async fn set_thinking_level(&self, level: &str) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("level".to_string(), json!(level));
+        self.command("set_thinking_level", Value::Object(params))
+            .await?;
+        Ok(())
     }
 
     /// Ask the child to abort the current run (`session/cancel`).
@@ -1727,6 +1847,33 @@ mod tests {
         std::env::set_var("RPI_BIN", "C:/custom/rpi.exe");
         assert_eq!(resolve_rpi_executable(), PathBuf::from("C:/custom/rpi.exe"));
         std::env::remove_var("RPI_BIN");
+    }
+
+    #[test]
+    fn forwarded_model_provider_parses_both_forms() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            forwarded_model_provider_from(&args(&["--model", "gateway/model"])),
+            (Some("gateway/model".into()), None)
+        );
+        assert_eq!(
+            forwarded_model_provider_from(&args(&["--model=claude-sonnet-5"])),
+            (Some("claude-sonnet-5".into()), None)
+        );
+        assert_eq!(
+            forwarded_model_provider_from(&args(&["--provider", "openai"])),
+            (None, Some("openai".into()))
+        );
+        assert_eq!(
+            forwarded_model_provider_from(&args(&["--provider=anthropic", "--model", "opus"])),
+            (Some("opus".into()), Some("anthropic".into()))
+        );
+        // A trailing `--model` without a value is ignored, not taken from argv.
+        assert_eq!(
+            forwarded_model_provider_from(&args(&["--acp", "--model"])),
+            (None, None)
+        );
+        assert_eq!(forwarded_model_provider_from(&[]), (None, None));
     }
 
     #[test]

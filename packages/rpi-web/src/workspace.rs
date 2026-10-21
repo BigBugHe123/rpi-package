@@ -158,6 +158,42 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
     Ok(Json(json!({"path":relative,"entries":entries})))
 }
 
+/// Direct child directories of a root, for the "open an existing folder" picker.
+pub async fn child_directories(
+    root: &Path,
+) -> Result<Vec<(String, String)>, (StatusCode, Json<Value>)> {
+    let mut directory = tokio::fs::read_dir(root)
+        .await
+        .map_err(|_| failure(StatusCode::NOT_FOUND, "projects directory not found"))?;
+    let mut folders = Vec::new();
+    while let Some(entry) = directory
+        .next_entry()
+        .await
+        .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read projects directory"))?
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if hidden(&name) {
+            continue;
+        }
+        let kind = entry
+            .file_type()
+            .await
+            .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read file type"))?;
+        if kind.is_symlink() || !kind.is_dir() {
+            continue;
+        }
+        folders.push((name.clone(), name));
+        if folders.len() > 2000 {
+            return Err(failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "projects directory has too many folders",
+            ));
+        }
+    }
+    folders.sort_by_key(|a| a.0.to_lowercase());
+    Ok(folders)
+}
+
 pub async fn file(project: &Project, relative: &str) -> Reply {
     let path = resolve(&project.root, relative)?;
     // Reject devices/FIFOs before opening: opening one may otherwise block indefinitely.

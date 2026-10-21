@@ -1448,7 +1448,8 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   await page
     .getByRole("combobox", { name: "Language", exact: true })
     .selectOption("zh");
-  await expect(page.locator(".composer-thinking")).toHaveCount(0);
+  await expect(page.locator(".composer-thinking")).toHaveCount(1);
+  await expect(page.locator(".composer-thinking")).toContainText("思考深度");
   await expect(
     page.getByRole("combobox", { name: "思考深度", exact: true }),
   ).toBeEnabled();
@@ -3514,6 +3515,7 @@ for (const outcome of ["done", "error", "closed"] as const) {
       },
     );
     await page.goto("/");
+    await expect(page.locator(".shell-command")).toHaveText("sleep 1");
     const timer = page.locator(".tool-elapsed");
     await expect(timer).toBeVisible();
     const first = await timer.innerText();
@@ -3524,11 +3526,17 @@ for (const outcome of ["done", "error", "closed"] as const) {
       page.locator(`.tool-card.tool-${outcome === "done" ? "done" : "error"}`),
     ).toBeVisible();
     if (outcome !== "closed") await expect(timer).toHaveText("1.2s");
+    if (outcome !== "closed") {
+      if (outcome !== "error")
+        await page.locator(".shell-card summary").click();
+      await expect(page.locator(".shell-output")).toHaveText("command output");
+    }
     const frozen = await timer.innerText();
     await page.waitForTimeout(350);
     await expect(timer).toHaveText(frozen);
     await page.reload();
     await expect(timer).toHaveText("1.2s");
+    await expect(page.locator(".shell-command")).toHaveText("sleep 1");
     await page
       .getByRole("combobox", { name: "Language", exact: true })
       .selectOption("zh");
@@ -3541,6 +3549,67 @@ for (const outcome of ["done", "error", "closed"] as const) {
     ).toBe(true);
   });
 }
+
+test("bash card folds a multiline command into one line and strips ANSI output", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const command =
+    "set -e\nnpm test -- --runInBand --maxWorkers=2 --detectOpenHandles\nnpm run lint";
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "bash-card",
+                name: "bash",
+                arguments: { command, description: "Run tests" },
+              },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "bash-card",
+            toolName: "bash",
+            isError: false,
+            content: [
+              { type: "text", text: "\u001b[32mok\u001b[0m\n2 passing" },
+            ],
+          },
+        ],
+        lastSeq: 5,
+        events: [],
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".shell-command")).toHaveText(
+    "set -e npm test -- --runInBand --maxWorkers=2 --detectOpenHandles npm run lint",
+  );
+  await expect(page.locator(".shell-command")).toHaveCSS(
+    "text-overflow",
+    "ellipsis",
+  );
+  await expect(page.locator(".shell-meta")).toContainText(
+    "description=Run tests",
+  );
+  await page.locator(".shell-card summary").click();
+  await expect(page.locator(".shell-input")).toContainText("detectOpenHandles");
+  await expect(page.locator(".shell-output")).toHaveText("ok 2 passing");
+  await expect(page.locator(".tool-card")).not.toContainText("\u001b");
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
 
 test("initial snapshot preserves slash feedback entered while history is loading", async ({
   page,
@@ -3575,4 +3644,213 @@ test("initial snapshot preserves slash feedback entered while history is loading
   await expect(
     page.locator(".transcript-note").filter({ hasText: "/help" }),
   ).toBeVisible();
+});
+
+test("plan tool renders a structured outline and markdown body", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        lastSeq: 9,
+        events: [],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "plan-1",
+                name: "plan",
+                arguments: {
+                  plan: "# Plan\n\n- Step one\n- Step two\n\nDone.",
+                },
+              },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "plan-1",
+            toolName: "plan",
+            content: [
+              {
+                type: "text",
+                text: "# Plan\n\n- Step one\n- Step two\n\nDone.",
+              },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".plan-card")).toBeVisible();
+  await page.locator(".plan-card summary").click();
+  await expect(page.locator(".plan-outline li")).toHaveCount(2);
+  await expect(page.locator(".plan-outline")).toContainText("Step one");
+  await expect(page.locator(".plan-detail")).toContainText("Done.");
+});
+
+test("todo tool renders a read-only checklist with completion count", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        lastSeq: 9,
+        events: [],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "todo-1", name: "todo", arguments: {} },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "todo-1",
+            toolName: "todo",
+            content: [
+              {
+                type: "text",
+                text: "1/2 completed\n[✓] #0: First task\n[ ] #1: Second task",
+              },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".todo-card")).toBeVisible();
+  await expect(page.locator(".todo-list li")).toHaveCount(2);
+  await expect(page.locator(".todo-list li.done")).toHaveCount(1);
+  await expect(page.locator(".todo-card summary")).toContainText("1/2");
+});
+
+test("composer model picker groups by provider and applies the selection", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const catalog = [
+    { id: "alpha-id", name: "Model Alpha", provider: "alpha" },
+    { id: "beta-id", name: "Model Beta", provider: "beta" },
+  ];
+  let selected = { modelId: "alpha-id", provider: "alpha" };
+  const changes: unknown[] = [];
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_models",
+          "set_model",
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/sessions/*/commands", (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type === "get_available_models")
+      return route.fulfill({ json: response({ models: catalog }, body.type) });
+    if (body.type === "get_state")
+      return route.fulfill({ json: response(selected, body.type) });
+    if (body.type === "set_model") {
+      changes.push(body);
+      selected = { modelId: body.modelId, provider: body.provider };
+      return route.fulfill({ json: response({}, body.type) });
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+  await page.locator(".composer-model").click();
+  await expect(page.locator(".dropdown-popover")).toBeVisible();
+  await expect(page.locator(".dropdown-group-label")).toHaveText([
+    "alpha",
+    "beta",
+  ]);
+  await page
+    .locator(".dropdown-item")
+    .filter({ hasText: "Model Beta" })
+    .click();
+  await expect
+    .poll(() => changes)
+    .toEqual([
+      expect.objectContaining({ type: "set_model", provider: "beta" }),
+    ]);
+  await expect(page.locator(".composer-model")).toContainText("Model Beta");
+});
+
+test("edit tool renders a file diff and powershell renders as a terminal", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        lastSeq: 9,
+        events: [],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "edit-1",
+                name: "edit",
+                arguments: {
+                  path: "src/app.ts",
+                  edits: [{ oldText: "const a = 1;", newText: "const a = 2;" }],
+                },
+              },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "edit-1",
+            toolName: "edit",
+            content: [{ type: "text", text: "Edited src/app.ts" }],
+          },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "ps-1",
+                name: "powershell",
+                arguments: { command: "Get-ChildItem" },
+              },
+            ],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "ps-1",
+            toolName: "powershell",
+            content: [{ type: "text", text: "Mode  LastWriteTime  Name" }],
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".edit-card")).toBeVisible();
+  await page.locator(".edit-card summary").click();
+  await expect(page.locator(".edit-path")).toContainText("src/app.ts");
+  await expect(page.locator(".edit-line.remove")).toContainText("const a = 1;");
+  await expect(page.locator(".edit-line.add")).toContainText("const a = 2;");
+  await expect(page.locator(".shell-card")).toBeVisible();
+  await expect(page.locator(".shell-card .shell-command")).toHaveText(
+    "Get-ChildItem",
+  );
+  await page.locator(".shell-card summary").click();
+  await expect(page.locator(".shell-card .shell-prompt")).toHaveText("PS> ");
 });

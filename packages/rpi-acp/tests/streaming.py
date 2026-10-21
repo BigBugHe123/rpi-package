@@ -88,6 +88,10 @@ def backend():
             continue
         elif kind == "abort":
             continue
+        elif kind == "get_available_models":
+            result = dict(models=[])
+        elif kind == "get_available_thinking_levels":
+            result = dict(levels=[])
         else:
             raise AssertionError(command)
         emit(dict(type="response", id=command["id"], command=kind, success=True, data=result))

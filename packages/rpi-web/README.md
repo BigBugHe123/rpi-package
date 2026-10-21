@@ -30,6 +30,15 @@ Run the installation command from the `rpi-package` repository root, then start 
 
 Both entry points read the same `.rpi/web.json`. Use `rpi --web=/absolute/path/to/web.json` to select an explicit file, and `rpi --web=help` for help. Keep the host process running; Ctrl+C stops Web, closes streams and session children, and releases the listener. Saved transcripts remain available after restart. Choose one service entry point per process: `--web` cannot be combined with `--acp`, `--webui`, or `--server`.
 
+The host also forwards its own `--port` and `--bind` options to Web, so a one-off override needs no file edit:
+
+```bash
+rpi --web --port 3031
+rpi --web --port 3031 --bind 0.0.0.0
+```
+
+These values are applied after every configuration file, exactly like `rpi-web --port 3031 / --bind 0.0.0.0` for the standalone executable.
+
 After the listener binds successfully, the terminal shows a server status page:
 
 ```text
@@ -126,9 +135,9 @@ Edit the configuration when you need different paths or settings. For example, o
 
 Every field is optional. JSON paths are resolved relative to **the configuration file's directory**, so `"project": ".."` in a project's `.rpi/web.json` selects the project root. A bare `rpiBin` program name is found on PATH; a value containing a directory is resolved as a path. On Windows, use forward slashes such as `D:/Projects/...` to avoid JSON backslash escaping.
 
-Settings are applied in this order: built-in defaults → `~/.rpi/web.json` → the startup project's `.rpi/web.json` → command-line options. The startup project defaults to the current directory. With `--project PATH`, the project configuration is discovered in that directory; parent directories are not searched. Global settings suit a service managing several projects, while project settings suit starting from a project directory.
+Settings are applied in this order: built-in defaults → `~/.rpi/agent/web.json` (or `$RPI_CODING_AGENT_DIR/web.json`) → the startup project's `.rpi/web.json` → command-line options. A legacy `~/.rpi/web.json` is still read first, so an existing installation keeps working while the agent-dir file takes precedence. The startup project defaults to the current directory. With `--project PATH`, the project configuration is discovered in that directory; parent directories are not searched. Global settings suit a service managing several projects, while project settings suit starting from a project directory.
 
-Later fields replace earlier values. A project's `projects` array replaces the global list; CLI `--add-project` options append to the resulting list. For a temporary port change, use `rpi-web --port 3031`. If you configured `allowedHosts`, update its port entries as needed.
+Later fields replace earlier values. A project's `projects` array replaces the global list; CLI `--add-project` options append to the resulting list. For a temporary port change, use `rpi-web --port 3031` (standalone) or `rpi --web --port 3031` (extension). If you configured `allowedHosts`, update its port entries as needed.
 
 To load only a specific configuration file, followed by CLI overrides:
 
@@ -217,8 +226,8 @@ Run `rpi-web --help` to list options.
 | `--projects-root PATH` | `projects/` beside the registry; managed root for browser-created or added projects |
 | `--rpi-bin PATH` | `rpi` on PATH; an absolute executable path is recommended |
 | `--assets PATH` | Discover assets beside the executable or in the source tree; an absolute path to the complete frontend directory is recommended for deployment |
-| `--bind IP` | `127.0.0.1`; use `0.0.0.0` for LAN or container access |
-| `--port N` | `3030`; CLI overrides the configuration file |
+| `--bind IP` | `127.0.0.1`; use `0.0.0.0` for LAN or container access; `rpi --web --bind IP` works too |
+| `--port N` | `3030`; CLI (`rpi --web --port N` or `rpi-web --port N`) overrides every configuration file |
 | `--registry PATH` | `~/.rpi-web/sessions.json`; session index, titles, and organization metadata |
 | `--session-dir PATH` | Native host's default session store; override to select an explicit transcript directory |
 | `--version` / `-V` | Print the Web version |

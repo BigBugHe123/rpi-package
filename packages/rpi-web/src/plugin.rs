@@ -39,6 +39,37 @@ fn flag(name: &str) -> Option<Value> {
     action(RuntimeActionId::GetCliFlag, json!({"name":name})).and_then(|v| v.get("value").cloned())
 }
 
+/// A flag carrying a value: `--port 3031` and `--port=3031` both yield a string.
+fn flag_value(name: &str) -> Option<String> {
+    flag(name).and_then(flag_text)
+}
+
+/// Normalize a parsed host flag into the text form of a `--flag VALUE` option.
+fn flag_text(value: Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Append `--web` options the host CLI already parsed, so `rpi --web --port N`
+/// behaves like `rpi-web --port N` (CLI overrides every config file).
+fn append_service_flags(args: &mut Vec<String>) {
+    args.extend(service_options(flag_value("bind"), flag_value("port")));
+}
+
+fn service_options(bind: Option<String>, port: Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (name, value) in [("bind", bind), ("port", port)] {
+        if let Some(value) = value {
+            args.push(format!("--{name}"));
+            args.push(value);
+        }
+    }
+    args
+}
+
 fn enabled(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Bool(value)) => *value,
@@ -73,6 +104,8 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
         Some(Value::String(path)) => vec!["--config".into(), path],
         _ => vec![],
     };
+    let mut args = args;
+    append_service_flags(&mut args);
     let mut config = match config::from_args(args) {
         Ok(Launch::Run(config)) => *config,
         Ok(Launch::Initialized(path)) => {
@@ -157,6 +190,20 @@ fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     {
         return 1;
     }
+    if let Some(register_flag) = api.register_flag {
+        let _ = register_flag(
+            StbStringRef::from_str("port"),
+            StbStringRef::from_str(
+                "Web workspace listen port (overrides web.json), used with --web",
+            ),
+        );
+        let _ = register_flag(
+            StbStringRef::from_str("bind"),
+            StbStringRef::from_str(
+                "Web workspace listen address (overrides web.json), used with --web",
+            ),
+        );
+    }
     if !enabled(flag("web").as_ref()) {
         return 0;
     }
@@ -194,5 +241,24 @@ mod tests {
         for value in [json!(true), json!("init"), json!("/path/web.json")] {
             assert!(enabled(Some(&value)));
         }
+    }
+
+    #[test]
+    fn host_service_flags_become_web_options() {
+        assert_eq!(flag_text(json!("3031")).as_deref(), Some("3031"));
+        assert_eq!(flag_text(json!(3031)).as_deref(), Some("3031"));
+        assert_eq!(flag_text(json!(true)), None);
+        assert_eq!(flag_text(json!(null)), None);
+        assert_eq!(flag_text(json!("")), None);
+        let options = service_options(Some("0.0.0.0".into()), Some("3031".into()));
+        assert_eq!(options, ["--bind", "0.0.0.0", "--port", "3031"]);
+        // The forwarded options parse as ordinary Web CLI overrides.
+        let (bind, port) = match crate::config::from_args(options).unwrap() {
+            crate::config::Launch::Run(config) => (config.bind, config.port),
+            other => panic!("expected a run launch, got {other:?}"),
+        };
+        assert_eq!(bind, "0.0.0.0");
+        assert_eq!(port, 3031);
+        assert!(service_options(None, None).is_empty());
     }
 }

@@ -114,7 +114,8 @@ def check(command, env, cwd, store):
         try:
             client.request("initialize", {"protocolVersion": 1})
             result, updates = client.request(method, {"sessionId": session_id, "cwd": cwd, "mcpServers": []})
-            assert result.get("result") == {}, (result, "".join(client.errors))
+            # load/resume also return the session's configOptions (model + thinking).
+            assert "configOptions" in result.get("result", {}), (result, "".join(client.errors))
             if method == "session/load":
                 assert any(item.get("params", {}).get("update", {}).get("content", {}).get("text")
                            == "ACP_RESTART_HISTORY" for item in updates), updates
