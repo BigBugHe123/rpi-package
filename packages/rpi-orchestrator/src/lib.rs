@@ -18,6 +18,7 @@
 mod control;
 mod dispatch;
 mod graph;
+mod host;
 mod kit;
 mod plan;
 mod spawn;
@@ -122,7 +123,7 @@ crate::tool_entry!(subagent_tool, crate::subagent::subagent);
 crate::tool_entry!(plan_tool, crate::plan::plan);
 crate::tool_entry!(dispatch_tool, crate::dispatch::dispatch);
 
-const SUBAGENT_PARAMS: &str = r#"{"type":"object","properties":{"task":{"type":"string","maxLength":20000},"role":{"type":"string"},"provider":{"type":"string"},"model":{"type":"string"},"maxTurns":{"type":"integer","minimum":1,"maximum":32},"timeoutSeconds":{"type":"integer","minimum":10,"maximum":1800}},"required":["task"]}"#;
+const SUBAGENT_PARAMS: &str = r#"{"type":"object","properties":{"task":{"type":"string","maxLength":20000},"role":{"type":"string"},"provider":{"type":"string","description":"Leave empty to run on this session's provider (recommended). Only set it to a provider you know is authenticated for this machine; an unknown or unauthenticated provider fails the delegation with 'No API key'."},"model":{"type":"string","description":"Leave empty to run on this session's model. Only set it together with a `provider`, or when the model id is unique across providers."},"maxTurns":{"type":"integer","minimum":1,"maximum":32},"timeoutSeconds":{"type":"integer","minimum":10,"maximum":1800}},"required":["task"]}"#;
 
 const PLAN_PARAMS: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["set","update","show"]},"nodes":{"type":"array","description":"action=set: full node list. Each node: {id, task, deps?, role?, provider?, model?, maxTurns?, timeoutSeconds?, expectFile?, verify?}"},"addNodes":{"type":"array","description":"action=update: nodes to add (same node shape)"},"removeIds":{"type":"array","items":{"type":"string"},"description":"action=update: ids to remove"},"setDeps":{"type":"array","description":"action=update: [{id, deps}]"},"reset":{"type":"array","items":{"type":"string"},"description":"action=update: re-arm these ids to pending for another attempt"}},"required":["action"]}"#;
 
@@ -240,6 +241,10 @@ fn on_before_agent_start(event_json, out, _user_data) {
 }
 
 rpi_plugin_sdk::export_plugin!(|api| {
+    // Capture the host action bridge first: `subagent`/`dispatch` read this
+    // session's provider/model through it so a child inherits the parent binding
+    // instead of quietly resolving the default provider.
+    crate::host::install(api);
     if let Some(register_prompt) = api.register_before_agent_start {
         let _ = register_prompt(
             on_before_agent_start,
@@ -378,11 +383,11 @@ mod tests {
             &params,
             &control,
             &progress,
-            |graph, ready, parallel, control, progress| {
+            |graph, ready, parallel, control, progress, parent| {
                 // Cancel after dispatch marks the ready set running, but
                 // before run_wave starts its first chunk. No child may run.
                 control.cancel();
-                crate::dispatch::run_wave(graph, ready, parallel, control, progress)
+                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent)
             },
         )
         .unwrap();
@@ -403,7 +408,8 @@ mod tests {
                        ready: &[String],
                        _: usize,
                        _: &crate::control::Control,
-                       _: &crate::kit::Progress| {
+                       _: &crate::kit::Progress,
+                       _: &crate::host::Selection| {
             ready
                 .iter()
                 .map(|id| (id.clone(), Ok("fixture success".into())))
@@ -453,7 +459,7 @@ mod tests {
                 &wave_params,
                 &wave_control,
                 &std::sync::mpsc::channel().0,
-                |_, ready, _, _, _| {
+                |_, ready, _, _, _, _| {
                     ready
                         .iter()
                         .map(|id| (id.clone(), Ok("fixture result".into())))
