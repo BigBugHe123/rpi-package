@@ -1,4 +1,9 @@
 #![forbid(unsafe_code)]
+// The `export_plugin!` expansion exposes the raw-pointer ABI entrypoints the host
+// calls. Every other plugin crate in this workspace carries the same allow (see
+// rpi-acp, rpi-btw, rpi-subagents, rpi-ui-adapter); without it
+// `cargo clippy -p rpi-orchestrator` fails on the macro expansion alone.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 //! `rpi-orchestrator` — DAG subagent orchestration for the rpi Rust agent.
 //!
