@@ -289,7 +289,7 @@ async fn index(State(state): State<AppState>) -> Html<String> {
     let path = asset_root(&state.config).join("index.html");
     let html = tokio::fs::read_to_string(path)
         .await
-        .unwrap_or_else(|_| include_str!("../assets/index.html").to_string());
+        .unwrap_or_else(|_| crate::assets::index_html().to_string());
     Html(html)
 }
 

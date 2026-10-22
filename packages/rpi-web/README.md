@@ -291,7 +291,10 @@ From the `rpi-package` repository root, with a native host already installed or 
 cargo run --locked -p rpi-web -- --project /path/to/project --rpi-bin /path/to/rpi --assets packages/rpi-web/assets --port 3030
 ```
 
-Built frontend assets are committed to the repository. Install Node.js dependencies and rebuild only when changing the frontend, as described below.
+The frontend bundle in `assets/` is generated, not committed. Build it once with the
+frontend commands below before `cargo build` / `cargo run` if you want the embedded
+workspace; without it the server still compiles and serves a "frontend not built" page,
+and `--assets` can point at an existing bundle.
 
 ### API and capability discovery
 
@@ -435,7 +438,12 @@ npm run dev          # Vite on :3181, proxying /api to :3030
 npm run e2e:production # builds and runs browser regression against the actual production bundle
 ```
 
-`assets/` is generated output committed to the repository. Both entry points embed it during compilation, and the standalone server can also serve an external directory. Rebuild and commit it whenever `frontend/src` changes; rebuild the Rust library or executable to update its embedded frontend.
+`assets/` is generated output and is ignored by git; it is produced by `npm run build`
+and never edited by hand. Both entry points embed it during compilation, and the
+standalone server can also serve an external directory. Rebuild it after changing
+`frontend/src`, then rebuild the Rust library or executable to update the embedded
+frontend. Release pipelines rebuild the bundle themselves, so a fresh checkout only
+needs this step for local builds.
 
 ## Integration checks
 
