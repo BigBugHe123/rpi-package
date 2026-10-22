@@ -186,3 +186,55 @@
 .markdown-body > :last-child {
   margin-bottom: 0;
 }
+
+/* Keep fenced source blocks readable inside tool results as well as messages. */
+.markdown-body .markdown-code-block {
+  margin: 14px 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--soft);
+}
+.markdown-body .markdown-code-block pre {
+  margin: 0;
+  padding: 13px 15px;
+  overflow: auto;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre;
+  overflow-wrap: normal;
+  tab-size: 4;
+}
+.markdown-body .markdown-code-block pre code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: inherit;
+  line-height: inherit;
+  white-space: inherit;
+}
+.read-code {
+  min-width: 0;
+}
+.read-code-path {
+  max-width: 100%;
+  margin: 4px 4px 8px;
+  overflow: hidden;
+  color: var(--muted);
+  font: 11px/1.4 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.read-code .markdown-code-block {
+  margin: 0;
+}
+.read-code .markdown-code-heading {
+  text-transform: none;
+}
+.read-code .markdown-body > :last-child {
+  margin-bottom: 0;
+}

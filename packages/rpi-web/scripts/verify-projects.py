@@ -101,11 +101,14 @@ with tempfile.TemporaryDirectory(prefix='rpi-project-check-') as temporary:
                 assert error.code == 400
         assert len(request('/api/v1/sessions')['sessions']) == 1
         request(path + '/rename', {'title': 'Project task'})
-        request(path + '/metadata', {'pinned': True, 'archived': True})
+        request(path + '/metadata', {'pinned': True, 'archived': True, 'tags': ['backend', 'urgent', 'backend']})
+        tagged = request('/api/v1/sessions?tag=urgent')['sessions']
+        assert len(tagged) == 1 and tagged[0]['sessionId'] == sid and tagged[0]['tags'] == ['backend', 'urgent']
+        assert request('/api/v1/sessions?q=project%20task')['sessions'][0]['sessionId'] == sid
         item = next(s for s in request('/api/v1/sessions')['sessions'] if s['sessionId'] == sid)
         assert item['projectId'] == project['id'] and item['title'] == 'Project task'
         assert request(path)['title'] == 'Project task'
-        assert item['pinned'] and item['archived']
+        assert item['pinned'] and item['archived'] and item['tags'] == ['backend', 'urgent']
         assert request('/api/v1/projects/' + project['id'] + '/git/status')['isRepository']
         probe = request('/api/v1/sessions', {'projectId': project['id']})['sessionId']
         blocked = root / 'registry.json.tmp'

@@ -74,6 +74,7 @@ import {
   ProjectDialog,
   ProjectSidebar,
   RenameDialog,
+  TagsDialog,
 } from "./ProjectSidebar";
 import {
   rowsFromAssistant,
@@ -205,6 +206,84 @@ function safeJson(value: unknown) {
   }
 }
 
+function pathOfArgs(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+  const record = args as Record<string, unknown>;
+  return typeof record.path === "string"
+    ? record.path
+    : typeof record.filePath === "string"
+      ? record.filePath
+      : "";
+}
+
+function syntaxForPath(path: string) {
+  const file = path.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  if (file === "dockerfile") return "dockerfile";
+  if (file === "makefile") return "makefile";
+  const extension = file.includes(".") ? file.split(".").pop() : "";
+  const syntax: Record<string, string> = {
+    c: "c",
+    cc: "cpp",
+    cpp: "cpp",
+    cs: "csharp",
+    css: "css",
+    gd: "gdscript",
+    go: "go",
+    h: "c",
+    hpp: "cpp",
+    html: "xml",
+    java: "java",
+    js: "javascript",
+    json: "json",
+    jsx: "jsx",
+    md: "markdown",
+    mjs: "javascript",
+    py: "python",
+    rs: "rust",
+    sh: "bash",
+    sql: "sql",
+    svelte: "xml",
+    toml: "ini",
+    ts: "typescript",
+    tsx: "tsx",
+    vue: "xml",
+    xml: "xml",
+    yaml: "yaml",
+    yml: "yaml",
+  };
+  return syntax[extension ?? ""] ?? "text";
+}
+
+function fencedCode(text: string, syntax: string) {
+  const longestFence = Math.max(
+    2,
+    ...Array.from(text.matchAll(/`+/g), (match) => match[0].length),
+  );
+  const fence = "`".repeat(longestFence + 1);
+  return `${fence}${syntax}\n${text.replace(/\r\n/g, "\n")}\n${fence}`;
+}
+
+/** Render read results as source code instead of wrapping them as prose. */
+function ReadCode({
+  path,
+  text,
+  language,
+}: {
+  path: string;
+  text: string;
+  language: Language;
+}) {
+  return (
+    <div className="read-code">
+      {path && <div className="read-code-path">{path}</div>}
+      <MarkdownBody
+        text={fencedCode(text, syntaxForPath(path))}
+        language={language}
+      />
+    </div>
+  );
+}
+
 /** 1234 -> 1.2k, 1234567 -> 1.2M. */
 function formatTokens(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "0";
@@ -245,6 +324,7 @@ export default function App() {
   const [projectsRoot, setProjectsRoot] = useState("");
   const [projectDialog, setProjectDialog] = useState(false);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
+  const [tagsTarget, setTagsTarget] = useState<SessionSummary | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const creatingSessionRef = useRef(false);
@@ -290,6 +370,8 @@ export default function App() {
   const followingRef = useRef(true);
   const [following, setFollowing] = useState(true);
   const [rows, setRows] = useState<Row[]>([]);
+  const rowsBySession = useRef(new Map<string, Row[]>());
+  const rowsSessionRef = useRef(sessionId);
   const earlierPage = useRef<{
     rows: Row[];
     firstId: string;
@@ -305,11 +387,16 @@ export default function App() {
   } | null>(null);
   const [historyData, setHistory] = useState<HistoryResponse | null>(null);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const pendingQueueItems = queueItems.filter(
+    (item) => !item.status || item.status === "queued",
+  );
   const [showQueueHistory, setShowQueueHistory] = useState(false);
   const [queueDraft, setQueueDraft] = useState("");
   const [queueKind, setQueueKind] = useState("followUp");
   const [draft, setDraft] = useState("");
   const [status, setStatus] = useState("connecting");
+  const [loadingSession, setLoadingSession] = useState(false);
   const [runActive, setRunActive] = useState(false);
   const [error, setError] = useState("");
   const [connectionFailed, setConnectionFailed] = useState(false);
@@ -716,6 +803,7 @@ export default function App() {
     sessionListRequest.current = null;
     sessionListValue.current = null;
     activeSessionRef.current = "";
+    rowsBySession.current.clear();
     source.current?.close();
     setAuthenticated(false);
     setAuthRequired(true);
@@ -950,10 +1038,11 @@ export default function App() {
     dialogRequests.current.clear();
     activeDialogId.current = "";
     earlierPage.current = null;
-    setRows([]);
+    setRows(sessionId ? (rowsBySession.current.get(sessionId) ?? []) : []);
     setRuntime(null);
     setHistory(null);
     setQueueItems([]);
+    setQueueOpen(false);
     setAuthProviders([]);
     setAuthProvider("");
     setApiKeyDraft("");
@@ -975,7 +1064,7 @@ export default function App() {
     setError("");
     setConnectionFailed(false);
     setStatus("connecting");
-    setRunActive(false);
+    setLoadingSession(Boolean(sessionId));
     setInterrupted(false);
     setDialog(null);
     setDialogAnswer("");
@@ -989,6 +1078,7 @@ export default function App() {
     setDraft(draftBySession.current.get(sessionId) ?? "");
     if (!sessionId) {
       setStatus("ready");
+      setLoadingSession(false);
       return;
     }
 
@@ -1004,6 +1094,7 @@ export default function App() {
         return;
       }
       setStatus("error");
+      setLoadingSession(false);
       setConnectionFailed(true);
       setError(errorText(cause));
     };
@@ -1216,6 +1307,7 @@ export default function App() {
       }
       if (cancelled) return;
       connect(after);
+      setLoadingSession(false);
     })();
 
     return () => {
@@ -1232,6 +1324,19 @@ export default function App() {
     connectionRevision,
     showNextDialog,
   ]);
+
+  useEffect(() => {
+    if (rowsSessionRef.current !== sessionId) {
+      rowsSessionRef.current = sessionId;
+      return;
+    }
+    if (!sessionId) return;
+    rowsBySession.current.set(sessionId, rows);
+    if (rowsBySession.current.size > 24) {
+      const oldest = rowsBySession.current.keys().next().value;
+      if (oldest && oldest !== sessionId) rowsBySession.current.delete(oldest);
+    }
+  }, [rows, sessionId]);
 
   useEffect(() => {
     if (followingRef.current && transcriptRef.current)
@@ -2066,7 +2171,7 @@ export default function App() {
 
   async function updateSessionMetadata(
     session: SessionSummary,
-    patch: { pinned?: boolean; archived?: boolean },
+    patch: { pinned?: boolean; archived?: boolean; tags?: string[] },
   ) {
     const id = session.sessionId;
     const navigation = navigationRevision.current;
@@ -2185,6 +2290,17 @@ export default function App() {
           }}
         />
       )}
+      {tagsTarget && (
+        <TagsDialog
+          language={language}
+          session={tagsTarget}
+          onClose={() => setTagsTarget(null)}
+          onSave={async (tags) => {
+            await api.sessionMetadata(tagsTarget.sessionId, { tags });
+            await refreshSessions();
+          }}
+        />
+      )}
       {settingsOpen && (
         <Modal
           language={language}
@@ -2264,6 +2380,7 @@ export default function App() {
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
+              onEditTags={setTagsTarget}
               onMetadata={updateSessionMetadata}
             />
             <div className="sidebar-bottom">
@@ -2361,10 +2478,22 @@ export default function App() {
             >
               <PanelLeft size={17} />
             </button>
-            <div className="breadcrumb">
-              <h1>{current?.title ?? t("newSession")}</h1>
-              <span>·</span>
-              <span>{project?.name ?? "rpi"}</span>
+            <div
+              className="breadcrumb"
+              aria-label={`${project?.name ?? "rpi"} · ${current?.title ?? t("newSession")}`}
+            >
+              <span
+                className="breadcrumb-project"
+                title={project?.name ?? "rpi"}
+              >
+                {project?.name ?? "rpi"}
+              </span>
+              <span className="breadcrumb-separator" aria-hidden="true">
+                ·
+              </span>
+              <h1 title={current?.title ?? t("newSession")}>
+                {current?.title ?? t("newSession")}
+              </h1>
             </div>
           </div>
           <div className="toolbar-actions">
@@ -2499,7 +2628,7 @@ export default function App() {
 
         <main className="main-content chat-layout">
           <div
-            className={`conversation-column ${rows.length === 0 ? "empty-conversation" : ""}`}
+            className={`conversation-column ${rows.length === 0 && !loadingSession ? "empty-conversation" : ""}`}
           >
             <div
               className="transcript"
@@ -2529,7 +2658,14 @@ export default function App() {
                   </div>
                 )}
 
-                {rows.length === 0 && (
+                {loadingSession && rows.length === 0 && (
+                  <div className="session-loading" role="status">
+                    <Loader2 size={15} className="spin" />
+                    <span>{t("loadingConversation")}</span>
+                  </div>
+                )}
+
+                {rows.length === 0 && !loadingSession && (
                   <div className="welcome">
                     <div className="welcome-symbol">
                       <Mark large />
@@ -2617,6 +2753,45 @@ export default function App() {
                 </div>
               )}
               <div className="composer">
+                {queueOpen && pendingQueueItems.length > 0 && (
+                  <div
+                    className="composer-queue-panel"
+                    aria-label={t("queue")}
+                  >
+                    <div className="composer-queue-heading">
+                      <span>
+                        <ListTodo size={13} /> {t("queue")}
+                      </span>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={t("closeQueue")}
+                        title={t("closeQueue")}
+                        onClick={() => setQueueOpen(false)}
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                    <div className="composer-queue-list">
+                      {pendingQueueItems.map((item) => (
+                        <div className="composer-queue-item" key={item.entryId}>
+                          <span>{item.text || t("nonTextMessage")}</span>
+                          {item.status === "queued" && (
+                            <button
+                              type="button"
+                              className="icon-button"
+                              aria-label={t("cancelQueued")}
+                              title={t("cancelQueued")}
+                              onClick={() => void cancelQueued(item.entryId)}
+                            >
+                              <X size={13} />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <textarea
                   value={draft}
                   onChange={(event) => {
@@ -2684,9 +2859,24 @@ export default function App() {
                     )}
                   </div>
                   <div className="composer-controls">
+                    {actions.has("queue") &&
+                      supported.has("get_queue") &&
+                      pendingQueueItems.length > 0 && (
+                        <button
+                          type="button"
+                          className="composer-queue-button"
+                          aria-label={`${t("queue")}: ${pendingQueueItems.length}`}
+                          aria-expanded={queueOpen}
+                          title={t("viewQueue")}
+                          onClick={() => setQueueOpen((value) => !value)}
+                        >
+                          <ListTodo size={14} />
+                          <strong>{queueItems.length}</strong>
+                        </button>
+                      )}
                     <button
                       type="button"
-                      className="danger"
+                      className="danger stop-button"
                       aria-label={t("abort")}
                       title={t("abort")}
                       onClick={() => void abort()}
@@ -3382,6 +3572,11 @@ function Dropdown({
             className="dropdown-popover"
             role="listbox"
             aria-label={label}
+            onClick={(event) => {
+              if ((event.target as Element).closest('[role="option"]')) {
+                setOpen(false);
+              }
+            }}
             style={{
               position: "fixed",
               top: position.top,
@@ -3528,8 +3723,10 @@ function RowView({ row, language }: { row: Row; language: Language }) {
   const t = (key: MessageKey) => translate(language, key);
   if (row.kind === "note") {
     const values = row.translation?.values;
+    const isRunStatus =
+      row.translation?.key === "liveRun" || row.translation?.key === "restoredRun";
     return (
-      <p className="transcript-note muted">
+      <p className={`transcript-note muted${isRunStatus ? " run-status" : ""}`}>
         {row.translation
           ? translate(
               language,
@@ -3572,6 +3769,9 @@ function RowView({ row, language }: { row: Row; language: Language }) {
     const edits = editInfo(row.name, row.args);
     if (edits) return <EditCard row={row} edits={edits} language={language} />;
     const resultText = typeof row.result === "string" ? row.result : null;
+    const readResult =
+      row.name === "read" && row.status !== "error" && resultText !== null;
+    const readPath = row.name === "read" ? pathOfArgs(row.args) : "";
     const showArgs = row.result === undefined && row.args !== undefined;
     return (
       <details
@@ -3594,6 +3794,8 @@ function RowView({ row, language }: { row: Row; language: Language }) {
               <h4>{t("input")}</h4>
               <pre>{safeJson(row.args)}</pre>
             </>
+          ) : readResult ? (
+            <ReadCode path={readPath} text={resultText} language={language} />
           ) : resultText !== null ? (
             isMarkdownText(resultText) ? (
               <MarkdownBody text={resultText} language={language} />
@@ -3610,23 +3812,58 @@ function RowView({ row, language }: { row: Row; language: Language }) {
     );
   }
 
+  return <MessageRow row={row} language={language} />;
+}
+
+function MessageRow({
+  row,
+  language,
+}: {
+  row: Extract<Row, { kind: "text" }>;
+  language: Language;
+}) {
+  const t = (key: MessageKey) => translate(language, key);
+  const [copied, setCopied] = useState(false);
+
+  async function copyMessage() {
+    try {
+      await navigator.clipboard.writeText(row.text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard access can be denied; the message remains selectable.
+    }
+  }
+
   return (
     <article className={`message ${row.role}`}>
       <div className="message-heading">
         {row.role === "assistant" ? (
           <Mark />
         ) : (
-          <span className="user-avatar">U</span>
+          <span className="user-avatar">{t("you").slice(0, 1)}</span>
         )}
         <strong>{row.role === "assistant" ? "rpi" : t("you")}</strong>
+        <button
+          type="button"
+          className="message-copy"
+          onClick={() => void copyMessage()}
+          aria-label={copied ? t("copied") : t("copyMessage")}
+          title={copied ? t("copied") : t("copyMessage")}
+        >
+          {copied ? <Check size={12} /> : <Copy size={12} />}
+          <span>{copied ? t("copied") : t("copyMessage")}</span>
+        </button>
       </div>
-      {row.role === "assistant" ? (
-        <MarkdownBody text={row.text} language={language} />
-      ) : (
-        <div className="prose plain-message">
-          <p>{row.text}</p>
-        </div>
-      )}
+      <div className="message-body">
+        {row.role === "assistant" ? (
+          <MarkdownBody text={row.text} language={language} />
+        ) : (
+          <div className="prose plain-message">
+            <p>{row.text}</p>
+          </div>
+        )}
+      </div>
     </article>
   );
 }

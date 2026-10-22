@@ -435,12 +435,17 @@ export function rowsFromAssistant(
   for (const [index, block] of blocksOf(message).entries()) {
     if (block.type === "text" && typeof block.text === "string") {
       if (!block.text.trim()) continue;
-      rows.push({
-        kind: "text",
-        id: `${prefix}:b${index}`,
-        role: "assistant",
-        text: block.text,
-      });
+      const previous = rows[rows.length - 1];
+      if (previous?.kind === "text" && previous.role === "assistant") {
+        previous.text = `${previous.text}\n\n${block.text}`;
+      } else {
+        rows.push({
+          kind: "text",
+          id: `${prefix}:b${index}`,
+          role: "assistant",
+          text: block.text,
+        });
+      }
     } else if (block.type === "thinking") {
       const text =
         typeof block.thinking === "string"

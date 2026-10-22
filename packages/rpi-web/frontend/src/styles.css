@@ -485,9 +485,26 @@ code {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
+  min-width: 0;
   color: var(--muted);
+  font-size: 12px;
   white-space: nowrap;
+}
+.breadcrumb-project,
+.breadcrumb h1 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.breadcrumb-project {
+  max-width: 180px;
+}
+.breadcrumb h1 {
+  flex: 1;
+}
+.breadcrumb-separator {
+  flex: 0 0 auto;
 }
 .toolbar h1 {
   font-size: 13px;
@@ -773,13 +790,14 @@ code {
   margin: auto;
 }
 .message {
-  padding: 0 0 24px;
+  padding: 0 0 28px;
 }
 .message-heading {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-bottom: 10px;
+  min-height: 24px;
+  margin-bottom: 9px;
 }
 .message-heading strong {
   font-size: 12px;
@@ -793,13 +811,31 @@ code {
 .message-heading .brand-mark svg {
   width: 16px;
 }
-.message-heading .icon-button {
+.message-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   margin-left: auto;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
   opacity: 0;
+  transition:
+    opacity 0.15s,
+    background-color 0.15s,
+    color 0.15s;
 }
-.message:hover .message-heading .icon-button,
-.message:focus-within .message-heading .icon-button {
+.message:hover .message-copy,
+.message:focus-within .message-copy {
   opacity: 1;
+}
+.message-copy:hover {
+  border-color: var(--line);
+  background: var(--soft);
+  color: var(--text);
 }
 .user-avatar {
   width: 24px;
@@ -812,6 +848,37 @@ code {
   justify-content: center;
   color: var(--muted);
   font-size: 11px;
+  font-weight: 600;
+}
+.message-body {
+  min-width: 0;
+}
+.message.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.message.user .message-heading {
+  width: min(88%, 650px);
+  justify-content: flex-end;
+}
+.message.user .message-copy {
+  margin-left: 0;
+  order: -1;
+}
+.message.user .message-body {
+  width: min(88%, 650px);
+  padding: 11px 15px;
+  border: 1px solid var(--line);
+  border-radius: 16px 16px 4px 16px;
+  background: var(--soft);
+}
+.message.user .plain-message {
+  font-size: 14px;
+  line-height: 1.7;
+}
+.message.user .plain-message p {
+  white-space: pre-wrap;
 }
 .prose {
   font-size: 14px;
@@ -823,13 +890,60 @@ code {
 .prose > :first-child {
   margin-top: 0;
 }
-.prose > :last-child {
-  margin-bottom: 0;
+.markdown-code-block {
+  margin: 14px 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--soft);
 }
-.thinking {
-  margin-bottom: 14px;
+.markdown-code-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 30px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--line);
   color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.45px;
 }
+.markdown-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.markdown-copy:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.markdown-copy:disabled {
+  opacity: 0.45;
+}
+.markdown-code-block pre {
+  margin: 0;
+  padding: 13px 15px;
+  overflow: auto;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre;
+}
+.markdown-code-block pre code {
+  font-family: var(--mono);
+}
+
 summary {
   cursor: pointer;
   list-style: none;
@@ -853,11 +967,14 @@ summary:before {
 details[open] > summary:before {
   transform: rotate(90deg);
 }
-.thinking > .prose {
-  padding: 9px 16px;
+.session-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 180px;
   color: var(--muted);
-  font-size: 13px;
-  border-left: 2px solid var(--line);
+  font-size: 12px;
 }
 .tool-card {
   border: 1px solid var(--line);
@@ -940,52 +1057,53 @@ details[open] > summary:before {
   font-size: 13px;
   line-height: 1.75;
 }
-/* Shell commands render as a terminal window: title bar, prompt line, output. */
+/* Shell commands use the same quiet surfaces as the rest of the workspace. */
 .shell-detail {
   padding-top: 10px;
 }
 .shell-summary-prompt {
+  flex-shrink: 0;
+  color: var(--green);
   font-family: var(--mono);
   font-size: 12px;
-  color: var(--green);
-  flex-shrink: 0;
 }
 .shell-window {
-  border: 1px solid #262732;
-  border-radius: 9px;
   overflow: hidden;
-  background: #1d1e26;
-  color: #e7e8f0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
 }
 .shell-titlebar {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 7px 11px;
-  background: #262732;
-  border-bottom: 1px solid #30313d;
+  border-bottom: 1px solid var(--line);
+  background: var(--soft);
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 11px;
-  color: #a7abc0;
 }
 .shell-dots {
   display: inline-flex;
-  gap: 5px;
   flex-shrink: 0;
+  gap: 5px;
 }
 .shell-dots i {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
+  opacity: 0.75;
 }
 .shell-dots i:nth-child(1) {
-  background: #ff5f57;
+  background: var(--danger);
 }
 .shell-dots i:nth-child(2) {
-  background: #febc2e;
+  background: #c99539;
 }
 .shell-dots i:nth-child(3) {
-  background: #28c840;
+  background: var(--green);
 }
 .shell-title {
   flex: 1;
@@ -995,57 +1113,64 @@ details[open] > summary:before {
   white-space: nowrap;
 }
 .shell-body {
-  padding: 9px 12px 11px;
   display: grid;
   gap: 8px;
+  padding: 10px 12px 12px;
 }
 .shell-card .shell-window .shell-input,
 .shell-card .shell-window .shell-output {
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  padding: 0;
+  max-height: 340px;
+  margin: 0;
+  overflow: auto;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 340px;
-  overflow: auto;
-  margin: 0;
-  color: #e7e8f0;
+  white-space: pre-wrap;
 }
-.shell-input {
+.shell-card .shell-window .shell-input {
   display: flex;
-  gap: 8px;
   align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--blue-soft) 38%, var(--surface));
+}
+.shell-card .shell-window .shell-output {
+  padding: 0 1px;
+  color: var(--text);
 }
 .shell-window .shell-prompt {
-  color: #57d364;
-  user-select: none;
   flex-shrink: 0;
+  color: var(--green);
+  user-select: none;
 }
 .shell-window .shell-copy {
-  border: 1px solid #3a3b48;
-  background: #2c2d3a;
-  color: #c3c6d8;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
 }
 .shell-window .shell-copy:hover:not(:disabled) {
-  color: #fff;
-  background: #353646;
+  background: var(--hover);
+  color: var(--text);
 }
 .shell-empty {
-  color: #8a8fa5;
+  margin: 0;
+  color: var(--muted);
   font-family: inherit;
   font-size: 12px;
-  margin: 0;
 }
 .shell-meta {
   margin: 7px 0 0;
-  font-family: var(--mono);
-  font-size: 10.5px;
   overflow-wrap: anywhere;
   color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
 }
 /* Plan and todo activities render as structured, read-only checklists. */
 .plan-detail,
@@ -1380,28 +1505,6 @@ details[open] > summary:before {
   .dropdown-popover {
     max-width: calc(100vw - 16px);
   }
-}
-.session-menu button,
-.session-menu a {
-  width: 100%;
-  justify-content: flex-start;
-  display: flex;
-  padding: 8px 10px;
-  font-size: 12px;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  gap: 7px;
-  border-radius: 5px;
-}
-.session-menu a:hover {
-  background: var(--hover);
-  text-decoration: none;
-}
-.session-menu hr {
-  border: 0;
-  border-top: 1px solid var(--line);
-  margin: 4px;
 }
 .modal {
   position: fixed;
@@ -1894,7 +1997,9 @@ details[open] > summary:before {
     padding: 0 22px;
   }
   .breadcrumb {
-    display: none;
+    display: flex;
+    flex: 1;
+    max-width: min(42vw, 260px);
   }
   .inspector {
     width: 250px;
@@ -1966,10 +2071,29 @@ details[open] > summary:before {
     gap: 5px;
   }
   .toolbar-left {
-    gap: 7px;
+    flex: 1;
+    min-width: 0;
   }
-  .toolbar h1 {
-    font-size: 12px;
+  .breadcrumb {
+    max-width: min(42vw, 210px);
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 1px;
+    line-height: 1.15;
+  }
+  .breadcrumb-project {
+    max-width: 100%;
+    font-size: 9px;
+    color: var(--muted);
+  }
+  .breadcrumb h1 {
+    width: 100%;
+    font-size: 11px;
+    font-weight: 550;
+  }
+  .breadcrumb-separator {
+    display: none;
   }
   .toolbar-actions {
     gap: 0;
@@ -2063,6 +2187,16 @@ details[open] > summary:before {
   .message {
     padding-bottom: 25px;
   }
+  .message-copy {
+    opacity: 1;
+  }
+  .message.user .message-heading,
+  .message.user .message-body {
+    width: min(94%, 650px);
+  }
+  .message.user .message-body {
+    padding: 10px 13px;
+  }
   .prose {
     font-size: 14px;
   }
@@ -2131,13 +2265,6 @@ details[open] > summary:before {
   .modal-heading .icon-button {
     width: 40px;
     height: 40px;
-  }
-  .session-menu button,
-  .session-menu a {
-    min-height: 44px;
-  }
-  .session-menu {
-    min-width: 190px;
   }
   .login {
     padding: 20px;
@@ -2451,6 +2578,20 @@ details[open] > summary:before {
   border-left: 2px solid var(--line);
   font-size: 11px;
   letter-spacing: 0.2px;
+}
+.transcript-note.run-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 760px;
+  min-height: 28px;
+  margin: 2px auto 18px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--soft);
+  text-align: center;
+  box-sizing: border-box;
 }
 .tool-card {
   max-width: 760px;

@@ -316,11 +316,21 @@ async fn list_projects(State(state): State<AppState>) -> Json<Value> {
     )
 }
 
-async fn list_project_folders(State(state): State<AppState>) -> workspace::Reply {
+#[derive(Debug, Default, Deserialize)]
+struct ProjectFoldersQuery {
+    path: Option<String>,
+}
+
+async fn list_project_folders(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectFoldersQuery>,
+) -> workspace::Reply {
     let root = state.projects.read().await.root.clone();
-    let folders = workspace::child_directories(&root).await?;
+    let relative = query.path.as_deref().unwrap_or("");
+    let folders = workspace::child_directories(&root, relative).await?;
     Ok(Json(json!({
         "root": root.to_string_lossy().trim_start_matches(r"\\?\"),
+        "path": relative,
         "folders": folders
             .into_iter()
             .map(|(name, path)| json!({"name": name, "path": path}))
@@ -640,6 +650,7 @@ async fn rename_session(
 struct MetadataRequest {
     pinned: Option<bool>,
     archived: Option<bool>,
+    tags: Option<Vec<String>>,
 }
 
 async fn session_metadata(
@@ -654,10 +665,15 @@ async fn session_metadata(
             Json(json!({"error":"session not found"})),
         );
     }
-    match registry.update_preferences(&id, request.pinned, request.archived) {
+    match registry.update_preferences(&id, request.pinned, request.archived, request.tags) {
         Ok(prefs) => (
             StatusCode::OK,
-            Json(json!({"sessionId":id,"pinned":prefs.pinned,"archived":prefs.archived})),
+            Json(json!({
+                "sessionId": id,
+                "pinned": prefs.pinned,
+                "archived": prefs.archived,
+                "tags": prefs.tags,
+            })),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -947,25 +963,131 @@ async fn open_session(State(state): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
-async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(Default, Deserialize)]
+struct SessionListQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(rename = "projectId", default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    archived: Option<bool>,
+    #[serde(default)]
+    pinned: Option<bool>,
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionListQuery>,
+) -> impl IntoResponse {
     let sessions = state.sessions.read().await;
     let registry = state.registry.read().await;
+    let project_names: HashMap<String, String> = state
+        .projects
+        .read()
+        .await
+        .entries
+        .iter()
+        .map(|project| (project.id.clone(), project.name.clone()))
+        .collect();
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let tag = query
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let status_filter = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
     let mut summaries = Vec::new();
     for entry in registry.entries() {
         let snapshot = match sessions.get(&entry.session_id) {
             Some(session) => Some(session.snapshot().await),
             None => None,
         };
-        summaries.push(json!({
-            "projectId": entry.project_id.as_deref().unwrap_or(&state.default_project_id),
-            "pinned":registry.preferences(&entry.session_id).pinned,
-            "archived":registry.preferences(&entry.session_id).archived,
-            "sessionId": entry.session_id,
-            "title": entry.title.clone().or_else(||snapshot.as_ref().and_then(|snapshot|snapshot.title.clone())),
-            "status": snapshot
+        let project_id = entry
+            .project_id
+            .clone()
+            .unwrap_or_else(|| state.default_project_id.clone());
+        let preferences = registry.preferences(&entry.session_id);
+        let title = entry.title.clone().or_else(|| {
+            snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.status.clone())
-                .unwrap_or_else(|| "offline".into()),
+                .and_then(|snapshot| snapshot.title.clone())
+        });
+        let status = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.status.clone())
+            .unwrap_or_else(|| "offline".into());
+        let project_name = project_names.get(&project_id).cloned().unwrap_or_default();
+        let searchable = format!(
+            "{} {} {}",
+            title.as_deref().unwrap_or_default(),
+            entry.session_id,
+            project_name
+        )
+        .to_lowercase();
+        if let Some(search) = &search {
+            if !searchable.contains(search)
+                && !preferences
+                    .tags
+                    .iter()
+                    .any(|item| item.to_lowercase().contains(search))
+            {
+                continue;
+            }
+        }
+        if query
+            .project_id
+            .as_deref()
+            .is_some_and(|value| value != project_id)
+        {
+            continue;
+        }
+        if let Some(tag) = &tag {
+            if !preferences
+                .tags
+                .iter()
+                .any(|item| item.to_lowercase() == *tag)
+            {
+                continue;
+            }
+        }
+        if status_filter
+            .as_deref()
+            .is_some_and(|value| value != status.to_lowercase())
+        {
+            continue;
+        }
+        if query
+            .archived
+            .is_some_and(|value| value != preferences.archived)
+            || query
+                .pinned
+                .is_some_and(|value| value != preferences.pinned)
+        {
+            continue;
+        }
+        summaries.push(json!({
+            "projectId": project_id,
+            "pinned": preferences.pinned,
+            "archived": preferences.archived,
+            "tags": preferences.tags,
+            "sessionId": entry.session_id,
+            "title": title,
+            "status": status,
             "createdAt": entry.created_at,
             "updatedAt": snapshot
                 .as_ref()

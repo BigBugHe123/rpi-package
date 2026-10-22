@@ -161,10 +161,12 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
 /// Direct child directories of a root, for the "open an existing folder" picker.
 pub async fn child_directories(
     root: &Path,
+    relative: &str,
 ) -> Result<Vec<(String, String)>, (StatusCode, Json<Value>)> {
-    let mut directory = tokio::fs::read_dir(root)
+    let path = resolve(root, relative)?;
+    let mut directory = tokio::fs::read_dir(path)
         .await
-        .map_err(|_| failure(StatusCode::NOT_FOUND, "projects directory not found"))?;
+        .map_err(|_| failure(StatusCode::NOT_FOUND, "directory not found"))?;
     let mut folders = Vec::new();
     while let Some(entry) = directory
         .next_entry()
@@ -182,7 +184,12 @@ pub async fn child_directories(
         if kind.is_symlink() || !kind.is_dir() {
             continue;
         }
-        folders.push((name.clone(), name));
+        let path = if relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative}/{name}")
+        };
+        folders.push((name, path));
         if folders.len() > 2000 {
             return Err(failure(
                 StatusCode::PAYLOAD_TOO_LARGE,

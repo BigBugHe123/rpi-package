@@ -43,6 +43,7 @@ const session = {
   sessionId,
   projectId: "project-a",
   title: "Mock session",
+  tags: ["frontend"],
   status: "ready",
   createdAt: 1_700_000_000_000,
   updatedAt: 1_700_000_000_100,
@@ -77,7 +78,7 @@ async function mockHost(page: Page) {
         const project = {
           id: `project-${projects.length + 1}`,
           name: body.name,
-          path: `/workspace/projects/${body.name}`,
+          path: body.path ?? `/workspace/projects/${body.name}`,
         };
         projects.push(project);
         return route.fulfill({ status: 201, json: { project } });
@@ -87,6 +88,18 @@ async function mockHost(page: Page) {
           projects,
           defaultProjectId: "project-a",
           projectsRoot: "/workspace/projects",
+        },
+      });
+    }
+    if (path === "/api/v1/project-folders") {
+      return route.fulfill({
+        json: {
+          root: "/workspace/projects",
+          folders: [
+            { name: "demo-app", path: "demo-app" },
+            { name: "rpi-package", path: "rpi-package" },
+            { name: "zimt", path: "zimt" },
+          ],
         },
       });
     }
@@ -329,6 +342,13 @@ test("capabilities gate the history and queue inspector", async ({ page }) => {
       .filter({ hasText: "Queue" })
       .first(),
   ).toBeVisible();
+  const queueToggle = page.getByRole("button", {
+    name: "Queue: 1",
+    exact: true,
+  });
+  await expect(queueToggle).toBeVisible();
+  await queueToggle.click();
+  await expect(page.locator(".composer-queue-panel")).toContainText("pending");
 });
 
 test("history records expand and queue history toggles", async ({ page }) => {
@@ -429,6 +449,44 @@ test("projects contain chats and a new project starts its own conversation", asy
   ).toBeVisible();
 });
 
+test("opening an existing folder is searchable and fills its project name", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let createdBody: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/projects", async (route) => {
+    if (route.request().method() === "POST") {
+      createdBody = route.request().postDataJSON();
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "New project", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Add project", exact: true });
+  await dialog.getByRole("button", { name: "Open folder", exact: true }).click();
+  const folderInput = dialog.getByLabel("Choose a folder", { exact: true });
+  await folderInput.fill("zim");
+  const zimt = dialog.getByRole("option", { name: /zimt/ });
+  await expect(zimt).toBeVisible();
+  await expect(dialog.getByRole("option", { name: /demo-app/ })).toHaveCount(0);
+  await zimt.click();
+  await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
+    "zimt",
+  );
+  await dialog.getByLabel("Project name", { exact: true }).fill("Zimt workspace");
+  await folderInput.fill("demo");
+  await dialog.getByRole("option", { name: /demo-app/ }).click();
+  await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
+    "Zimt workspace",
+  );
+  await dialog.getByRole("button", { name: "Add project and start chat" }).click();
+  await expect.poll(() => createdBody).toEqual({
+    name: "Zimt workspace",
+    initGit: true,
+    path: "demo-app",
+  });
+});
+
 test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   await mockHost(page);
   await page.goto("/");
@@ -489,6 +547,32 @@ test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("session tags can be edited and filtered", async ({ page }) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Session actions: Mock session", exact: true })
+    .click();
+  await page.getByRole("menuitem", { name: "Edit tags", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Edit tags" });
+  await dialog.getByLabel("Tags").fill("frontend, urgent, frontend");
+  await dialog.getByRole("button", { name: "Save tags", exact: true }).click();
+  await expect(
+    page.locator(".session-tag", { hasText: "urgent" }),
+  ).toBeVisible();
+  await page
+    .getByRole("combobox", { name: "Filter by tag" })
+    .selectOption("urgent");
+  await expect(page.locator(".project-session")).toHaveCount(1);
+  await page
+    .getByRole("combobox", { name: "Filter by status" })
+    .selectOption("offline");
+  await expect(page.locator(".project-session")).toHaveCount(0);
+  await page
+    .getByRole("combobox", { name: "Filter by status" })
+    .selectOption("");
+  await expect(page.locator(".project-session")).toHaveCount(1);
+});
 test("project navigation collapses, searches and remembers appearance", async ({
   page,
 }) => {
@@ -618,6 +702,48 @@ test("mobile navigation opens without horizontal overflow", async ({
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
+});
+
+test("mobile session actions keep the ellipsis control compact", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Toggle sidebar", exact: true })
+    .click();
+  const row = page.locator(".project-session").first();
+  const trigger = row.getByRole("button", {
+    name: "Session actions: Mock session",
+    exact: true,
+  });
+  await expect(trigger).toBeVisible();
+  const timeAndMenu = await row.evaluate((element) => {
+    const time = element.querySelector("time")?.getBoundingClientRect();
+    const menu = element
+      .querySelector(".session-menu-trigger")
+      ?.getBoundingClientRect();
+    return {
+      timeRight: time?.right ?? 0,
+      menuLeft: menu?.left ?? 0,
+    };
+  });
+  expect(timeAndMenu.timeRight).toBeLessThanOrEqual(timeAndMenu.menuLeft);
+  expect(
+    await row.locator(".session-menu").evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeLessThanOrEqual(50);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await trigger.click();
+  await expect(
+    page.getByRole("menuitem", { name: "Rename", exact: true }),
+  ).toBeVisible();
 });
 
 test("messages sent during a run enter the follow-up queue", async ({
@@ -852,6 +978,16 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await expect(prose.locator("ol ul > li")).toHaveCount(2);
   await expect(prose.locator('input[type="checkbox"]:checked')).toHaveCount(1);
   await expect(prose.locator("pre code")).toContainText('  return "long_code_');
+  await expect(prose.locator(".markdown-code-heading")).toContainText("Code");
+  await expect(prose.locator(".markdown-copy").first()).toHaveAttribute(
+    "aria-label",
+    "Copy code",
+  );
+  await prose.locator(".markdown-copy").first().click();
+  await expect(
+    page.locator(".message.assistant .message-copy").first(),
+  ).toHaveAttribute("aria-label", "Copy message");
+  await page.locator(".message.assistant .message-copy").first().click();
   const table = prose.getByRole("region", {
     name: "Table, scroll horizontally",
   });
@@ -875,6 +1011,10 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await page.setViewportSize({ width: 375, height: 812 });
   await page.reload();
   await expect(prose.locator("img")).toBeVisible();
+  await expect(
+    page.locator(".message.assistant .message-copy").first(),
+  ).toBeVisible();
+  await expect(page.locator(".message.user .message-body")).toBeVisible();
   expect(
     await page
       .locator(".transcript")
@@ -1453,6 +1593,45 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   await expect(
     page.getByRole("combobox", { name: "思考深度", exact: true }),
   ).toBeEnabled();
+});
+
+test("mobile composer keeps thinking level picker visible", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_thinking_levels",
+          "set_thinking_level",
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/sessions/*/commands", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type === "get_available_thinking_levels")
+      return route.fulfill({
+        json: response({ levels: ["low", "high"] }, body.type),
+      });
+    return route.fallback();
+  });
+  await page.goto("/");
+  const thinking = page.locator(".composer-thinking");
+  await expect(thinking).toBeVisible();
+  await expect(thinking).toContainText("Thinking level");
+  await thinking.click();
+  await expect(
+    page.getByRole("listbox", { name: "Choose thinking level", exact: true }),
+  ).toBeVisible();
+  await page.locator(".dropdown-popover .dropdown-item").first().click();
+  await expect(
+    page.getByRole("listbox", { name: "Choose thinking level", exact: true }),
+  ).toBeHidden();
 });
 
 test("snapshot replay keeps a closed dialog and completed recovery state closed", async ({
@@ -2241,7 +2420,12 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
     timestamp: 42,
     content: [
       { type: "text", text: "Already committed" },
-      { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      {
+        type: "toolCall",
+        id: "call-1",
+        name: "read",
+        arguments: { path: "src/main.ts" },
+      },
     ],
   };
   await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
@@ -2313,6 +2497,10 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".tool-card.tool-done")).toHaveCount(1);
   await page.locator(".tool-card summary").click();
   await expect(page.locator(".tool-card")).toContainText("Completed result");
+  await expect(page.locator(".read-code-path")).toHaveText("src/main.ts");
+  await expect(page.locator(".read-code pre code")).toHaveClass(
+    /language-typescript/,
+  );
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
@@ -3780,6 +3968,7 @@ test("composer model picker groups by provider and applies the selection", async
     .locator(".dropdown-item")
     .filter({ hasText: "Model Beta" })
     .click();
+  await expect(page.locator(".dropdown-popover")).toBeHidden();
   await expect
     .poll(() => changes)
     .toEqual([

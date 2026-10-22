@@ -22,6 +22,7 @@ export interface SessionSummary {
   projectId?: string;
   pinned?: boolean;
   archived?: boolean;
+  tags?: string[];
   title: string | null;
   status: string;
   createdAt: number;
@@ -39,6 +40,14 @@ export interface SessionSummary {
   } | null;
 }
 
+export interface SessionListFilters {
+  q?: string;
+  projectId?: string;
+  tag?: string;
+  status?: string;
+  archived?: boolean;
+  pinned?: boolean;
+}
 export interface AuthState {
   required: boolean;
   authenticated: boolean;
@@ -260,10 +269,12 @@ export const api = {
       defaultProjectId: string;
       projectsRoot?: string;
     }>("/projects"),
-  projectFolders: () =>
-    request<{ root: string; folders: { name: string; path: string }[] }>(
-      "/project-folders",
-    ),
+  projectFolders: (path = "") =>
+    request<{
+      root: string;
+      path: string;
+      folders: { name: string; path: string }[];
+    }>(`/project-folders?${new URLSearchParams({ path })}`),
   createProject: (name: string, initGit: boolean, path?: string) =>
     request<{ project: Project }>("/projects", {
       method: "POST",
@@ -271,9 +282,14 @@ export const api = {
     }),
   sessionMetadata: (
     id: string,
-    metadata: { pinned?: boolean; archived?: boolean },
+    metadata: { pinned?: boolean; archived?: boolean; tags?: string[] },
   ) =>
-    request<{ sessionId: string; pinned: boolean; archived: boolean }>(
+    request<{
+      sessionId: string;
+      pinned: boolean;
+      archived: boolean;
+      tags: string[];
+    }>(
       `/sessions/${id}/metadata`,
       { method: "POST", body: JSON.stringify(metadata) },
     ),
@@ -310,7 +326,16 @@ export const api = {
       body: JSON.stringify({ provider }),
     }),
 
-  listSessions: () => request<{ sessions: SessionSummary[] }>("/sessions"),
+  listSessions: (filters: SessionListFilters = {}) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    const query = params.toString();
+    return request<{ sessions: SessionSummary[] }>(
+      `/sessions${query ? `?${query}` : ""}`,
+    );
+  },
   createSession: (projectId?: string) =>
     request<{ sessionId: string; status: string }>("/sessions", {
       method: "POST",

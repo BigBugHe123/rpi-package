@@ -21,11 +21,18 @@ import {
   Plus,
   Search,
   SquarePen,
+  Tag,
   X,
 } from "lucide-react";
 import { api, type Project, type SessionSummary } from "./api";
 import { translate, type Language } from "./i18n";
 import { createPortal } from "react-dom";
+
+type FolderNode = {
+  name: string;
+  path: string;
+  children?: FolderNode[];
+};
 
 function useMountedFlag() {
   const mounted = useRef(true);
@@ -113,33 +120,63 @@ export function ProjectDialog({
   const zh = language === "zh";
   const [mode, setMode] = useState<"create" | "open">("create");
   const [name, setName] = useState("");
+  const [nameEdited, setNameEdited] = useState(false);
   const [path, setPath] = useState("");
+  const [folderQuery, setFolderQuery] = useState("");
   const [git, setGit] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState<Project | null>(null);
-  const [folders, setFolders] = useState<{ name: string; path: string }[]>([]);
-  const [foldersLoading, setFoldersLoading] = useState(false);
+  const [folderNodes, setFolderNodes] = useState<FolderNode[]>([]);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [loadingFolders, setLoadingFolders] = useState<Set<string>>(
+    () => new Set(),
+  );
   const mounted = useMountedFlag();
+  function updateFolderChildren(
+    nodes: FolderNode[],
+    parentPath: string,
+    children: FolderNode[],
+  ): FolderNode[] {
+    return nodes.map((node) =>
+      node.path === parentPath
+        ? { ...node, children }
+        : node.children
+          ? { ...node, children: updateFolderChildren(node.children, parentPath, children) }
+          : node,
+    );
+  }
+
+  async function loadFolders(relative = "") {
+    setLoadingFolders((previous) => new Set(previous).add(relative));
+    try {
+      const result = await api.projectFolders(relative);
+      const children = result.folders.map((folder) => ({
+        name: folder.name,
+        path: folder.path,
+      }));
+      setFolderNodes((previous) =>
+        relative ? updateFolderChildren(previous, relative, children) : children,
+      );
+      setExpandedFolders((previous) => new Set(previous).add(relative));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setLoadingFolders((previous) => {
+        const next = new Set(previous);
+        next.delete(relative);
+        return next;
+      });
+    }
+  }
+
   useEffect(() => {
     if (mode !== "open") return;
-    let cancelled = false;
-    setFoldersLoading(true);
-    api
-      .projectFolders()
-      .then((result) => {
-        if (!cancelled) setFolders(result.folders);
-      })
-      .catch((cause) => {
-        if (!cancelled)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      })
-      .finally(() => {
-        if (!cancelled) setFoldersLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+    setFolderNodes([]);
+    setExpandedFolders(new Set());
+    void loadFolders();
   }, [mode]);
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -166,6 +203,70 @@ export function ProjectDialog({
     } finally {
       if (mounted.current) setBusy(false);
     }
+  }
+  const allFolders = (nodes: FolderNode[]): FolderNode[] =>
+    nodes.flatMap((node) => [node, ...(node.children ? allFolders(node.children) : [])]);
+  const folderMatches = folderQuery.trim()
+    ? allFolders(folderNodes).filter((folder) =>
+        `${folder.name} ${folder.path}`.toLowerCase().includes(folderQuery.trim().toLowerCase()),
+      )
+    : [];
+  function chooseFolder(folder: FolderNode) {
+    setPath(folder.path);
+    setFolderQuery(folder.path);
+    if (!nameEdited) setName(folder.name);
+  }
+  function updateFolderQuery(value: string) {
+    setFolderQuery(value);
+    setPath(value);
+    if (!nameEdited) {
+      const candidate = value.replace(/[\/]+$/, "").split(/[\/]/).pop() ?? "";
+      if (candidate) setName(candidate);
+    }
+  }
+  function toggleFolder(path: string) {
+    setExpandedFolders((previous) => {
+      const next = new Set(previous);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+  function renderFolder(folder: FolderNode, depth = 0): ReactNode {
+    const expanded = expandedFolders.has(folder.path);
+    const loading = loadingFolders.has(folder.path);
+    const hasChildren = folder.children === undefined || folder.children.length > 0;
+    return (
+      <div className="folder-tree-node" role="treeitem" aria-expanded={expanded} key={folder.path}>
+        <div className="folder-option-row" style={{ paddingLeft: 4 + depth * 16 }}>
+          <button
+            type="button"
+            className="folder-toggle"
+            aria-label={expanded ? (zh ? "折叠目录" : "Collapse folder") : (zh ? "展开目录" : "Expand folder")}
+            disabled={!hasChildren || loading || !!created}
+            onClick={() => {
+              if (!expanded && folder.children === undefined) void loadFolders(folder.path);
+              toggleFolder(folder.path);
+            }}
+          >
+            {loading ? <Loader2 size={13} className="spin" /> : hasChildren ? (expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : <span className="folder-toggle-placeholder" />}
+          </button>
+          <button
+            type="button"
+            role="option"
+            aria-selected={path === folder.path}
+            className="folder-option"
+            onClick={() => chooseFolder(folder)}
+            disabled={busy || !!created}
+          >
+            <Folder size={14} />
+            <span><strong>{folder.name}</strong><small>{folder.path}</small></span>
+            {path === folder.path && <Check size={14} />}
+          </button>
+        </div>
+        {expanded && folder.children?.map((child) => renderFolder(child, depth + 1))}
+      </div>
+    );
   }
   return (
     <Modal
@@ -209,7 +310,10 @@ export function ProjectDialog({
         <input
           id="project-name"
           value={name}
-          onChange={(event) => setName(event.target.value)}
+          onChange={(event) => {
+            setName(event.target.value);
+            setNameEdited(true);
+          }}
           placeholder={zh ? "例如：我的网站" : "e.g. my-website"}
           maxLength={80}
           autoFocus
@@ -221,36 +325,61 @@ export function ProjectDialog({
             <label htmlFor="project-path">
               {zh ? "选择文件夹" : "Choose a folder"}
             </label>
-            <select
+            <input
               id="project-path"
-              value={path}
-              onChange={(event) => setPath(event.target.value)}
+              value={folderQuery}
+              onChange={(event) => updateFolderQuery(event.target.value)}
+              placeholder={
+                zh ? "搜索文件夹，或粘贴路径…" : "Search folders or paste a path…"
+              }
+              autoComplete="off"
+              spellCheck={false}
               required
-              disabled={busy || !!created || foldersLoading}
+              disabled={busy || !!created}
+            />
+            <div
+              className="folder-picker"
+              role="tree"
+              aria-label={zh ? "可用文件夹" : "Available folders"}
             >
-              <option value="" disabled>
-                {foldersLoading
-                  ? zh
-                    ? "加载中…"
-                    : "Loading…"
-                  : folders.length
-                    ? zh
-                      ? "选择一个文件夹"
-                      : "Select a folder"
-                    : zh
-                      ? "没有可用的文件夹"
-                      : "No folders available"}
-              </option>
-              {folders.map((folder) => (
-                <option key={folder.path} value={folder.path}>
-                  {folder.name}
-                </option>
-              ))}
-            </select>
+              {loadingFolders.has("") ? (
+                <p className="folder-picker-empty muted">
+                  {zh ? "正在加载文件夹…" : "Loading folders…"}
+                </p>
+              ) : folderQuery.trim() ? (
+                folderMatches.length > 0 ? (
+                  folderMatches.map((folder) => (
+                    <button
+                      key={folder.path}
+                      type="button"
+                      role="option"
+                      aria-selected={path === folder.path}
+                      className="folder-option"
+                      onClick={() => chooseFolder(folder)}
+                      disabled={busy || !!created}
+                    >
+                      <Folder size={14} />
+                      <span><strong>{folder.name}</strong><small>{folder.path}</small></span>
+                      {path === folder.path && <Check size={14} />}
+                    </button>
+                  ))
+                ) : (
+                  <p className="folder-picker-empty muted">
+                    {zh ? "没有匹配的文件夹；也可以直接粘贴路径。" : "No matching folder; you can also paste a path directly."}
+                  </p>
+                )
+              ) : folderNodes.length > 0 ? (
+                folderNodes.map((folder) => renderFolder(folder))
+              ) : (
+                <p className="folder-picker-empty muted">
+                  {zh ? "没有可用的文件夹" : "No folders available"}
+                </p>
+              )}
+            </div>
             <p className="form-hint">
               {zh
-                ? "在以下目录中选择已有文件夹："
-                : "Choose an existing folder inside:"}{" "}
+                ? "可搜索下方目录，也可以直接输入或粘贴 root 内的相对路径："
+                : "Search the folders below, or type/paste a path inside:"}{" "}
               <code>{root}</code>
             </p>
           </>
@@ -386,6 +515,77 @@ export function RenameDialog({
   );
 }
 
+export function TagsDialog({
+  language,
+  session,
+  onClose,
+  onSave,
+}: {
+  language: Language;
+  session: SessionSummary;
+  onClose: () => void;
+  onSave: (tags: string[]) => Promise<void>;
+}) {
+  const zh = language === "zh";
+  const mounted = useMountedFlag();
+  const [value, setValue] = useState((session.tags ?? []).join(", "));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  return (
+    <Modal
+      language={language}
+      title={translate(language, "editTags")}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+    >
+      <form
+        className="project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (busy) return;
+          const tags = [...new Set(value.split(",").map((tag) => tag.trim()).filter(Boolean))];
+          setBusy(true);
+          setError("");
+          void onSave(tags)
+            .then(() => {
+              if (mounted.current) onClose();
+            })
+            .catch((cause: Error) => {
+              if (mounted.current) setError(cause.message);
+            })
+            .finally(() => {
+              if (mounted.current) setBusy(false);
+            });
+        }}
+      >
+        <label htmlFor="session-tags">{translate(language, "tags")}</label>
+        <input
+          id="session-tags"
+          autoFocus
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          placeholder={translate(language, "tagsPlaceholder")}
+          disabled={busy}
+        />
+        <p className="form-hint">
+          {zh ? "使用逗号分隔多个标签。" : "Separate multiple tags with commas."}
+        </p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button type="button" disabled={busy} onClick={onClose}>
+            {zh ? "取消" : "Cancel"}
+          </button>
+          <button className="primary" disabled={busy}>
+            {busy ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+            {translate(language, "saveTags")}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function shortTime(time: number, language: Language) {
   const minutes = Math.max(0, Math.floor((Date.now() - time) / 60_000));
   const zh = language === "zh";
@@ -415,9 +615,10 @@ interface SidebarProps {
   onNewSession: (projectId: string) => void;
   onNewProject: () => void;
   onRename: (session: SessionSummary) => void;
+  onEditTags: (session: SessionSummary) => void;
   onMetadata: (
     session: SessionSummary,
-    patch: { pinned?: boolean; archived?: boolean },
+    patch: { pinned?: boolean; archived?: boolean; tags?: string[] },
   ) => Promise<void>;
 }
 
@@ -435,11 +636,14 @@ export function ProjectSidebar({
   onNewSession,
   onNewProject,
   onRename,
+  onEditTags,
   onMetadata,
 }: SidebarProps) {
   const zh = language === "zh";
   const [query, setQuery] = useState("");
   const [archived, setArchived] = useState(false);
+  const [tagFilter, setTagFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
     try {
       return new Set(
@@ -498,9 +702,10 @@ export function ProjectSidebar({
     });
   }
   const normalized = query.trim().toLowerCase();
+  const availableTags = [...new Set(sessions.flatMap((session) => session.tags ?? []))].sort((a, b) => a.localeCompare(b));
   async function metadata(
     session: SessionSummary,
-    patch: { pinned?: boolean; archived?: boolean },
+    patch: { pinned?: boolean; archived?: boolean; tags?: string[] },
   ) {
     if (pending) return;
     setPending(session.sessionId);
@@ -550,6 +755,16 @@ export function ProjectSidebar({
             {session.relation && <span className="fork-label">↳ </span>}
             {title}
           </span>
+          {(session.tags ?? []).length > 0 && (
+            <span className="session-tags" aria-label={translate(language, "tags")}>
+              {(session.tags ?? []).slice(0, 2).map((tag) => (
+                <span className="session-tag" key={tag}>{tag}</span>
+              ))}
+              {(session.tags ?? []).length > 2 && (
+                <span className="session-tag-more">+{(session.tags ?? []).length - 2}</span>
+              )}
+            </span>
+          )}
           <time dateTime={new Date(session.updatedAt).toISOString()}>
             {shortTime(session.updatedAt, language)}
           </time>
@@ -593,6 +808,16 @@ export function ProjectSidebar({
                   >
                     <SquarePen size={14} />
                     {zh ? "重命名" : "Rename"}
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenu("");
+                      onEditTags(session);
+                    }}
+                  >
+                    <Tag size={14} />
+                    {translate(language, "editTags")}
                   </button>
                   <button
                     role="menuitem"
@@ -660,6 +885,36 @@ export function ProjectSidebar({
           />
           <kbd>Ctrl K</kbd>
         </label>
+        <div className="sidebar-filters">
+          <label className={`sidebar-filter ${tagFilter ? "active" : ""}`}>
+            <Tag size={12} aria-hidden="true" />
+            <select
+              aria-label={translate(language, "filterTag")}
+              value={tagFilter}
+              onChange={(event) => setTagFilter(event.target.value)}
+            >
+              <option value="">{translate(language, "allTags")}</option>
+              {availableTags.map((tag) => (
+                <option key={tag} value={tag}>{tag}</option>
+              ))}
+            </select>
+          </label>
+          <label className={`sidebar-filter ${statusFilter ? "active" : ""}`}>
+            <span className="sidebar-filter-dot" aria-hidden="true" />
+            <select
+              aria-label={translate(language, "filterStatus")}
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+            >
+              <option value="">{translate(language, "allStatuses")}</option>
+              <option value="ready">{translate(language, "ready")}</option>
+              <option value="running">{translate(language, "running")}</option>
+              <option value="awaiting_input">{translate(language, "awaiting_input")}</option>
+              <option value="offline">{translate(language, "offline")}</option>
+              <option value="error">{translate(language, "error")}</option>
+            </select>
+          </label>
+        </div>
       </div>
       <div className="project-section-heading">
         <span>
@@ -709,6 +964,8 @@ export function ProjectSidebar({
                   session.projectId === project.id ||
                   (!session.projectId && project.id === groups[0].id)) &&
                 Boolean(session.archived) === archived &&
+                (!tagFilter || (session.tags ?? []).includes(tagFilter)) &&
+                (!statusFilter || session.status === statusFilter) &&
                 (projectMatches ||
                   `${session.title ?? ""} ${session.sessionId}`
                     .toLowerCase()

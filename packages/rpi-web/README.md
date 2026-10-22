@@ -195,7 +195,7 @@ When using a remote service, these are **server directories**. To register an ex
 rpi-web --project /work/project-a --add-project /work/project-b --add-project /work/project-c --projects-root /work/new-projects --rpi-bin /path/to/rpi --assets /path/to/web/assets
 ```
 
-Sessions are grouped by project. New sessions use the selected project as the tools' working directory; forks and clones retain their source project. Session menus support rename, pin, archive, and restore. Archiving retains history and does not cancel a running task. Sidebar search filters project names and session titles.
+Sessions are grouped by project. New sessions use the selected project as the tools' working directory; forks and clones retain their source project. Session menus support rename, tags, pin, archive, and restore. Archiving retains history and does not cancel a running task. Sidebar search filters project names, session titles, tags, and ids; tag and status selectors provide narrower views.
 
 ### Commands and keyboard shortcuts
 
@@ -306,13 +306,14 @@ The server binds to loopback by default and exposes:
   `begin`, display the returned authorization URL/instructions, then send
   `exchange` with `{ "input": { "value": "..." } }`; credential material is
   saved natively and never returned to the browser
-- `POST /api/v1/sessions` / `GET /api/v1/sessions` (list)
+- `POST /api/v1/sessions` / `GET /api/v1/sessions` (list; optional `q`, `projectId`, `tag`, `status`, `archived`, and `pinned` filters)
 - `GET /api/v1/sessions/:id` / `DELETE /api/v1/sessions/:id`
 - `POST /api/v1/sessions/:id/open` (reopen a remembered session)
 - `POST /api/v1/sessions/:id/commands`
 - `POST /api/v1/sessions/:id/fork` with optional `{ "entryId": "...", "title": "..." }`
 - `POST /api/v1/sessions/:id/clone` with optional `{ "title": "..." }`
 - `POST /api/v1/sessions/:id/rename` with `{ "title": "..." }`
+- `POST /api/v1/sessions/:id/metadata` with optional `pinned`, `archived`, and `tags` fields
 - `GET /api/v1/sessions/:id/snapshot` (native transcript + caught-up events)
 - `GET /api/v1/sessions/:id/events` (SSE, `?after=<seq>` replay)
 
