@@ -12,16 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - *(orchestrator)* run children on the calling session's provider/model
-
-### Fixed
-
-- *(orchestrator)* `subagent`/`dispatch` now run children on the calling session's
+  `subagent`/`dispatch` now run children on the calling session's
   provider/model instead of silently falling back to the settings default. The
   binding is read from the host (`GetExecutionContext`) and passed as
   `--provider`/`--model`; explicit parameters still win. This is how a
   delegation could end up on a different model, or fail with `No API key` for a
   provider the session never used (`openai` + a catalog model with no credential).
-- *(orchestrator)* a failed child reports the binding it ran on
+  A failed child also reports the binding it ran on
   (`subagent exited with 2 (selection=openai/gpt-6-astra): …`), so an
   unattributable `No API key` / `No model matches` no longer forces guesswork.
 
