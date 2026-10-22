@@ -41,6 +41,7 @@ pub(super) fn dispatch_with(
         usize,
         &Control,
         &Progress,
+        &crate::host::Selection,
     ) -> Vec<(String, Result<String, String>)>,
 ) -> Result<String, String> {
     control.check()?;
@@ -85,7 +86,17 @@ pub(super) fn dispatch_with(
     // `plan`, and vice versa).
     let snapshot = graph.clone();
     drop(guard);
-    let outcomes = run(&snapshot, &ready, max_parallel, control, progress_tx);
+    // Nodes that name neither a provider nor a model run on this session's
+    // binding, exactly like a standalone `subagent` call.
+    let parent = crate::host::parent_selection(params);
+    let outcomes = run(
+        &snapshot,
+        &ready,
+        max_parallel,
+        control,
+        progress_tx,
+        &parent,
+    );
 
     // Reject an already stale wave before running acceptance commands, then
     // keep verification outside the graph lock so plan/show and session
@@ -156,6 +167,7 @@ pub(super) fn run_wave(
     max_parallel: usize,
     control: &Control,
     progress_tx: &Progress,
+    parent: &crate::host::Selection,
 ) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(max_parallel.max(1)) {
@@ -180,13 +192,15 @@ pub(super) fn run_wave(
                     let node = graph.get(id).cloned().expect("ready node exists");
                     let id = id.clone();
                     let control = control.clone();
+                    let selection =
+                        parent.effective(node.provider.as_deref(), node.model.as_deref());
                     let handle = scope.spawn(move || {
                         spawn::run(
                             &node.task,
                             node.max_turns,
                             node.timeout_secs,
-                            node.provider.as_deref(),
-                            node.model.as_deref(),
+                            selection.provider(),
+                            selection.model(),
                             &control,
                         )
                     });

@@ -41,25 +41,28 @@ pub fn subagent(
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
-    // Optional provider/model passthrough: the child shares the agent dir and
-    // would otherwise fall back to its *default* provider, which is not
-    // necessarily the one the orchestrator was started with.
-    let provider = optional_trimmed(params, "provider");
-    let model = optional_trimmed(params, "model");
+    // Optional provider/model passthrough. A child `rpi` process shares this
+    // session's agent dir but *not* its binding, so a call that names neither
+    // would silently resolve the default provider from settings. Default to the
+    // binding the host reports for this session and pass it down explicitly.
+    let selection = crate::host::parent_selection(params).effective(
+        optional_trimmed(params, "provider").as_deref(),
+        optional_trimmed(params, "model").as_deref(),
+    );
 
     progress(progress_tx, &format!("[subagent] running (role={role})…"));
     let output = spawn::run(
         &task,
         max_turns,
         timeout_secs,
-        provider.as_deref(),
-        model.as_deref(),
+        selection.provider(),
+        selection.model(),
         control,
     )?;
     Ok(content_only(&format!(
         "[subagent role={role} turns<={max_turns} timeout={timeout_secs}s provider={} model={}]\n{output}",
-        provider.as_deref().unwrap_or("-"),
-        model.as_deref().unwrap_or("-"),
+        selection.provider().unwrap_or("-"),
+        selection.model().unwrap_or("-"),
     )))
 }
 

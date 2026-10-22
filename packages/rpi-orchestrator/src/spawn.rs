@@ -44,9 +44,11 @@ pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 /// spawning anything.
 ///
 /// `provider` / `model` are passed through as `--provider` / `--model`. The child
-/// shares the orchestrator's agent dir, so without them it silently falls back to
-/// the *default* provider — which is wrong (or broken) whenever the orchestrator
-/// itself was started with an explicit `--provider` / `--model`.
+/// shares the orchestrator's agent dir but not its binding, so without them it
+/// would resolve the *default* provider from settings — wrong (or broken)
+/// whenever this session runs on anything else, or on a provider the default does
+/// not authenticate. Callers therefore resolve the effective pair from
+/// [`crate::host::parent_selection`] first and always pass it down.
 pub fn child_command(
     exe: &Path,
     max_turns: u64,
@@ -84,6 +86,26 @@ pub fn child_command(
         command.process_group(0);
     }
     command
+}
+
+/// The failure text for a child that exited non-zero, naming the binding it ran
+/// on. Split out so the shape is testable on every platform.
+pub(crate) fn failure_message(
+    code: Option<i32>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    text: &str,
+) -> String {
+    let selection = crate::host::Selection {
+        provider: provider.map(str::to_string),
+        model: model.map(str::to_string),
+    };
+    format!(
+        "subagent exited with {} (selection={}):\n{}",
+        code.unwrap_or(-1),
+        selection.label(),
+        text
+    )
 }
 
 /// Truncate to [`MAX_OUTPUT_BYTES`] on a char boundary, appending a marker.
@@ -214,11 +236,10 @@ pub fn run_with_exe(
                 }
                 let text = truncate_output(text);
                 if !status.success() {
-                    return Err(format!(
-                        "subagent exited with {}:\n{}",
-                        status.code().unwrap_or(-1),
-                        text
-                    ));
+                    // Name the binding in the failure: without it a `No API key` or
+                    // `No model matches` from the child is unattributable, and the
+                    // caller can only guess again.
+                    return Err(failure_message(status.code(), provider, model, &text));
                 }
                 return Ok(text);
             }
@@ -568,6 +589,69 @@ mod tests {
         assert_eq!(
             bare_args,
             vec!["-p", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
+        );
+    }
+
+    #[test]
+    fn an_inherited_parent_binding_reaches_the_child_command() {
+        // A call that names neither provider nor model runs on this session's
+        // binding, so the child must receive it explicitly: its own default
+        // provider is not the session's and need not be authenticated at all.
+        let parent = crate::host::Selection {
+            provider: Some("routeryo-copy".into()),
+            model: Some("gpt-6.1-sol".into()),
+        };
+        let selection = parent.effective(None, None);
+        let command = child_command(
+            Path::new("/usr/bin/rpi"),
+            8,
+            selection.provider(),
+            selection.model(),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--provider", "routeryo-copy"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-6.1-sol"]));
+    }
+
+    #[test]
+    fn a_failure_names_the_binding_that_was_used() {
+        let named = failure_message(Some(2), Some("openai"), Some("gpt-6-astra"), "boom");
+        assert!(named.contains("exited with 2"), "{named}");
+        assert!(named.contains("selection=openai/gpt-6-astra"), "{named}");
+        assert!(named.ends_with("boom"), "{named}");
+
+        // A call that passed nothing (settings default) still reports its exit
+        // code instead of looking like a crash without a cause.
+        let unset = failure_message(None, None, None, "");
+        assert!(unset.contains("exited with -1"), "{unset}");
+        assert!(unset.contains("selection=-"), "{unset}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_child_names_the_attempted_selection() {
+        // `No API key` / `No model matches` from the child used to surface with
+        // no attribution at all, so the caller could only guess again.
+        let error = run_with_exe(
+            Path::new("/bin/false"),
+            "task",
+            1,
+            5,
+            Some("openai"),
+            Some("gpt-6-astra"),
+            &Control::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("selection=openai/gpt-6-astra"),
+            "got: {error}"
         );
     }
 
