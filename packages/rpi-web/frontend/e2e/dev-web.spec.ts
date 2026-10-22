@@ -684,8 +684,11 @@ test("mobile navigation opens without horizontal overflow", async ({
   await mockHost(page);
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: "What shall we build?" }),
-  ).toBeVisible();
+    page.locator(".breadcrumb-project").first(),
+  ).toHaveText("pi-rust");
+  await expect(page.locator(".breadcrumb h1").first()).toHaveText(
+    "Mock session",
+  );
   await page
     .getByRole("button", { name: "Toggle sidebar", exact: true })
     .click();

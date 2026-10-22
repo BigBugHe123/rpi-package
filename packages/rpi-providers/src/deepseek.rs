@@ -20,6 +20,13 @@ fn compatibility() -> OpenaiCompletionsCompat {
         supports_strict_mode: Some(false),
         supports_reasoning_effort: Some(true),
         requires_reasoning_content: Some(true),
+        // The wire `reasoning_content` is part of the completion, and DeepSeek
+        // bills those hidden tokens inside `max_tokens`. Declaring it lets the
+        // provider protocol reserve the active thinking level's budget on top of
+        // the answer allowance; without it a long chain of thought consumed the
+        // whole 8k ceiling and the answer arrived empty with
+        // `finish_reason: "length"`.
+        reasoning_counts_toward_max_tokens: Some(true),
         max_tokens_field: Some(MaxTokensField::MaxTokens),
         ..Default::default()
     }
@@ -35,8 +42,10 @@ pub fn models() -> Vec<Model> {
         let mut model = Model::new(id, name, Api::OpenaiCompletions, PROVIDER_ID, BASE_URL);
         model.reasoning = true;
         model.context_window = 1_000_000;
-        // Conservative per-request default, not the server's maximum.
-        model.max_tokens = 8_192;
+        // The visible answer's allowance. Thinking room is added on top by the
+        // provider protocol (`reasoningCountsTowardMaxTokens`), and the server
+        // accepts well above this — it is a per-request default, not its maximum.
+        model.max_tokens = 16_384;
         model.thinking_level_map = Some(BTreeMap::from([
             (ThinkingLevel::Xhigh, Some("high".into())),
             (ThinkingLevel::Max, Some("max".into())),

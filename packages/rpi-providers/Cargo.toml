@@ -1,6 +1,6 @@
 [package]
 name = "rpi-providers"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,12 +16,13 @@ prebuilt = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# SDK 0.6.3 publishes the optional provider bridge and matching host API.
+# SDK 0.8.0 carries `reasoningCountsTowardMaxTokens`, which the DeepSeek catalog
+# declares so a long chain of thought cannot consume the whole output budget.
 # Keep all three dependencies on the same released version. Do not change
 # the SDK used by unrelated extensions in this workspace.
 [dependencies]
-rpi-ai = { version = "=0.6.3", features = ["providers"] }
-rpi-plugin-sdk = { version = "=0.6.3", features = ["provider"] }
+rpi-ai = { version = "=0.8.0", features = ["providers"] }
+rpi-plugin-sdk = { version = "=0.8.0", features = ["provider"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +30,6 @@ reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
 
 [dev-dependencies]
-rpi-extensions = { version = "=0.6.3" }
+rpi-extensions = { version = "=0.8.0" }
 tokio = { workspace = true, features = ["macros", "net", "io-util"] }
 tempfile = "3"
