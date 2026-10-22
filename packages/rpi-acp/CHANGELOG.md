@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Forward `todo` result snapshots as ACP plan updates so Zed's plan panel reflects pending, in-progress, and completed task states immediately.
+
 ## [0.1.11] - 2026-10-21
 
 ### Added
