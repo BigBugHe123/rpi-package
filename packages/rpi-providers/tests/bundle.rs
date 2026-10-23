@@ -109,14 +109,28 @@ async fn simultaneous_requests_use_each_providers_own_factory_and_credentials() 
             };
             assert!(headers.starts_with("post /v1/chat/completions "));
             assert!(headers.contains(&format!("authorization: bearer fixture-{id}")));
-            assert!(headers.contains(&format!("x-provider-fixture: {id}")));
+            for (name, expected) in [
+                ("authorization", format!("bearer fixture-{id}")),
+                ("x-provider-fixture", id.to_string()),
+            ] {
+                let values: Vec<_> = headers
+                    .lines()
+                    .filter_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case(name).then(|| value.trim())
+                    })
+                    .collect();
+                assert_eq!(values, [expected.as_str()], "{id}: {name}");
+            }
+            assert!(!headers.contains("stale-"));
             assert_eq!(
-                headers.contains("x-title: fixture title"),
+                headers.contains("x-title: request title"),
                 id == "openrouter"
             );
             if id == "openrouter" {
                 assert!(headers.contains("http-referer: https://fixture.invalid/"));
                 assert!(!headers.contains("x-title: rpi"));
+                assert!(!headers.contains("x-title: fixture title"));
             }
             if id == "deepseek" {
                 assert_eq!(body["thinking"]["type"], "disabled");
@@ -132,18 +146,26 @@ async fn simultaneous_requests_use_each_providers_own_factory_and_credentials() 
     for provider in providers {
         let mut model = provider.models()[0].clone();
         model.base_url = base.clone();
-        model.headers = Some(std::collections::BTreeMap::from([(
-            "X-Provider-Fixture".into(),
-            provider.id().to_string(),
-        )]));
+        model.headers = Some(std::collections::BTreeMap::from([
+            ("X-Provider-Fixture".into(), "model-default".into()),
+            ("Authorization".into(), "Bearer stale-model".into()),
+        ]));
         if provider.id() == "openrouter" {
             let headers = model.headers.as_mut().unwrap();
             headers.insert("x-title".into(), "Fixture title".into());
             headers.insert("http-referer".into(), "https://fixture.invalid/".into());
         }
         requests.push(tokio::spawn(async move {
+            let mut headers = std::collections::BTreeMap::from([
+                ("x-provider-fixture".into(), provider.id().to_string()),
+                ("aUtHoRiZaTiOn".into(), "Bearer stale-request".into()),
+            ]);
+            if provider.id() == "openrouter" {
+                headers.insert("X-Title".into(), "Request title".into());
+            }
             let options = SimpleStreamOptions {
                 api_key: Some(format!("fixture-{}", provider.id())),
+                headers: Some(headers),
                 max_retries: Some(0),
                 timeout: Some(Duration::from_secs(5)),
                 ..Default::default()

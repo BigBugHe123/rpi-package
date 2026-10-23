@@ -141,6 +141,10 @@ async fn host_retries_extension_stalls_and_checks_compat_after_manifest_defaults
 }
 
 async fn read_request(socket: &mut TcpStream) -> Value {
+    read_request_with_headers(socket).await.0
+}
+
+async fn read_request_with_headers(socket: &mut TcpStream) -> (Value, String) {
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 4096];
@@ -158,8 +162,80 @@ async fn read_request(socket: &mut TcpStream) -> Value {
                 .parse()
                 .unwrap();
             if bytes.len() >= end + 4 + length {
-                return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                return (
+                    serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
+                    String::from_utf8(bytes[..end].to_vec()).unwrap(),
+                );
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn proxy_header_overrides_do_not_send_duplicate_credentials_or_routing_headers() {
+    use rpi_providers::proxy::{ProxyConfig, ProxyProvider};
+    for request_override in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (_, headers) = read_request_with_headers(&mut socket).await;
+            let body = format!("{}data: [DONE]\n\n", frame("done", true));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            headers
+        });
+        let base = format!("http://{address}/v1");
+        let provider = ProxyProvider::new(
+            ProxyConfig::new(&base)
+                .with_header("X-Tenant", "config-tenant")
+                .with_header("authorization", "Bearer ConfigToken"),
+        );
+        let mut model = Model::new(
+            "fixture",
+            "Fixture",
+            rpi_ai::Api::OpenaiCompletions,
+            "proxy",
+            base,
+        );
+        model.headers = Some(std::collections::BTreeMap::from([
+            ("x-tenant".into(), "model-tenant".into()),
+            ("Authorization".into(), "Bearer ModelToken".into()),
+        ]));
+        let mut options = options(Duration::from_secs(1));
+        options.api_key = None;
+        if request_override {
+            options.headers = Some(std::collections::BTreeMap::from([
+                ("x-TENANT".into(), "request-tenant".into()),
+                ("aUtHoRiZaTiOn".into(), "Bearer RequestToken".into()),
+            ]));
+        }
+        let stream = provider
+            .stream_simple(&model, &Context::new(vec![]), &options)
+            .await;
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop, "{message:?}");
+        let headers = server.await.unwrap();
+        let expected = if request_override {
+            ["request-tenant", "Bearer RequestToken"]
+        } else {
+            ["config-tenant", "Bearer ConfigToken"]
+        };
+        for (name, value) in ["x-tenant", "authorization"].into_iter().zip(expected) {
+            let values: Vec<_> = headers
+                .lines()
+                .filter_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim())
+                })
+                .collect();
+            assert_eq!(
+                values,
+                [value],
+                "{name}; request override={request_override}"
+            );
         }
     }
 }

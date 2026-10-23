@@ -19,7 +19,7 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
 宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
-`6130d1585519839cbf13192881af8fe9718935da`。当前 crates.io 的 0.8.1 不包含此修复；
+`b158b6a8495f7e6dda051f46d1fa56df07e085a0`。当前 crates.io 的 0.8.1 不包含此修复；
 正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
 其他扩展继续使用工作区固定的 SDK 0.3.20。
 
@@ -118,6 +118,9 @@ medium / high / xhigh 映射 high，max 映射 max。遵循宿主 options 约定
 规则依据 [思考模式与工具调用](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
 用户端点和请求头由宿主私有执行绑定提供，本包不读取进程 key 或改回固定运行时端点。
+请求头名称按不区分大小写的方式合并，覆盖或删除时不会保留旧名称的另一种大小写。
+Rust Proxy 调用中，请求级 headers 优先于 ProxyConfig，后者优先于模型默认 headers；
+显式 API key 的认证优先级保持不变。普通 metadata 的键仍区分大小写。
 涉及包的 `/reload` 会重新绑定；移除当前包时保留旧会话并报错，先切换模型再卸载。
 
 ## 流超时与兼容配置

@@ -145,12 +145,11 @@ impl Provider for ProxyProvider {
             options.api_key = self.config.api_key.clone();
         }
         if let Some(headers) = &self.config.headers {
-            let options_headers = options.headers.get_or_insert_with(Default::default);
-            for (key, value) in headers {
-                options_headers
-                    .entry(key.clone())
-                    .or_insert_with(|| value.clone());
+            let mut merged = headers.clone();
+            for (key, value) in options.headers.take().unwrap_or_default() {
+                rpi_ai::provider::set_http_header(&mut merged, &key, Some(&value));
             }
+            options.headers = Some(merged);
         }
         rpi_plugin_sdk::provider::completions(&model, &options, true)
             .stream_simple(&model, context, &options)
