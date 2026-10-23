@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Restore the upstream delegation-envelope implementation from before the
+  ChildAgent backend. `delegate_task` validates parameters and returns an
+  envelope; scheduling remains a host responsibility.
+
 ## [0.1.7](https://github.com/pi-rust/rpi-package/compare/rpi-subagents-v0.1.6...rpi-subagents-v0.1.7) - 2026-10-17
 
 ### Added
