@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Restore the desktop workspace chrome after the responsive pass: keep the rounded buttons, cards, popovers and composer instead of the global square-corner override, and restore the missing `--radius` token.
+- Hide the mobile-only session switcher and its backdrop on desktop, and keep the connection status chip in the toolbar.
+- Keep the model and thinking (provider) pickers in the composer only instead of duplicating them in the top-right toolbar.
 - Prevent background RPC, Git and authentication refresh processes from opening console windows on Windows while preserving their standard I/O and shutdown behavior.
 
 ### Added
