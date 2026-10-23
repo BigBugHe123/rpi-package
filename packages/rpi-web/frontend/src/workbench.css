@@ -346,12 +346,33 @@
 }
 .jump-to-bottom {
   position: absolute;
+  right: 16px;
   bottom: 175px;
-  left: 50%;
-  transform: translateX(-50%);
-  border-radius: 20px;
-  box-shadow: var(--shadow);
+  left: auto;
+  transform: none;
   z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  box-shadow: 0 4px 14px #0002;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.jump-to-bottom:hover:not(:disabled),
+.jump-to-bottom:focus-visible {
+  border-color: var(--text);
+  background: var(--hover);
+  color: var(--text);
+}
+.jump-to-bottom svg {
+  flex: 0 0 auto;
 }
 .workbench ~ .inspector {
   display: none;

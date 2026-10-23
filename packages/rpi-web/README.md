@@ -195,7 +195,7 @@ When using a remote service, these are **server directories**. To register an ex
 rpi-web --project /work/project-a --add-project /work/project-b --add-project /work/project-c --projects-root /work/new-projects --rpi-bin /path/to/rpi --assets /path/to/web/assets
 ```
 
-Sessions are grouped by project. New sessions use the selected project as the tools' working directory; forks and clones retain their source project. Session menus support rename, pin, archive, and restore. Archiving retains history and does not cancel a running task. Sidebar search filters project names and session titles.
+Sessions are grouped by project. New sessions use the selected project as the tools' working directory; forks and clones retain their source project. Session menus support rename, tags, pin, archive, and restore. Archiving retains history and does not cancel a running task. Sidebar search filters project names, session titles, tags, and ids; tag and status selectors provide narrower views.
 
 ### Commands and keyboard shortcuts
 
@@ -291,7 +291,10 @@ From the `rpi-package` repository root, with a native host already installed or 
 cargo run --locked -p rpi-web -- --project /path/to/project --rpi-bin /path/to/rpi --assets packages/rpi-web/assets --port 3030
 ```
 
-Built frontend assets are committed to the repository. Install Node.js dependencies and rebuild only when changing the frontend, as described below.
+The frontend bundle in `assets/` is generated, not committed. Build it once with the
+frontend commands below before `cargo build` / `cargo run` if you want the embedded
+workspace; without it the server still compiles and serves a "frontend not built" page,
+and `--assets` can point at an existing bundle.
 
 ### API and capability discovery
 
@@ -306,13 +309,14 @@ The server binds to loopback by default and exposes:
   `begin`, display the returned authorization URL/instructions, then send
   `exchange` with `{ "input": { "value": "..." } }`; credential material is
   saved natively and never returned to the browser
-- `POST /api/v1/sessions` / `GET /api/v1/sessions` (list)
+- `POST /api/v1/sessions` / `GET /api/v1/sessions` (list; optional `q`, `projectId`, `tag`, `status`, `archived`, and `pinned` filters)
 - `GET /api/v1/sessions/:id` / `DELETE /api/v1/sessions/:id`
 - `POST /api/v1/sessions/:id/open` (reopen a remembered session)
 - `POST /api/v1/sessions/:id/commands`
 - `POST /api/v1/sessions/:id/fork` with optional `{ "entryId": "...", "title": "..." }`
 - `POST /api/v1/sessions/:id/clone` with optional `{ "title": "..." }`
 - `POST /api/v1/sessions/:id/rename` with `{ "title": "..." }`
+- `POST /api/v1/sessions/:id/metadata` with optional `pinned`, `archived`, and `tags` fields
 - `GET /api/v1/sessions/:id/snapshot` (native transcript + caught-up events)
 - `GET /api/v1/sessions/:id/events` (SSE, `?after=<seq>` replay)
 
@@ -434,7 +438,12 @@ npm run dev          # Vite on :3181, proxying /api to :3030
 npm run e2e:production # builds and runs browser regression against the actual production bundle
 ```
 
-`assets/` is generated output committed to the repository. Both entry points embed it during compilation, and the standalone server can also serve an external directory. Rebuild and commit it whenever `frontend/src` changes; rebuild the Rust library or executable to update its embedded frontend.
+`assets/` is generated output and is ignored by git; it is produced by `npm run build`
+and never edited by hand. Both entry points embed it during compilation, and the
+standalone server can also serve an external directory. Rebuild it after changing
+`frontend/src`, then rebuild the Rust library or executable to update the embedded
+frontend. Release pipelines rebuild the bundle themselves, so a fresh checkout only
+needs this step for local builds.
 
 ## Integration checks
 

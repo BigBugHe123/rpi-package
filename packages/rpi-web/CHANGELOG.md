@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent background RPC, Git and authentication refresh processes from opening console windows on Windows while preserving their standard I/O and shutdown behavior.
+
+### Added
+
+- Add durable session tags, server-side session list filters, and sidebar tag/status filtering.
+- Add a session tag editor with bounded, normalized tag persistence.
+
+### Notes
+
+- Session search currently indexes project names, session titles, IDs, and tags without opening offline native hosts. Transcript full-text search remains a follow-up feature.
+
 ## [0.1.5] - 2026-10-21
 
 ### Changed

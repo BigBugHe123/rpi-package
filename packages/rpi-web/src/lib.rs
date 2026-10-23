@@ -7,6 +7,7 @@ mod assets;
 pub mod config;
 mod host;
 mod plugin;
+mod process;
 mod projects;
 mod protocol;
 mod registry;

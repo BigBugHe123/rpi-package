@@ -10,7 +10,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    process::Command,
     sync::{broadcast, mpsc, oneshot, Mutex, RwLock},
 };
 
@@ -221,7 +220,7 @@ impl HostSession {
             timings_dir.join(format!("{}.json", fork_source.unwrap_or(session_id))),
         )?;
         timings.set_session(session_id);
-        let mut command = Command::new(&rpi_bin);
+        let mut command = crate::process::background_command(&rpi_bin);
         command.arg("--mode").arg("rpc");
         if let Some(source) = fork_source {
             command.arg("--fork").arg(source);
@@ -236,7 +235,6 @@ impl HostSession {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|error| format!("failed to start {}: {error}", rpi_bin.display()))?;
         let stdin = child.stdin.take().ok_or("rpi host stdin unavailable")?;

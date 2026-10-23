@@ -13,6 +13,8 @@ pub struct SessionPreferences {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,10 +100,12 @@ impl Registry {
         id: &str,
         pinned: Option<bool>,
         archived: Option<bool>,
+        tags: Option<Vec<String>>,
     ) -> Result<SessionPreferences, String> {
         if self.get(id).is_none() {
             return Err("session not found".into());
         }
+        let normalized_tags = tags.map(|tags| normalize_tags(tags)).transpose()?;
         let previous = self.preferences(id);
         let value = self.preferences.entry(id.into()).or_default();
         if let Some(pinned) = pinned {
@@ -109,6 +113,9 @@ impl Registry {
         }
         if let Some(archived) = archived {
             value.archived = archived;
+        }
+        if let Some(tags) = normalized_tags {
+            value.tags = tags;
         }
         let result = value.clone();
         if let Err(error) = self.save_result() {
@@ -202,6 +209,29 @@ impl Registry {
     }
 }
 
+const MAX_TAGS: usize = 12;
+const MAX_TAG_LENGTH: usize = 32;
+
+fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_LENGTH {
+            return Err(format!("tag is longer than {MAX_TAG_LENGTH} characters"));
+        }
+        if !normalized.iter().any(|item| item == tag) {
+            normalized.push(tag.to_owned());
+        }
+        if normalized.len() > MAX_TAGS {
+            return Err(format!("a session can have at most {MAX_TAGS} tags"));
+        }
+    }
+    Ok(normalized)
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -264,11 +294,19 @@ mod tests {
         assert_eq!(entry.updated_at, 5);
         assert_eq!(entry.project_id.as_deref(), Some("project-a"));
         registry
-            .update_preferences("a", Some(true), Some(true))
+            .update_preferences(
+                "a",
+                Some(true),
+                Some(true),
+                Some(vec!["work".into(), "priority".into()]),
+            )
             .unwrap();
         let reloaded = Registry::load(dir.join("sessions.json")).unwrap();
         assert!(reloaded.preferences("a").pinned && reloaded.preferences("a").archived);
-        registry.update_preferences("a", None, Some(false)).unwrap();
+        assert_eq!(reloaded.preferences("a").tags, ["work", "priority"]);
+        registry
+            .update_preferences("a", None, Some(false), None)
+            .unwrap();
         assert!(registry.preferences("a").pinned && !registry.preferences("a").archived);
         assert!(registry.rename("a", "renamed".into()).unwrap());
         assert_eq!(registry.get("a").unwrap().title.as_deref(), Some("renamed"));
@@ -316,6 +354,60 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_and_limits_tags() {
+        let dir = std::env::temp_dir().join(format!("rpi-web-tags-{}", uuid::Uuid::new_v4()));
+        let mut registry = Registry::load(dir.join("sessions.json")).unwrap();
+        registry
+            .upsert(RegistryEntry {
+                session_id: "tags".into(),
+                project_id: None,
+                title: None,
+                parent_session_id: None,
+                fork_entry_id: None,
+                relation: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .update_preferences(
+                "tags",
+                None,
+                None,
+                Some(vec![
+                    " work ".into(),
+                    "work".into(),
+                    "priority".into(),
+                    "".into(),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(registry.preferences("tags").tags, ["work", "priority"]);
+        assert!(registry
+            .update_preferences(
+                "tags",
+                None,
+                None,
+                Some(vec!["x".repeat(MAX_TAG_LENGTH + 1)]),
+            )
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_empty_tags() {
+        let dir =
+            std::env::temp_dir().join(format!("rpi-web-legacy-tags-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        std::fs::write(&path, r#"{"sessions":[{"sessionId":"legacy"}],"preferences":{"legacy":{"pinned":true,"archived":false}}}"#).unwrap();
+        let registry = Registry::load(path).unwrap();
+        assert!(registry.preferences("legacy").pinned);
+        assert!(registry.preferences("legacy").tags.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_writes_roll_back_all_registry_mutations() {
         let dir = std::env::temp_dir().join(format!("rpi-web-registry-{}", uuid::Uuid::new_v4()));
         let path = dir.join("sessions.json");
@@ -332,13 +424,13 @@ mod tests {
         };
         registry.upsert(entry.clone()).unwrap();
         registry
-            .update_preferences("kept", Some(true), None)
+            .update_preferences("kept", Some(true), None, None)
             .unwrap();
         std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
         assert!(registry.rename("kept", "Unsaved".into()).is_err());
         assert!(registry.remove("kept").is_err());
         assert!(registry
-            .update_preferences("kept", Some(false), Some(true))
+            .update_preferences("kept", Some(false), Some(true), None)
             .is_err());
         let mut other = entry;
         other.session_id = "unsaved".into();
