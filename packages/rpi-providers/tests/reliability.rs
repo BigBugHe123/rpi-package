@@ -448,6 +448,36 @@ async fn deepseek_preserves_explicit_thinking_format_and_effort_mapping() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deepseek_disables_thinking_for_custom_non_reasoning_models() {
+    let (_session, providers) = providers();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id() == "deepseek")
+        .unwrap();
+    for requested in [None, Some(ThinkingLevel::High)] {
+        let mut fixture = Fixture::new(vec![(Duration::ZERO, frame("done", true))], true).await;
+        let mut model = model(provider.as_ref(), &fixture);
+        // models.json entries without `reasoning` default to false. Preserve
+        // explicit thinking=off even if the remote endpoint defaults it on.
+        model.reasoning = false;
+        let mut options = options(Duration::from_secs(1));
+        options.reasoning = requested;
+        let stream = provider
+            .stream_simple(&model, &Context::new(vec![]), &options)
+            .await;
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop, "{message:?}");
+        let request = (&mut fixture.request).await.unwrap();
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(request.get("reasoning_effort").is_none());
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_config_timeout_is_a_fallback_and_request_options_take_precedence() {
     use rpi_providers::proxy::{ProxyConfig, ProxyProvider};
     let mut fixture = Fixture::new(vec![(Duration::ZERO, frame("partial", false))], false).await;

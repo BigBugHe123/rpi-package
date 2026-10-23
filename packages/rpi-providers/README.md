@@ -19,7 +19,7 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
 宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
-`6ff6d70b2b64459ff65934baca17d989923b7a82`。当前 crates.io 的 0.8.1 不包含此修复；
+`85189291ca38a4c9daaaa534da906d631a4f36c8`。当前 crates.io 的 0.8.1 不包含此修复；
 正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
 其他扩展继续使用工作区固定的 SDK 0.3.20。
 
@@ -109,6 +109,8 @@ cargo run -p rpi-providers --bin rpi-llama -- status
 `--thinking off` 显式发送 `thinking.type=disabled`；minimal / low 映射 low，
 medium / high / xhigh 映射 high，max 映射 max。遵循宿主 options 约定：`None` 与 `Off`
 均关闭思考；CLI 的默认 medium 映射 high，不依赖供应商隐含默认值。
+自定义模型未声明 `reasoning` 或显式设为 `false` 时，也会发送关闭思考的字段，
+避免服务端默认开启思考。
 部分 `compat` 对象会补全 DeepSeek 默认值，并保留用户显式指定的字段和思考等级映射。
 `supportsReasoningEffort: false` 会禁止发送 `reasoning_effort`；
 `thinkingFormat` 控制思考开关字段。历史思考回传始终保留。
@@ -159,7 +161,8 @@ cargo test -p rpi-providers --test reliability --locked -- --include-ignored
 OpenAI key 隔离、端点 / 请求头覆盖和实际 CLI 推理，不访问 DeepSeek 服务。
 `reliability` 另覆盖四个 Provider 的流空闲超时、心跳与分帧、取消、禁用、独立总超时、
 兼容字段和思考历史，以及实际宿主通过扩展重试卡住的 SSE 请求。
-PR 工作流在 Linux、Windows、macOS 上执行这些离线检查。
+PR 工作流在 Linux、Windows、macOS 上执行这些离线检查，并验证宿主重载时将
+配置警告返回界面，不直接写入正在使用的终端。
 
 ## 可选真实 API 验证
 
