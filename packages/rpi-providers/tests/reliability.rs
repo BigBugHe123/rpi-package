@@ -285,7 +285,7 @@ async fn every_loaded_provider_keeps_active_fragmented_streams_alive() {
         let data = frame("healthy", true);
         let split = data.len() / 2;
         let chunks = vec![
-            (Duration::ZERO, ": ping\n\n".into()),
+            (Duration::ZERO, "event: ping\n\ndata: \n\n".into()),
             (Duration::from_millis(200), ": ping\n\n".into()),
             (Duration::from_millis(200), data[..split].into()),
             (Duration::from_millis(200), data[split..].into()),

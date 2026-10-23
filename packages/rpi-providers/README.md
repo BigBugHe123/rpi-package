@@ -19,7 +19,7 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
 宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
-`85189291ca38a4c9daaaa534da906d631a4f36c8`。当前 crates.io 的 0.8.1 不包含此修复；
+`6130d1585519839cbf13192881af8fe9718935da`。当前 crates.io 的 0.8.1 不包含此修复；
 正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
 其他扩展继续使用工作区固定的 SDK 0.3.20。
 
@@ -127,7 +127,8 @@ medium / high / xhigh 映射 high，max 映射 max。遵循宿主 options 约定
 - 宿主默认总请求超时为 600 秒，流空闲超时为 300 秒。
 - `rpi --stream-idle-timeout 60` 将空闲超时设为 60 秒；`0` 禁用空闲检测。
 - `~/.rpi/agent/settings.json` 中可持久化 `"streamIdleTimeout": 60`，命令行优先。
-- 心跳和未完整解析的帧，只要收到非空字节就刷新空闲计时；卡住后产生可重试错误。
+- 心跳和未完整解析的帧，只要收到非空字节就刷新空闲计时；带事件名但无数据的
+  心跳和空数据帧会被跳过。卡住后产生可重试错误。
 - Rust 调用方使用 `SimpleStreamOptions.stream_idle_timeout`；Proxy 的配置超时只在
   请求未指定 `timeout` 时作为回退。llama.cpp 管理操作的超时与推理超时分别设置。
 
