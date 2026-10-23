@@ -22,7 +22,8 @@ pub struct LlamaCppConfig {
     #[serde(default = "default_server_url")]
     pub server_url: String,
 
-    /// Request timeout
+    /// Timeout for health and model-management requests. Streaming inference
+    /// uses `SimpleStreamOptions` independently.
     #[serde(default = "default_timeout")]
     pub timeout: Duration,
 
@@ -52,6 +53,7 @@ impl Default for LlamaCppConfig {
 pub struct LlamaCppProvider {
     config: LlamaCppConfig,
     client: Client,
+    inference_client: Option<Client>,
 }
 
 impl LlamaCppProvider {
@@ -62,7 +64,11 @@ impl LlamaCppProvider {
             .build()
             .expect("Failed to build HTTP client");
 
-        Self { config, client }
+        Self {
+            config,
+            client,
+            inference_client: None,
+        }
     }
 
     /// Create with default configuration
@@ -70,11 +76,19 @@ impl LlamaCppProvider {
         Self::new(LlamaCppConfig::default())
     }
 
+    pub(super) fn with_client(config: LlamaCppConfig, client: Client) -> Self {
+        Self {
+            config,
+            client: client.clone(),
+            inference_client: Some(client),
+        }
+    }
+
     /// Check if the server is available
     pub async fn health_check(&self) -> Result<bool, AiError> {
         let url = format!("{}/health", self.config.server_url);
 
-        let mut request = self.client.get(&url);
+        let mut request = self.client.get(&url).timeout(self.config.timeout);
 
         if let Some(api_key) = &self.config.api_key {
             request = request.header("Authorization", format!("Bearer {}", api_key));
@@ -92,7 +106,7 @@ impl LlamaCppProvider {
     pub async fn get_model_info(&self) -> Result<serde_json::Value, AiError> {
         let url = format!("{}/v1/models", self.config.server_url);
 
-        let mut request = self.client.get(&url);
+        let mut request = self.client.get(&url).timeout(self.config.timeout);
 
         if let Some(api_key) = &self.config.api_key {
             request = request.header("Authorization", format!("Bearer {}", api_key));
@@ -143,9 +157,14 @@ impl Provider for LlamaCppProvider {
         if options.api_key.is_none() {
             options.api_key = self.config.api_key.clone();
         }
-        rpi_plugin_sdk::provider::completions(&model, &options, true)
-            .stream_simple(&model, context, &options)
-            .await
+        crate::transport::stream(
+            self.inference_client.as_ref(),
+            &model,
+            context,
+            &options,
+            true,
+        )
+        .await
     }
 }
 

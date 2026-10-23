@@ -17,13 +17,20 @@ fn model() -> Model {
     model
 }
 
-fn create(model: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
-    Arc::new(ProxyProvider::new(ProxyConfig {
-        endpoint: model.base_url.clone(),
-        api_key: options.api_key.clone(),
-        timeout: options.timeout,
-        headers: options.headers.clone(),
-    }))
+fn create(
+    context: &rpi_plugin_sdk::provider::ProviderContext,
+    model: &Model,
+    options: &SimpleStreamOptions,
+) -> Result<Arc<dyn Provider>, String> {
+    Ok(Arc::new(ProxyProvider::with_client(
+        ProxyConfig {
+            endpoint: model.base_url.clone(),
+            api_key: options.api_key.clone(),
+            timeout: options.timeout,
+            headers: options.headers.clone(),
+        },
+        context.client(&model.base_url)?,
+    )))
 }
 
 crate::registration::register_provider!(

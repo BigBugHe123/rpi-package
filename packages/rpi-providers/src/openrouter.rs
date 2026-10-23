@@ -7,6 +7,7 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub struct OpenRouterProvider {
     api_key: Option<String>,
     models: Vec<Model>,
+    client: Option<reqwest::Client>,
 }
 
 impl OpenRouterProvider {
@@ -14,6 +15,7 @@ impl OpenRouterProvider {
         Self {
             api_key,
             models: vec![default_model()],
+            client: None,
         }
     }
 }
@@ -49,9 +51,7 @@ impl Provider for OpenRouterProvider {
                 headers.insert(name.into(), value.into());
             }
         }
-        rpi_plugin_sdk::provider::completions(model, &options, false)
-            .stream_simple(model, context, &options)
-            .await
+        crate::transport::stream(self.client.as_ref(), model, context, &options, false).await
     }
 }
 
@@ -68,11 +68,16 @@ fn default_model() -> Model {
     model
 }
 
-fn create(model: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
-    Arc::new(OpenRouterProvider {
+fn create(
+    context: &rpi_plugin_sdk::provider::ProviderContext,
+    model: &Model,
+    options: &SimpleStreamOptions,
+) -> Result<Arc<dyn Provider>, String> {
+    Ok(Arc::new(OpenRouterProvider {
         api_key: options.api_key.clone(),
         models: vec![model.clone()],
-    })
+        client: Some(context.client(&model.base_url)?),
+    }))
 }
 
 crate::registration::register_provider!(

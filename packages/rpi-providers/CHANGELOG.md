@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Ship the pending stream idle timeout, keepalive/BOM/CR framing, DeepSeek compat/reasoning replay and case-insensitive header fixes together.
+- Pin the released 0.8.3 SDK and propagate client construction errors as terminal provider errors.
+
+### Changed
+
+- Reuse lifecycle-scoped runtimes and bounded HTTP connection pools for all four providers, while keeping credentials and request headers separate.
+- Cancel active work and reject new calls on reload; older hosts without lifecycle support retain the request-scoped fallback.
+
 ## [0.1.3](https://github.com/pi-rust/rpi-package/compare/rpi-providers-v0.1.2...rpi-providers-v0.1.3) - 2026-10-22
 
 ### Fixed
