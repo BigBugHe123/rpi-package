@@ -16,13 +16,13 @@ prebuilt = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# SDK 0.8.0 carries `reasoningCountsTowardMaxTokens`, which the DeepSeek catalog
-# declares so a long chain of thought cannot consume the whole output budget.
-# Keep all three dependencies on the same released version. Do not change
-# the SDK used by unrelated extensions in this workspace.
+# Use the SDK's maintained compat handling and stream idle watchdog.
+# Keep these three dependencies on one SDK revision. This reviewed commit
+# contains the unreleased transport fix; switch all three to its crates.io
+# release before merging/publishing. Unrelated extensions retain their SDK.
 [dependencies]
-rpi-ai = { version = "=0.8.0", features = ["providers"] }
-rpi-plugin-sdk = { version = "=0.8.0", features = ["provider"] }
+rpi-ai = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "fb655c55a2b86dff04b55c5af164512f49307f01", features = ["providers"] }
+rpi-plugin-sdk = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "fb655c55a2b86dff04b55c5af164512f49307f01", features = ["provider"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +30,6 @@ reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
 
 [dev-dependencies]
-rpi-extensions = { version = "=0.8.0" }
+rpi-extensions = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "fb655c55a2b86dff04b55c5af164512f49307f01" }
 tokio = { workspace = true, features = ["macros", "net", "io-util"] }
 tempfile = "3"

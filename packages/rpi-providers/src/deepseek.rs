@@ -1,7 +1,9 @@
 //! DeepSeek policy belongs to this optional package. Wire parsing, retries and
 //! the native streaming ABI use the maintained provider protocol and bridge.
 use rpi_ai::{
-    model::{MaxTokensField, OpenaiCompletionsCompat, StreamingProtocolCompat},
+    model::{
+        MaxTokensField, OpenaiCompletionsCompat, OpenaiThinkingFormat, StreamingProtocolCompat,
+    },
     types::ModelCostRates,
     Api, AssistantMessageEventStream, Context, Model, Provider, SimpleStreamOptions, ThinkingLevel,
 };
@@ -20,6 +22,7 @@ fn compatibility() -> OpenaiCompletionsCompat {
         supports_strict_mode: Some(false),
         supports_reasoning_effort: Some(true),
         requires_reasoning_content: Some(true),
+        thinking_format: Some(OpenaiThinkingFormat::Deepseek),
         // The wire `reasoning_content` is part of the completion, and DeepSeek
         // bills those hidden tokens inside `max_tokens`. Declaring it lets the
         // provider protocol reserve the active thinking level's budget on top of
@@ -30,6 +33,21 @@ fn compatibility() -> OpenaiCompletionsCompat {
         max_tokens_field: Some(MaxTokensField::MaxTokens),
         ..Default::default()
     }
+}
+
+fn thinking_levels() -> BTreeMap<ThinkingLevel, Option<String>> {
+    use ThinkingLevel::*;
+    [
+        (Minimal, "low"),
+        (Low, "low"),
+        (Medium, "high"),
+        (High, "high"),
+        (Xhigh, "high"),
+        (Max, "max"),
+    ]
+    .into_iter()
+    .map(|(level, effort)| (level, Some(effort.into())))
+    .collect()
 }
 
 pub fn models() -> Vec<Model> {
@@ -46,10 +64,7 @@ pub fn models() -> Vec<Model> {
         // provider protocol (`reasoningCountsTowardMaxTokens`), and the server
         // accepts well above this — it is a per-request default, not its maximum.
         model.max_tokens = 16_384;
-        model.thinking_level_map = Some(BTreeMap::from([
-            (ThinkingLevel::Xhigh, Some("high".into())),
-            (ThinkingLevel::Max, Some("max".into())),
-        ]));
+        model.thinking_level_map = Some(thinking_levels());
         model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compatibility()));
         // Peak USD / million tokens, checked 2026-10-16. Off-peak billing
         // can be lower; users can override estimates in models.json.
@@ -117,28 +132,25 @@ impl Provider for DeepSeekProvider {
             // Tool continuation requires prior reasoning, including assistant
             // turns without a tool call. Preserve other user compat overrides.
             compat.requires_reasoning_content = Some(true);
+            compat.supports_store.get_or_insert(false);
+            compat.supports_developer_role.get_or_insert(false);
+            compat.supports_strict_mode.get_or_insert(false);
+            compat.supports_reasoning_effort.get_or_insert(true);
+            compat
+                .reasoning_counts_toward_max_tokens
+                .get_or_insert(true);
+            compat
+                .max_tokens_field
+                .get_or_insert(MaxTokensField::MaxTokens);
+            compat
+                .thinking_format
+                .get_or_insert(OpenaiThinkingFormat::Deepseek);
         }
-        let params = model
-            .sampling_params
-            .get_or_insert_with(serde_json::Map::new);
-        // The host represents reasoning=off as None as well as Some(Off).
-        // Follow SimpleStreamOptions semantics rather than the API's default.
-        let level = options.reasoning_level();
-        params.insert(
-            "thinking".into(),
-            json!({
-                "type": if level == ThinkingLevel::Off { "disabled" } else { "enabled" }
-            }),
-        );
-        if level == ThinkingLevel::Off {
-            params.remove("reasoning_effort");
-        } else {
-            let effort = match level {
-                ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
-                ThinkingLevel::Max => "max",
-                _ => "high",
-            };
-            params.insert("reasoning_effort".into(), json!(effort));
+        let levels = model
+            .thinking_level_map
+            .get_or_insert_with(Default::default);
+        for (level, effort) in thinking_levels() {
+            levels.entry(level).or_insert(effort);
         }
         let mut options = options.clone();
         if options.api_key.is_none() {

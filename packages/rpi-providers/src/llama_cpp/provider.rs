@@ -22,7 +22,8 @@ pub struct LlamaCppConfig {
     #[serde(default = "default_server_url")]
     pub server_url: String,
 
-    /// Request timeout
+    /// Timeout for health and model-management requests. Streaming inference
+    /// uses `SimpleStreamOptions` independently.
     #[serde(default = "default_timeout")]
     pub timeout: Duration,
 

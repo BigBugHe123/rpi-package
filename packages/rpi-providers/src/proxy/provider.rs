@@ -55,7 +55,8 @@ pub struct ProxyConfig {
     /// Optional API key for the proxy (not the underlying LLM provider).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Request timeout. Defaults to 600 seconds if not specified.
+    /// Total request timeout when `SimpleStreamOptions::timeout` is unset.
+    /// Per-request options take precedence; absent values use the SDK default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Duration>,
     /// Additional headers to send with each request.
@@ -139,6 +140,7 @@ impl Provider for ProxyProvider {
             model.base_url = self.config.endpoint.clone();
         }
         let mut options = options.clone();
+        options.timeout = options.timeout.or(self.config.timeout);
         if options.api_key.is_none() {
             options.api_key = self.config.api_key.clone();
         }

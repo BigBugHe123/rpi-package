@@ -17,15 +17,14 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 ## 安装、升级与迁移
 
-当前使用 crates.io 发布的 `rpi-plugin-sdk` 0.6.3，并显式启用可选的 `provider`
-feature；`rpi-ai` 与集成测试使用的 `rpi-extensions` 同样固定为 0.6.3。
-使用 rpi 0.6.3 宿主，无需从指定 Git 提交构建。从 0.1.2 开始，本包发布到 crates.io，
-并通过 GitHub Release 分发预编译包；其他扩展继续使用工作区固定的 SDK 0.3.20。
+本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
+宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
+`fb655c55a2b86dff04b55c5af164512f49307f01`。当前 crates.io 的 0.8.1 不包含此修复；
+正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
+其他扩展继续使用工作区固定的 SDK 0.3.20。
 
-```toml
-rpi-plugin-sdk = { version = "=0.6.3", features = ["provider"] }
-rpi-ai = { version = "=0.6.3", features = ["providers"] }
-```
+从 0.1.2 开始，本包发布到 crates.io，并通过 GitHub Release 分发预编译包。
+仅更新宿主不会替换旧动态库内部的协议实现，升级时还需要 `rpi update` 更新本扩展。
 
 `provider` 默认关闭；普通工具扩展无需启用，也不会因此引入 AI / HTTP 依赖。
 
@@ -101,7 +100,7 @@ cargo run -p rpi-providers --bin rpi-llama -- status
 
 默认目录按 `deepseek-v4-pro`、`deepseek-flash` 排序，保持原先默认 Pro 的行为。
 端点为 `https://api.deepseek.com/v1`，目录上下文为 1,000,000 token，每次请求输出预设
-8,192 token；后者是保守默认值，可通过 models.json 或请求 options 覆盖。
+16,384 token；后者是保守默认值，可通过 models.json 或请求 options 覆盖。
 目录价格采用 2026-10-16 的峰时美元 / 百万 token 估值，非峰时账单可能较低，可覆盖 cost。
 
 模型名、限制与价格依据 [首次调用](https://api-docs.deepseek.com/)、
@@ -110,11 +109,30 @@ cargo run -p rpi-providers --bin rpi-llama -- status
 `--thinking off` 显式发送 `thinking.type=disabled`；minimal / low 映射 low，
 medium / high / xhigh 映射 high，max 映射 max。遵循宿主 options 约定：`None` 与 `Off`
 均关闭思考；CLI 的默认 medium 映射 high，不依赖供应商隐含默认值。
+部分 `compat` 对象会补全 DeepSeek 默认值，并保留用户显式指定的字段和思考等级映射。
+`supportsReasoningEffort: false` 会禁止发送 `reasoning_effort`；
+`thinkingFormat` 控制思考开关字段。历史思考回传始终保留。
 工具请求保留所有历史 assistant 思考块，包括上一轮没有调用工具的回答，避免续轮 400。
 规则依据 [思考模式与工具调用](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
 用户端点和请求头由宿主私有执行绑定提供，本包不读取进程 key 或改回固定运行时端点。
 涉及包的 `/reload` 会重新绑定；移除当前包时保留旧会话并报错，先切换模型再卸载。
+
+## 流超时与兼容配置
+
+四个 Provider 共用 SDK 的 SSE 实现。总请求超时与流空闲超时独立生效：
+
+- 宿主默认总请求超时为 600 秒，流空闲超时为 300 秒。
+- `rpi --stream-idle-timeout 60` 将空闲超时设为 60 秒；`0` 禁用空闲检测。
+- `~/.rpi/agent/settings.json` 中可持久化 `"streamIdleTimeout": 60`，命令行优先。
+- 心跳和未完整解析的帧，只要收到非空字节就刷新空闲计时；卡住后产生可重试错误。
+- Rust 调用方使用 `SimpleStreamOptions.stream_idle_timeout`；Proxy 的配置超时只在
+  请求未指定 `timeout` 时作为回退。llama.cpp 管理操作的超时与推理超时分别设置。
+
+`models.json` 支持 `thinkingFormat: "deepseek"` 和
+`requiresReasoningContentOnAssistantMessages: true`；原生
+`requiresReasoningContent` 与别名并存时，以原生字段为准。未知字段和非法类型由宿主
+在补齐扩展 API 默认值后报告，避免配置被静默忽略。
 
 ## 离线验证
 
@@ -129,15 +147,19 @@ cargo test -p rpi-providers
 中文 UTF-8 跨块、thinking 与 usage、响应未结束时取消、HTTP 401、唯一终态、思考开关，
 以及工具调用 → 工具结果 → 回答 → 新用户轮次的完整历史回传。
 
-宿主命令与凭据检查另外需要安装或构建 rpi 0.6.3 CLI，再设置路径显式执行：
+宿主联调需要构建上述同一 SDK 提交的 CLI，再设置路径显式执行：
 
 ```powershell
 $env:RPI_TEST_CLI = 'C:\path\to\pi-rust\target\debug\rpi.exe'
-cargo test -p rpi-providers --test host -- --ignored --nocapture
+cargo test -p rpi-providers --test host --locked -- --ignored --nocapture
+cargo test -p rpi-providers --test reliability --locked -- --include-ignored
 ```
 
 该测试使用隔离的临时配置与本地 SSE 服务，验证目录、禁用扩展、默认模型、认证来源、
 OpenAI key 隔离、端点 / 请求头覆盖和实际 CLI 推理，不访问 DeepSeek 服务。
+`reliability` 另覆盖四个 Provider 的流空闲超时、心跳与分帧、取消、禁用、独立总超时、
+兼容字段和思考历史，以及实际宿主通过扩展重试卡住的 SSE 请求。
+PR 工作流在 Linux、Windows、macOS 上执行这些离线检查。
 
 ## 可选真实 API 验证
 
