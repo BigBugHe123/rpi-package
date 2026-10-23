@@ -444,14 +444,13 @@ fn auth_refresh_command(
     project: &std::path::Path,
     provider: &str,
 ) -> Command {
-    let mut command = Command::new(program);
+    let mut command = crate::process::background_command(program);
     command
         .args(["auth", "refresh", "--provider", provider])
         .current_dir(project)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::null());
     command
 }
 

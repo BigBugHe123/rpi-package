@@ -108,6 +108,15 @@ export interface RuntimeStats {
   cachedTokens: number;
   uncachedTokens: number;
   totalTokens: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  input?: number | null;
+  output?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  cost?: number | null;
   provider?: string | null;
   modelId?: string | null;
   operationCount?: number;

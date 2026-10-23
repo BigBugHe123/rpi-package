@@ -200,6 +200,35 @@ function blocksToText(value: unknown): string {
     .join("\n");
 }
 
+/** Extract text blocks returned by the read tool without rendering its transport envelope. */
+export function readOutput(result: unknown): string | null {
+  if (typeof result === "string") {
+    try {
+      const parsed: unknown = JSON.parse(result);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        Array.isArray((parsed as Record<string, unknown>).content) &&
+        ("details" in parsed || "usage" in parsed || "terminate" in parsed)
+      ) {
+        return readOutput(parsed);
+      }
+    } catch {
+      // A normal source file is not necessarily JSON.
+    }
+    return result;
+  }
+  if (!result || typeof result !== "object") return null;
+  const record = result as Record<string, unknown>;
+  if (Array.isArray(record.content)) {
+    const text = blocksToText(record.content);
+    return text || null;
+  }
+  for (const key of ["text", "output", "result"]) {
+    if (typeof record[key] === "string") return record[key] as string;
+  }
+  return null;
+}
 /** Shell results are text or `{stdout, stderr}` objects, not JSON payloads. */
 export function shellOutput(result: unknown): string {
   if (result === undefined || result === null) return "";

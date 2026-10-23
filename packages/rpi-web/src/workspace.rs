@@ -8,7 +8,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::io::AsyncReadExt;
 
 const FILE_LIMIT: u64 = 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 2 * 1024 * 1024;
@@ -251,7 +251,7 @@ async fn git(
     project: &Project,
     args: &[&str],
 ) -> Result<(bool, String), (StatusCode, Json<Value>)> {
-    let mut child = Command::new("git")
+    let mut child = crate::process::background_command("git")
         .args([
             "--no-pager",
             "--literal-pathspecs",
@@ -266,7 +266,6 @@ async fn git(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .map_err(|_| {
             failure(

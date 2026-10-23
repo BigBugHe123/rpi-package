@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent background RPC, Git and authentication refresh processes from opening console windows on Windows while preserving their standard I/O and shutdown behavior.
+
 ### Added
 
 - Add durable session tags, server-side session list filters, and sidebar tag/status filtering.

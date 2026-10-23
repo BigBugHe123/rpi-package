@@ -82,13 +82,12 @@ impl Projects {
         if existing.is_none() && init_git {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                tokio::process::Command::new("git")
+                crate::process::background_command("git")
                     .args(["-c", "core.fsmonitor=false", "init", "--quiet"])
                     .arg(&path)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
                     .status(),
             )
             .await;

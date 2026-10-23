@@ -19,7 +19,6 @@ import {
   Pin,
   PinOff,
   Plus,
-  Search,
   SquarePen,
   Tag,
   X,
@@ -27,7 +26,6 @@ import {
 import { api, type Project, type SessionSummary } from "./api";
 import { translate, type Language } from "./i18n";
 import { createPortal } from "react-dom";
-
 type FolderNode = {
   name: string;
   path: string;
@@ -56,56 +54,120 @@ export function Modal({
   children: ReactNode;
   language?: Language;
 }) {
-  const ref = useRef<HTMLDialogElement>(null);
+  const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const dialog = ref.current;
-    dialog?.showModal();
-    const input = dialog?.querySelector<HTMLInputElement>(
+    const input = ref.current?.querySelector<HTMLInputElement>(
       'input:not([type="checkbox"])',
     );
     input?.focus();
     input?.select();
-    return () => dialog?.close();
-  }, []);
-  return (
-    <dialog
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+  return createPortal(
+    <div
       ref={ref}
       className="workspace-dialog"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
+      role="dialog"
+      aria-modal="true"
       aria-label={title}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) {
-          const box = event.currentTarget.getBoundingClientRect();
-          if (
-            event.clientX < box.left ||
-            event.clientX > box.right ||
-            event.clientY < box.top ||
-            event.clientY > box.bottom
-          )
-            onClose();
-        }
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div className="dialog-heading">
-        <h2>{title}</h2>
-        <button
-          className="icon-button"
-          type="button"
-          aria-label={translate(language, "closeDialog")}
-          title={translate(language, "closeDialog")}
-          onClick={onClose}
-        >
-          <X size={17} />
-        </button>
+      <div className="workspace-dialog-surface">
+        <div className="dialog-heading">
+          <h2>{title}</h2>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={translate(language, "closeDialog")}
+            title={translate(language, "closeDialog")}
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+        {children}
       </div>
-      {children}
-    </dialog>
+    </div>,
+    document.body,
   );
 }
 
+export function PromptDialog({
+  language,
+  title,
+  message,
+  defaultValue = "",
+  onClose,
+  onSubmit,
+}: {
+  language: Language;
+  title: string;
+  message?: string;
+  defaultValue?: string;
+  onClose: () => void;
+  onSubmit: (value: string) => void;
+}) {
+  const [value, setValue] = useState(defaultValue);
+  const t = (key: "cancel" | "submit") => translate(language, key);
+  return (
+    <Modal language={language} title={title} onClose={onClose}>
+      <form
+        className="project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit(value);
+        }}
+      >
+        {message && <p className="dialog-description">{message}</p>}
+        <input
+          autoFocus
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+        />
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>{t("cancel")}</button>
+          <button type="submit" className="primary">{t("submit")}</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+export function ConfirmDialog({
+  language,
+  title,
+  message,
+  onClose,
+  onConfirm,
+}: {
+  language: Language;
+  title: string;
+  message: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <Modal language={language} title={title} onClose={onClose}>
+      <div className="project-form">
+        <p className="dialog-description">{message}</p>
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>
+            {translate(language, "cancel")}
+          </button>
+          <button type="button" className="danger" onClick={onConfirm}>
+            {translate(language, "submit")}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
 export function ProjectDialog({
   language,
   root,
@@ -640,10 +702,7 @@ export function ProjectSidebar({
   onMetadata,
 }: SidebarProps) {
   const zh = language === "zh";
-  const [query, setQuery] = useState("");
   const [archived, setArchived] = useState(false);
-  const [tagFilter, setTagFilter] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
     try {
       return new Set(
@@ -701,8 +760,6 @@ export function ProjectSidebar({
       return next;
     });
   }
-  const normalized = query.trim().toLowerCase();
-  const availableTags = [...new Set(sessions.flatMap((session) => session.tags ?? []))].sort((a, b) => a.localeCompare(b));
   async function metadata(
     session: SessionSummary,
     patch: { pinned?: boolean; archived?: boolean; tags?: string[] },
@@ -875,46 +932,6 @@ export function ProjectSidebar({
           <span>{zh ? "新建会话" : "New session"}</span>
           <kbd>Ctrl N</kbd>
         </button>
-        <label className="sidebar-search">
-          <Search size={15} />
-          <input
-            aria-label={zh ? "搜索项目或会话" : "Search projects or chats"}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder={zh ? "搜索" : "Search"}
-          />
-          <kbd>Ctrl K</kbd>
-        </label>
-        <div className="sidebar-filters">
-          <label className={`sidebar-filter ${tagFilter ? "active" : ""}`}>
-            <Tag size={12} aria-hidden="true" />
-            <select
-              aria-label={translate(language, "filterTag")}
-              value={tagFilter}
-              onChange={(event) => setTagFilter(event.target.value)}
-            >
-              <option value="">{translate(language, "allTags")}</option>
-              {availableTags.map((tag) => (
-                <option key={tag} value={tag}>{tag}</option>
-              ))}
-            </select>
-          </label>
-          <label className={`sidebar-filter ${statusFilter ? "active" : ""}`}>
-            <span className="sidebar-filter-dot" aria-hidden="true" />
-            <select
-              aria-label={translate(language, "filterStatus")}
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value)}
-            >
-              <option value="">{translate(language, "allStatuses")}</option>
-              <option value="ready">{translate(language, "ready")}</option>
-              <option value="running">{translate(language, "running")}</option>
-              <option value="awaiting_input">{translate(language, "awaiting_input")}</option>
-              <option value="offline">{translate(language, "offline")}</option>
-              <option value="error">{translate(language, "error")}</option>
-            </select>
-          </label>
-        </div>
       </div>
       <div className="project-section-heading">
         <span>
@@ -954,30 +971,20 @@ export function ProjectSidebar({
         aria-label={zh ? "项目与会话" : "Projects and chats"}
       >
         {groups.map((project) => {
-          const projectMatches = project.name
-            .toLowerCase()
-            .includes(normalized);
           const chats = sessions
             .filter(
               (session) =>
                 (!projects.length ||
                   session.projectId === project.id ||
                   (!session.projectId && project.id === groups[0].id)) &&
-                Boolean(session.archived) === archived &&
-                (!tagFilter || (session.tags ?? []).includes(tagFilter)) &&
-                (!statusFilter || session.status === statusFilter) &&
-                (projectMatches ||
-                  `${session.title ?? ""} ${session.sessionId}`
-                    .toLowerCase()
-                    .includes(normalized)),
+                Boolean(session.archived) === archived,
             )
             .sort(
               (a, b) =>
                 Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) ||
                 b.updatedAt - a.updatedAt,
             );
-          if (normalized && !projectMatches && !chats.length) return null;
-          const expanded = !collapsed.has(project.id) || Boolean(normalized);
+          const expanded = !collapsed.has(project.id);
           return (
             <section
               key={project.id}

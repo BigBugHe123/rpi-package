@@ -22,15 +22,10 @@ export default defineConfig({
     },
   },
   server: {
-    host: "10.100.100.3",
-    port: 3181,
+    host: "0.0.0.0",
+    port: 18088,
     strictPort: true,
     allowedHosts: ["work.bigfisharc.cn"],
-    hmr: {
-      protocol: "wss",
-      host: "work.bigfisharc.cn",
-      clientPort: 443,
-    },
     proxy: {
       "/api": {
         target: "http://127.0.0.1:3180",

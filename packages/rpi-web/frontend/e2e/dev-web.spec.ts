@@ -1,3 +1,4 @@
+import { chooseMenuOption } from "./controls";
 import { test, expect, type Page, type Route } from "@playwright/test";
 
 const sessionId = "session-1";
@@ -349,6 +350,50 @@ test("capabilities gate the history and queue inspector", async ({ page }) => {
   await expect(queueToggle).toBeVisible();
   await queueToggle.click();
   await expect(page.locator(".composer-queue-panel")).toContainText("pending");
+  await page
+    .locator(".composer-queue-item")
+    .getByRole("button", { name: "Edit queued message" })
+    .click();
+  await expect(page.locator(".composer textarea")).toHaveValue("pending");
+  await expect(page.locator(".composer-queue-editing")).toContainText(
+    "Edit queued message",
+  );
+});
+
+test("failed queue cancellation restores the removed message", async ({ page }) => {
+  await mockHost(page);
+  let release!: () => void;
+  let cancelling = false;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route(`**/api/v1/sessions/${sessionId}/commands`, async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type !== "cancel_queued") return route.fallback();
+    cancelling = true;
+    await held;
+    return route.fulfill({
+      json: {
+        ...response({}, body.type),
+        success: false,
+        error: "Cancellation rejected",
+      },
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Queue: 1", exact: true }).click();
+  await page
+    .locator(".composer-queue-item")
+    .getByRole("button", { name: "Cancel queued message" })
+    .click();
+  await expect.poll(() => cancelling).toBe(true);
+  await expect(page.locator(".composer-queue-item")).toHaveCount(0);
+  release();
+  await expect(page.locator(".composer-queue-item")).toContainText("pending");
+  await expect(page.locator(".error-banner")).toContainText("Cancellation rejected");
+  expect(errors).toEqual([]);
 });
 
 test("history records expand and queue history toggles", async ({ page }) => {
@@ -463,7 +508,9 @@ test("opening an existing folder is searchable and fills its project name", asyn
   await page.goto("/");
   await page.getByRole("button", { name: "New project", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add project", exact: true });
-  await dialog.getByRole("button", { name: "Open folder", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Open folder", exact: true })
+    .click();
   const folderInput = dialog.getByLabel("Choose a folder", { exact: true });
   await folderInput.fill("zim");
   const zimt = dialog.getByRole("option", { name: /zimt/ });
@@ -473,18 +520,24 @@ test("opening an existing folder is searchable and fills its project name", asyn
   await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
     "zimt",
   );
-  await dialog.getByLabel("Project name", { exact: true }).fill("Zimt workspace");
+  await dialog
+    .getByLabel("Project name", { exact: true })
+    .fill("Zimt workspace");
   await folderInput.fill("demo");
   await dialog.getByRole("option", { name: /demo-app/ }).click();
   await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
     "Zimt workspace",
   );
-  await dialog.getByRole("button", { name: "Add project and start chat" }).click();
-  await expect.poll(() => createdBody).toEqual({
-    name: "Zimt workspace",
-    initGit: true,
-    path: "demo-app",
-  });
+  await dialog
+    .getByRole("button", { name: "Add project and start chat" })
+    .click();
+  await expect
+    .poll(() => createdBody)
+    .toEqual({
+      name: "Zimt workspace",
+      initGit: true,
+      path: "demo-app",
+    });
 });
 
 test("rename, pin, archive and restore survive reloads", async ({ page }) => {
@@ -547,7 +600,7 @@ test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("session tags can be edited and filtered", async ({ page }) => {
+test("session tags can be edited without sidebar filters", async ({ page }) => {
   await mockHost(page);
   await page.goto("/");
   await page
@@ -560,20 +613,8 @@ test("session tags can be edited and filtered", async ({ page }) => {
   await expect(
     page.locator(".session-tag", { hasText: "urgent" }),
   ).toBeVisible();
-  await page
-    .getByRole("combobox", { name: "Filter by tag" })
-    .selectOption("urgent");
-  await expect(page.locator(".project-session")).toHaveCount(1);
-  await page
-    .getByRole("combobox", { name: "Filter by status" })
-    .selectOption("offline");
-  await expect(page.locator(".project-session")).toHaveCount(0);
-  await page
-    .getByRole("combobox", { name: "Filter by status" })
-    .selectOption("");
-  await expect(page.locator(".project-session")).toHaveCount(1);
 });
-test("project navigation collapses, searches and remembers appearance", async ({
+test("project navigation collapses and remembers appearance", async ({
   page,
 }) => {
   await mockHost(page);
@@ -587,15 +628,9 @@ test("project navigation collapses, searches and remembers appearance", async ({
     page.getByRole("button", { name: "Expand project: pi-rust", exact: true }),
   ).toBeVisible();
   await page
-    .getByRole("textbox", { name: "Search projects or chats" })
-    .fill("Mock");
+    .getByRole("button", { name: "Expand project: pi-rust", exact: true })
+    .click();
   await expect(page.locator(".project-session")).toHaveCount(1);
-  await expect(
-    page.getByRole("button", {
-      name: "Open project: rpi-package",
-      exact: true,
-    }),
-  ).toHaveCount(0);
   await page
     .getByRole("button", { name: "Toggle appearance", exact: true })
     .click();
@@ -683,19 +718,48 @@ test("mobile navigation opens without horizontal overflow", async ({
   await page.setViewportSize({ width: 390, height: 844 });
   await mockHost(page);
   await page.goto("/");
-  await expect(
-    page.locator(".breadcrumb-project").first(),
-  ).toHaveText("pi-rust");
-  await expect(page.locator(".breadcrumb h1").first()).toHaveText(
-    "Mock session",
+  await expect(page.locator(".mobile-session-switcher small")).toHaveText(
+    "pi-rust",
   );
+  expect(
+    await page
+      .locator(".mobile-session-switcher svg")
+      .evaluate((element) => getComputedStyle(element).width),
+  ).toBe("16px");
+  await page.getByRole("button", { name: "Switch session", exact: true }).click();
+  await expect(page.locator(".mobile-session-sheet")).toBeVisible();
+  await expect(page.locator(".mobile-session-search")).not.toBeFocused();
+  await expect(
+    page.locator(".mobile-session-option").filter({ hasText: "Mock session" }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Close panel", exact: true })
+    .click();
+  expect(
+    await page
+      .locator(".composer")
+      .first()
+      .evaluate((element) => getComputedStyle(element).borderRadius),
+  ).toBe("10px");
+  expect(
+    await page.locator(".toolbar").evaluate(
+      (element) => element.scrollWidth <= element.clientWidth,
+    ),
+  ).toBe(true);
+
   await page
     .getByRole("button", { name: "Toggle sidebar", exact: true })
     .click();
   await expect(
     page.getByRole("button", { name: "Open project: pi-rust", exact: true }),
   ).toBeVisible();
+  expect(
+    await page.locator(".project-tree").evaluate(
+      (element) => element.scrollWidth <= element.clientWidth,
+    ),
+  ).toBe(true);
   await page.getByRole("button", { name: "Close sidebar" }).click();
+
   await page.getByRole("button", { name: "Toggle project files" }).click();
   await expect(
     page.getByRole("tab", { name: "Files", exact: true }),
@@ -734,9 +798,9 @@ test("mobile session actions keep the ellipsis control compact", async ({
   });
   expect(timeAndMenu.timeRight).toBeLessThanOrEqual(timeAndMenu.menuLeft);
   expect(
-    await row.locator(".session-menu").evaluate(
-      (element) => element.getBoundingClientRect().width,
-    ),
+    await row
+      .locator(".session-menu")
+      .evaluate((element) => element.getBoundingClientRect().width),
   ).toBeLessThanOrEqual(50);
   expect(
     await page.evaluate(
@@ -1211,9 +1275,7 @@ test("narrow authenticated sidebar uses icons and all settings follow the chosen
     element.scrollTop = 0;
   });
   await page.screenshot({ path: testInfo.outputPath("sidebar-chinese.png") });
-  await page
-    .getByRole("combobox", { name: "语言", exact: true })
-    .selectOption("en");
+  await chooseMenuOption(page, "语言", "en");
   await expect(
     inspector.getByRole("heading", { name: "Provider auth" }),
   ).toBeVisible();
@@ -1223,15 +1285,11 @@ test("narrow authenticated sidebar uses icons and all settings follow the chosen
   await expect(
     page.getByRole("button", { name: "Sign out", exact: true }),
   ).toHaveText("");
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await page.getByRole("button", { name: "关闭面板", exact: true }).click();
   await page.getByRole("button", { name: "运行时设置", exact: true }).click();
   await expect(inspector.getByText("暂无可用工具列表。")).toBeVisible();
-  await page
-    .getByRole("combobox", { name: "思考深度", exact: true })
-    .selectOption({ label: "低" });
+  await chooseMenuOption(page, "思考深度", { label: "低" });
   await expect.poll(() => submittedLevel).toBe("low");
   expect(errors).toEqual([]);
   await logout.click();
@@ -1289,9 +1347,7 @@ test("delayed diagnostics from another chat cannot replace the active chat queue
   );
   release();
   await (await oldResponse).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".inspector h2")).toHaveText("会话诊断");
   await expect(page.locator(".queue-item")).toContainText("Current chat queue");
   await expect(page.locator(".queue-item")).not.toContainText("Old chat queue");
@@ -1526,9 +1582,7 @@ test("pagination from a previous chat does not prepend into the current chat", a
   );
   release();
   await (await completed).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".message.user")).toHaveCount(0);
 });
 
@@ -1570,9 +1624,7 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Thinking level", exact: true })
-    .selectOption("high");
+  await chooseMenuOption(page, "Thinking level", "high");
   await expect.poll(() => pending).toBe(true);
   await page
     .getByRole("button", { name: "New session", exact: false })
@@ -1588,13 +1640,11 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   );
   release();
   await (await completed).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".composer-thinking")).toHaveCount(1);
   await expect(page.locator(".composer-thinking")).toContainText("思考深度");
   await expect(
-    page.getByRole("combobox", { name: "思考深度", exact: true }),
+    page.getByRole("button", { name: "思考深度", exact: true }),
   ).toBeEnabled();
 });
 
@@ -1801,7 +1851,6 @@ for (const action of ["fork", "clone"] as const) {
         });
       },
     );
-    page.on("dialog", (dialog) => dialog.accept("Derived chat"));
     await page.goto("/");
     await page
       .getByRole("button", {
@@ -1809,6 +1858,11 @@ for (const action of ["fork", "clone"] as const) {
           action === "fork" ? "Fork current session" : "Clone current session",
         exact: true,
       })
+      .click();
+    await page.getByRole("dialog").getByRole("textbox").fill("Derived chat");
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Submit", exact: true })
       .click();
     await expect.poll(() => pending).toBe(true);
     await page
@@ -1819,9 +1873,7 @@ for (const action of ["fork", "clone"] as const) {
     );
     release();
     await (await finished).finished();
-    await page
-      .getByRole("combobox", { name: "Language", exact: true })
-      .selectOption("zh");
+    await chooseMenuOption(page, "Language", "zh");
     expect(new URL(page.url()).searchParams.has("session")).toBe(false);
     await expect(page.locator(".toolbar .breadcrumb")).toContainText(
       "rpi-package",
@@ -1867,9 +1919,7 @@ test("late file contents cannot replace the newly selected project preview", asy
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.getByLabel("文件内容")).not.toContainText(
     "Stale project A contents",
   );
@@ -1926,9 +1976,7 @@ test("compaction notes survive pagination and update when language changes", asy
       .locator(".transcript-note")
       .filter({ hasText: "Conversation compacted" }),
   ).toHaveCount(2);
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page.locator(".transcript-note").filter({ hasText: "会话已压缩" }),
   ).toHaveCount(2);
@@ -2031,9 +2079,7 @@ test("provider changes clear secret drafts and an old save cannot clear a new dr
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator("input[type=password]")).toHaveValue(
     "test-only-new-draft",
   );
@@ -2093,7 +2139,6 @@ test("rewinding the current chat reloads its native transcript", async ({
     }
     return route.fallback();
   });
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
   await expect(page.locator(".message.user")).toContainText(
     "Original transcript",
@@ -2101,6 +2146,10 @@ test("rewinding the current chat reloads its native transcript", async ({
   await page.getByRole("button", { name: "Toggle inspector" }).click();
   await page.locator(".history-timeline-item summary").click();
   await page.getByRole("button", { name: "Rewind", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Submit", exact: true })
+    .click();
   await expect(page.locator(".message.user")).toContainText(
     "Rewound transcript",
   );
@@ -2225,9 +2274,9 @@ test("consecutive permission dialogs remain independent of delayed acknowledgeme
   );
   releases[0]();
   await (await firstFinished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  // Keep interacting with the active permission modal; its backdrop correctly
+  // prevents changing the workspace language while a response is pending.
+  await page.setViewportSize({ width: 1100, height: 800 });
   await expect(
     page.getByRole("heading", { name: "Second question" }),
   ).toBeVisible();
@@ -2443,7 +2492,17 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
             timestamp: 43,
             entryId: "durable-2",
             toolCallId: "call-1",
-            content: [{ type: "text", text: "Completed result" }],
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  content: [{ type: "text", text: "const value = 1;" }],
+                  details: null,
+                  usage: null,
+                  terminate: false,
+                }),
+              },
+            ],
           },
         ],
         history: {
@@ -2499,7 +2558,8 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".message.assistant")).toHaveCount(1);
   await expect(page.locator(".tool-card.tool-done")).toHaveCount(1);
   await page.locator(".tool-card summary").click();
-  await expect(page.locator(".tool-card")).toContainText("Completed result");
+  await expect(page.locator(".tool-card")).toContainText("const value = 1;");
+  await expect(page.locator(".tool-card")).not.toContainText('"content"');
   await expect(page.locator(".read-code-path")).toHaveText("src/main.ts");
   await expect(page.locator(".read-code pre code")).toHaveClass(
     /language-typescript/,
@@ -2616,9 +2676,7 @@ test("a late failed chat creation does not mark the subsequently selected projec
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".toolbar .breadcrumb")).toContainText(
     "rpi-package",
   );
@@ -2893,7 +2951,7 @@ test("a failed chat creation does not hide rejection of the still-active prompt"
     "Prompt was rejected",
   );
   await expect(page.locator(".message.user")).toHaveCount(0);
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
 });
 
 test("snapshot boundary status supersedes an earlier idle runtime read", async ({
@@ -2913,7 +2971,7 @@ test("snapshot boundary status supersedes an earlier idle runtime read", async (
     }),
   );
   await page.goto("/");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
@@ -3113,12 +3171,12 @@ test("a rejected compact command releases the composer and restores its draft", 
   await input.press("Enter");
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Cannot compact yet",
   );
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
   await expect(input).toHaveValue("/compact keep recent context");
   await expect(page.locator(".connection")).toContainText("reconnecting");
 });
@@ -3175,7 +3233,7 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Resume unavailable",
@@ -3183,7 +3241,7 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await expect(
     page.getByRole("button", { name: "Continue", exact: true }),
   ).toBeEnabled();
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
 });
 
 test("an executed slash command does not return as a draft after switching chats", async ({
@@ -3288,13 +3346,16 @@ test("late message pagination from before rewind cannot enter the restored branc
       return route.fallback();
     },
   );
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
   await page.getByRole("button", { name: "Load earlier messages" }).click();
   await expect.poll(() => pending).toBe(true);
   await page.getByRole("button", { name: "Toggle inspector" }).click();
   await page.locator(".history-timeline-item summary").click();
   await page.getByRole("button", { name: "Rewind", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Submit", exact: true })
+    .click();
   await expect(page.locator(".message.user")).toContainText("Restored branch");
   const finished = page.waitForResponse(
     (res) =>
@@ -3303,9 +3364,7 @@ test("late message pagination from before rewind cannot enter the restored branc
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".message.user")).toHaveCount(1);
   await expect(page.locator(".message.user")).not.toContainText(
     "Stale branch message",
@@ -3324,7 +3383,7 @@ test("an operation accepted in another tab stays busy without an agent_start eve
   );
   await page.goto("/");
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
@@ -3344,9 +3403,7 @@ test("live and restored settlement labels follow the selected language", async (
       .locator(".transcript-note")
       .filter({ hasText: "Run failed · aborted" }),
   ).toHaveCount(1);
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page
       .locator(".transcript-note")
@@ -3355,9 +3412,7 @@ test("live and restored settlement labels follow the selected language", async (
   await expect(
     page.locator(".transcript-note").filter({ hasText: "运行状态：已完成" }),
   ).toHaveCount(1);
-  await page
-    .getByRole("combobox", { name: "语言", exact: true })
-    .selectOption("en");
+  await chooseMenuOption(page, "语言", "en");
   await expect(
     page
       .locator(".transcript-note")
@@ -3422,8 +3477,8 @@ test("same model IDs from different providers keep their identity in runtime sel
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  const model = page.getByRole("combobox", { name: "Model", exact: true });
-  await model.selectOption({ label: "Model Beta (beta)" });
+  const model = page.getByRole("button", { name: "Model", exact: true });
+  await chooseMenuOption(page, "Model", { label: "Model Beta (beta)" });
   await expect
     .poll(() => changes)
     .toEqual([
@@ -3433,7 +3488,7 @@ test("same model IDs from different providers keep their identity in runtime sel
         provider: "beta",
       }),
     ]);
-  await expect(model.locator("option:checked")).toHaveText("Model Beta (beta)");
+  await expect(model).toContainText("Model Beta (beta)");
   await expect(page.locator(".inspector")).toContainText("8k");
 });
 
@@ -3499,9 +3554,7 @@ test("a late tool change cannot replace the next chat tool catalog", async ({
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page.getByRole("checkbox", { name: "new-tool", exact: true }),
   ).toBeVisible();
@@ -3569,20 +3622,24 @@ test("model changes reload supported thinking levels and keep authoritative runt
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", {
+  const thinking = page.getByRole("button", {
     name: "Thinking level",
     exact: true,
   });
-  await thinking.selectOption("high");
-  await expect(thinking).toHaveValue("low");
-  await page
-    .getByRole("combobox", { name: "Model", exact: true })
-    .selectOption({ label: "Second model (test)" });
+  await chooseMenuOption(page, "Thinking level", "high");
+  await expect(thinking).toContainText("low");
+  await chooseMenuOption(page, "Model", { label: "Second model (test)" });
   await expect.poll(() => loadingSecondLevels).toBe(true);
   await expect(thinking).toBeDisabled();
   releaseLevels();
-  await expect(thinking).toHaveValue("off");
-  await expect(thinking.locator("option")).toHaveText(["—", "off"]);
+  await expect(thinking).toContainText("off");
+  await thinking.click();
+  const options = page
+    .getByRole("listbox", { name: "Thinking level", exact: true })
+    .getByRole("option");
+  await expect(options).toHaveCount(2);
+  await expect(options.nth(0)).toHaveAccessibleName("—");
+  await expect(options.nth(1)).toHaveAccessibleName("off");
 });
 
 test("slash model selection rejects ambiguous names and accepts provider qualified IDs", async ({
@@ -3728,9 +3785,7 @@ for (const outcome of ["done", "error", "closed"] as const) {
     await page.reload();
     await expect(timer).toHaveText("1.2s");
     await expect(page.locator(".shell-command")).toHaveText("sleep 1");
-    await page
-      .getByRole("combobox", { name: "Language", exact: true })
-      .selectOption("zh");
+    await chooseMenuOption(page, "Language", "zh");
     await expect(timer).toHaveAccessibleName("耗时 1.2s");
     await page.setViewportSize({ width: 390, height: 844 });
     expect(
@@ -3983,6 +4038,7 @@ test("composer model picker groups by provider and applies the selection", async
 test("edit tool renders a file diff and powershell renders as a terminal", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   await mockHost(page);
   await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
     route.fulfill({
@@ -4019,7 +4075,10 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
                 type: "toolCall",
                 id: "ps-1",
                 name: "powershell",
-                arguments: { command: "Get-ChildItem" },
+                arguments: {
+                  command:
+                    'rg -n -A120 -B30 "tool-row|tool-card|message-list|virtual-row|message-body" packages/rpi-web/frontend/src/styles.css packages/rpi-web/frontend/src/desktop.css | sed -n \'1,300p\'',
+                },
               },
             ],
           },
@@ -4035,14 +4094,111 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
   );
   await page.goto("/");
   await expect(page.locator(".edit-card")).toBeVisible();
-  await page.locator(".edit-card summary").click();
+  await expect(page.locator(".edit-card")).toHaveCSS("border-radius", "0px");
+  await page.locator(".edit-card > summary").click();
   await expect(page.locator(".edit-path")).toContainText("src/app.ts");
+  await page.locator(".edit-content > summary").click();
   await expect(page.locator(".edit-line.remove")).toContainText("const a = 1;");
   await expect(page.locator(".edit-line.add")).toContainText("const a = 2;");
   await expect(page.locator(".shell-card")).toBeVisible();
-  await expect(page.locator(".shell-card .shell-command")).toHaveText(
-    "Get-ChildItem",
+  const transcriptBox = await page.locator(".transcript").boundingBox();
+  const shellBox = await page.locator(".shell-card").boundingBox();
+  expect(transcriptBox).not.toBeNull();
+  expect(shellBox).not.toBeNull();
+  expect(shellBox!.x).toBeGreaterThanOrEqual(transcriptBox!.x);
+  expect(shellBox!.x + shellBox!.width).toBeLessThanOrEqual(
+    transcriptBox!.x + transcriptBox!.width,
+  );
+  const status = page.locator(".shell-card .tool-status");
+  const statusBox = await status.boundingBox();
+  expect(statusBox).not.toBeNull();
+  expect(statusBox!.x + statusBox!.width).toBeLessThanOrEqual(
+    shellBox!.x + shellBox!.width,
+  );
+  await expect(page.locator(".shell-card .shell-command")).toContainText(
+    "rg -n",
   );
   await page.locator(".shell-card summary").click();
   await expect(page.locator(".shell-card .shell-prompt")).toHaveText("PS> ");
+});
+
+test("mobile composer footer keeps model picker usable beside session metrics", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_models",
+          "set_model",
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/sessions/*/commands", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type === "get_available_models") {
+      return route.fulfill({
+        json: response(
+          { models: [{ id: "mobile-model", name: "Mobile model", provider: "test-provider" }] },
+          body.type,
+        ),
+      });
+    }
+    if (body.type === "get_state") {
+      return route.fulfill({
+        json: response(
+          {
+            sessionId,
+            leafId: "leaf-1",
+            modelId: "mobile-model",
+            provider: "test-provider",
+            context: { tokens: 129000, window: 227000, percent: 57 },
+          },
+          body.type,
+        ),
+      });
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+
+  const model = page.getByRole("button", {
+    name: "Choose model",
+    exact: true,
+  });
+  await expect(model).toBeVisible();
+  const modelBox = await model.boundingBox();
+  expect(modelBox).not.toBeNull();
+  expect(modelBox!.x + modelBox!.width).toBeLessThanOrEqual(390);
+
+  const metrics = page.locator(".composer-metrics");
+  const footer = page.locator(".composer-footer");
+  await expect(metrics.getByLabel(/^Context:/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Input tokens:/)).toBeVisible();
+  await metrics.locator(":scope > summary").click();
+  await expect(metrics.getByLabel(/^Cached tokens:/)).toBeVisible();
+  const metricsBox = await metrics.boundingBox();
+  const footerBox = await footer.boundingBox();
+  expect(metricsBox).not.toBeNull();
+  expect(footerBox).not.toBeNull();
+  expect(metricsBox!.y).toBeGreaterThan(footerBox!.y + footerBox!.height - 1);
+
+  await model.click();
+  const popover = page.getByRole("listbox", {
+    name: "Choose model",
+    exact: true,
+  });
+  await expect(popover).toBeVisible();
+  const popoverBox = await popover.boundingBox();
+  expect(popoverBox).not.toBeNull();
+  expect(popoverBox!.y).toBeGreaterThanOrEqual(0);
+  expect(popoverBox!.y + popoverBox!.height).toBeLessThanOrEqual(844);
+  await page.getByRole("option", { name: "Mobile model" }).click();
+  await expect(popover).toBeHidden();
 });
