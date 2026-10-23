@@ -4653,7 +4653,6 @@ function ShellCard({ row, language }: { row: ToolRow; language: Language }) {
     resultObj &&
     typeof resultObj.stderr === "string" &&
     !!resultObj.stderr.trim();
-  const isPowerShell = /powershell|pwsh/i.test(row.name);
   const metaParts = [
     meta,
     exitCode ? `exit ${exitCode}` : "",
@@ -4681,9 +4680,7 @@ function ShellCard({ row, language }: { row: ToolRow; language: Language }) {
     >
       <summary>
         <Terminal size={14} />
-        <span className="shell-summary-prompt" aria-hidden="true">
-          {isPowerShell ? "PS" : "$"}
-        </span>
+        <span className="tool-action">Ran</span>
         <code className="shell-command" title={command || row.name}>
           {command ? command.replace(/\s+/g, " ").trim() : row.name}
         </code>
