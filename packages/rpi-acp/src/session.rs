@@ -483,6 +483,14 @@ impl Session {
                             )
                             .await;
                     }
+                    if let Some(plan) = translate_todo_event(&value) {
+                        writer
+                            .notify(
+                                "session/update",
+                                json!({"sessionId": acp_session_id, "update": plan}),
+                            )
+                            .await;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     // The lost frames may contain acceptance or settlement.
@@ -900,8 +908,10 @@ pub fn translate_event(event: &Value) -> Option<Value> {
                 "title": title_for_tool(tool, &args),
                 "kind": kind_for_tool(tool),
                 "status": "in_progress",
-                "rawInput": args.clone(),
             });
+            if tool != "todo" {
+                update["rawInput"] = args.clone();
+            }
             // Surface file mutations as ACP `diff` content so the client can
             // render its native diff view.
             let diffs = diff_contents(tool, &args);
@@ -923,6 +933,10 @@ pub fn translate_event(event: &Value) -> Option<Value> {
             }))
         }
         "tool_execution_end" => {
+            let tool = event
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
             let is_error = event
                 .get("isError")
                 .and_then(Value::as_bool)
@@ -932,8 +946,10 @@ pub fn translate_event(event: &Value) -> Option<Value> {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_call_id(event),
                 "status": if is_error { "failed" } else { "completed" },
-                "rawOutput": event.get("result").cloned().unwrap_or(Value::Null),
             });
+            if tool != "todo" {
+                update["rawOutput"] = event.get("result").cloned().unwrap_or(Value::Null);
+            }
             if !text.is_empty() {
                 update["content"] =
                     json!([{"type": "content", "content": {"type": "text", "text": text}}]);
@@ -1024,6 +1040,40 @@ pub fn translate_plan_event(event: &Value) -> Option<Value> {
     Some(json!({"sessionUpdate": "plan", "entries": entries}))
 }
 
+fn translate_todo_event(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_execution_end")
+        || event.get("toolName").and_then(Value::as_str) != Some("todo")
+    {
+        return None;
+    }
+    let todos = event.pointer("/result/details/todos")?.as_array()?;
+    let entries = todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo.get("text").and_then(Value::as_str)?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let status = todo
+                .get("status")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    todo.get("done")
+                        .and_then(Value::as_bool)
+                        .filter(|done| *done)
+                        .map(|_| "completed")
+                })
+                .unwrap_or("pending");
+            Some(json!({
+                "content": content,
+                "priority": "medium",
+                "status": status,
+            }))
+        })
+        .collect::<Vec<_>>();
+    Some(json!({"sessionUpdate": "plan", "entries": entries}))
+}
+
 /// Parse the `rpi-plan-mode` outline (`- ✓ 1. step` / `- ○ 2. step`, optionally
 /// with `[x]` markers) into ACP plan entries.
 fn plan_entries(outline: &str) -> Vec<Value> {
@@ -1068,6 +1118,12 @@ fn kind_for_tool(tool: &str) -> &'static str {
 
 /// A short human title for a tool call, using the raw input when useful.
 fn title_for_tool(tool: &str, args: &Value) -> String {
+    if tool == "todo" {
+        return format!(
+            "todo: {}",
+            args.get("action").and_then(Value::as_str).unwrap_or("list")
+        );
+    }
     if let Some(path) = args.get("path").and_then(Value::as_str) {
         return format!("{tool} {}", truncate(path, 80));
     }
@@ -1798,6 +1854,33 @@ mod tests {
     }
 
     #[test]
+    fn todo_tool_call_uses_a_human_title_instead_of_raw_json() {
+        let event = json!({
+            "type": "tool_execution_start",
+            "toolCallId": "todo-call",
+            "toolName": "todo",
+            "args": {"action": "list", "id": 0, "includeDone": true, "status": "pending", "text": ""},
+        });
+        let update = translate_event(&event).unwrap();
+        assert_eq!(update["title"], "todo: list");
+        assert!(update.get("rawInput").is_none());
+
+        let completed = translate_event(&json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-call",
+            "toolName": "todo",
+            "isError": false,
+            "result": {
+                "content": [{"type": "text", "text": "0/0 completed"}],
+                "details": {"todos": []},
+            },
+        }))
+        .unwrap();
+        assert!(completed.get("rawOutput").is_none());
+        assert_eq!(completed["content"][0]["content"]["text"], "0/0 completed");
+    }
+
+    #[test]
     fn tool_end_maps_to_completed_with_text() {
         let event = json!({
             "type": "tool_execution_end",
@@ -1973,6 +2056,41 @@ mod tests {
         assert_eq!(plan["entries"][0]["status"], "completed");
         assert_eq!(plan["entries"][1]["content"], "2. Implement");
         assert_eq!(plan["entries"][1]["status"], "pending");
+    }
+
+    #[test]
+    fn todo_completion_emits_live_plan_statuses() {
+        let event = json!({
+            "type": "tool_execution_end",
+            "toolCallId": "todo-call",
+            "toolName": "todo",
+            "isError": false,
+            "result": {
+                "details": {
+                    "todos": [
+                        {"id": 0, "text": "Inspect", "status": "completed"},
+                        {"id": 1, "text": "Implement", "status": "in_progress"},
+                        {"id": 2, "text": "Test", "status": "pending"},
+                    ],
+                },
+            },
+        });
+        let plan = translate_todo_event(&event).unwrap();
+        assert_eq!(plan["sessionUpdate"], "plan");
+        assert_eq!(plan["entries"][0]["content"], "Inspect");
+        assert_eq!(plan["entries"][0]["status"], "completed");
+        assert_eq!(plan["entries"][1]["status"], "in_progress");
+        assert_eq!(plan["entries"][2]["status"], "pending");
+    }
+
+    #[test]
+    fn todo_clear_emits_an_empty_plan_update() {
+        let event = json!({
+            "type": "tool_execution_end",
+            "toolName": "todo",
+            "result": {"details": {"todos": []}},
+        });
+        assert_eq!(translate_todo_event(&event).unwrap()["entries"], json!([]));
     }
 
     #[test]
