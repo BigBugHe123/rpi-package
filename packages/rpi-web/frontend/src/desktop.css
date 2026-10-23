@@ -1,19 +1,4 @@
-.composer {
-  border-radius: 10px !important;
-}
-
-*,
-*::before,
-*::after {
-  border-radius: 0 !important;
-}
-.status-dot,
-.sidebar-filter-dot,
-.session-running-dot,
-.shell-dots i {
-  border-radius: 50% !important;
-}
-
+/* Desktop workspace: quiet chrome, project-first navigation, compact task controls. */
 :root {
   --bg: #fdfdfc;
   --shell: #f8f8f6;

@@ -23,7 +23,6 @@ import {
   ChevronDown,
   Code2,
   Copy,
-  Cpu,
   Database,
   Files,
   FileText,
@@ -600,6 +599,9 @@ export default function App() {
     (key: MessageKey, values?: Record<string, string | number>) =>
       translate(language, key, values),
     [language],
+  );
+  const connectionLabel = t(
+    (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
   );
   const current = sessions.find((session) => session.sessionId === sessionId);
   const sidebarSessions = useMemo(
@@ -2840,30 +2842,13 @@ export default function App() {
             </button>
           </div>
           <div className="toolbar-actions">
-            {supported.has("set_model") && (
-              <ModelPicker
-                language={language}
-                runtime={runtime}
-                models={models}
-                supported={supported}
-                pending={modelPending}
-                className="badge selectable toolbar-picker"
-                icon={<Cpu size={12} />}
-                onSelect={(entry) => void selectModel(entry)}
-              />
-            )}
-            {supported.has("set_thinking_level") && (
-              <ThinkingPicker
-                language={language}
-                runtime={runtime}
-                levels={levels}
-                supported={supported}
-                pending={thinkingPending}
-                className="badge selectable toolbar-picker"
-                icon={<Gauge size={12} />}
-                onSelect={(level) => void selectThinkingLevel(level)}
-              />
-            )}
+            <span
+              className={`connection ${status === "error" ? "offline" : ""}`}
+              title={connectionLabel}
+            >
+              <span className="status-dot" /> {" "}
+              {connectionLabel}
+            </span>
             {actions.has("fork") && (
               <button
                 disabled={!sessionId}

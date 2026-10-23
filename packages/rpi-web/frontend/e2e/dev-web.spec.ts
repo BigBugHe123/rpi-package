@@ -751,7 +751,7 @@ test("mobile navigation opens without horizontal overflow", async ({
       .locator(".composer")
       .first()
       .evaluate((element) => getComputedStyle(element).borderRadius),
-  ).toBe("10px");
+  ).toBe("17px");
   expect(
     await page.locator(".toolbar").evaluate(
       (element) => element.scrollWidth <= element.clientWidth,

@@ -23,10 +23,10 @@
   --green: #218147;
   --shadow: 0 8px 32px #1d1d2512;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --radius: 10px;
   --icon-sm: 12px;
   --icon-md: 14px;
   --icon-lg: 16px;
-
 }
 :root[data-theme="dark"] {
   --bg: #1c1c1e;
@@ -2205,6 +2205,10 @@ details[open] > summary:before {
 .mobile-only {
   display: none;
 }
+.mobile-session-switcher,
+.mobile-session-backdrop {
+  display: none;
+}
 .skip-link {
   position: fixed;
   top: 10px;
@@ -2517,7 +2521,7 @@ details[open] > summary:before {
     width: 6px;
     height: 6px;
     flex: 0 0 6px;
-    border-radius: 50% !important;
+    border-radius: 50%;
     background: var(--muted);
   }
   .mobile-session-option.selected .mobile-session-option-status {
