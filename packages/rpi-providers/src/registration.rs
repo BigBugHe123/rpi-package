@@ -4,11 +4,12 @@ macro_rules! register_provider {
         extern "C" fn request(
             req: rpi_plugin_sdk::StbStringRef,
             out: *mut rpi_plugin_sdk::StbString,
-            _: *mut std::ffi::c_void,
+            context: *mut std::ffi::c_void,
         ) -> i32 {
             unsafe {
-                rpi_plugin_sdk::provider::drive(
+                rpi_plugin_sdk::provider::drive_with_context(
                     $factory,
+                    context,
                     req,
                     None,
                     std::ptr::null_mut(),
@@ -26,13 +27,19 @@ macro_rules! register_provider {
             _: Option<rpi_plugin_sdk::ProviderStreamCompletionFn>,
             _: *mut std::ffi::c_void,
             out: *mut rpi_plugin_sdk::StbString,
-            _: *mut std::ffi::c_void,
+            context: *mut std::ffi::c_void,
         ) -> i32 {
-            unsafe { rpi_plugin_sdk::provider::drive($factory, req, emit, data, control, out) }
+            unsafe {
+                rpi_plugin_sdk::provider::drive_with_context(
+                    $factory, context, req, emit, data, control, out,
+                )
+            }
         }
 
         pub(crate) fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
-            rpi_plugin_sdk::provider::register(api, $id, $base, $api, $manifest, request, stream)
+            rpi_plugin_sdk::provider::register_with_context(
+                api, $id, $base, $api, $manifest, request, stream,
+            )
         }
     };
 }

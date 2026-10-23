@@ -324,6 +324,154 @@ fn options(idle: Duration) -> SimpleStreamOptions {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_loaded_provider_reuses_connections_without_reusing_credentials() {
+    let (_session, providers) = providers();
+    for provider in providers {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Both accounts must arrive on this one connection. A fresh client
+            // would connect again and leave this read waiting until timeout.
+            for account in ["first-account", "second-account"] {
+                let (_, headers) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    read_request_with_headers(&mut socket),
+                )
+                .await
+                .expect("the second request must reuse the existing connection");
+                let credentials: Vec<_> = headers
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim())
+                    })
+                    .collect();
+                assert_eq!(credentials, [format!("Bearer {account}")]);
+                let body = format!("{}data: [DONE]\n\n", frame(account, true));
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let mut model = provider.models()[0].clone();
+        model.base_url = format!("http://{address}/v1");
+        for account in ["first-account", "second-account"] {
+            let mut options = options(Duration::from_secs(2));
+            options.api_key = Some(account.into());
+            let stream = provider
+                .stream_simple(&model, &Context::new(vec![]), &options)
+                .await;
+            let message = tokio::time::timeout(Duration::from_secs(3), stream.result())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                message.stop_reason,
+                StopReason::Stop,
+                "{}: {message:?}",
+                provider.id()
+            );
+            assert_eq!(Content::text_only(&message.content, ""), account);
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_shutdown_cancels_all_accounts_and_rejects_new_requests() {
+    let (session, providers) = providers();
+    let mut active = Vec::new();
+    for provider in &providers {
+        let mut fixture =
+            Fixture::new(vec![(Duration::ZERO, frame("partial", false))], false).await;
+        let stream = provider
+            .stream_simple(
+                &model(provider.as_ref(), &fixture),
+                &Context::new(vec![]),
+                &options(Duration::ZERO),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), &mut fixture.request)
+            .await
+            .unwrap()
+            .unwrap();
+        active.push((fixture, stream));
+    }
+    session.begin_shutdown();
+    session.begin_shutdown();
+    for (mut fixture, stream) in active {
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Aborted, "{message:?}");
+        fixture.finish().await;
+    }
+    for provider in providers {
+        let stream = provider
+            .stream_simple(
+                &provider.models()[0],
+                &Context::new(vec![]),
+                &options(Duration::ZERO),
+            )
+            .await;
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert!(message.error_message.unwrap().contains("shutting down"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_loaded_provider_reports_invalid_transport_configuration() {
+    let (_session, providers) = providers();
+    for provider in providers {
+        let mut model = provider.models()[0].clone();
+        model.base_url = ":invalid".into();
+        let stream = provider
+            .stream_simple(&model, &Context::new(vec![]), &options(Duration::ZERO))
+            .await;
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert!(message.error_message.is_some());
+    }
+}
+
+#[tokio::test]
+async fn native_provider_constructors_report_transport_errors_without_panicking() {
+    let native: Vec<Arc<dyn Provider>> = vec![
+        Arc::new(rpi_providers::deepseek::DeepSeekProvider::new(None)),
+        Arc::new(rpi_providers::openrouter::OpenRouterProvider::new(None)),
+        Arc::new(rpi_providers::proxy::ProxyProvider::new(
+            rpi_providers::proxy::ProxyConfig::new("http://127.0.0.1:9/v1"),
+        )),
+        Arc::new(rpi_providers::llama_cpp::LlamaCppProvider::with_defaults()),
+    ];
+    for provider in native {
+        let model = Model::new(
+            "fixture",
+            "Fixture",
+            rpi_ai::Api::OpenaiCompletions,
+            provider.id(),
+            ":invalid",
+        );
+        let stream = provider
+            .stream_simple(&model, &Context::new(vec![]), &options(Duration::ZERO))
+            .await;
+        let message = stream.result().await.unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert!(message.error_message.is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_loaded_provider_interrupts_stalled_streams_before_the_total_deadline() {
     let (_session, providers) = providers();
     for provider in providers {

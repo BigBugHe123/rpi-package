@@ -102,12 +102,23 @@ impl ProxyConfig {
 /// needing direct API credentials.
 pub struct ProxyProvider {
     config: ProxyConfig,
+    client: Option<reqwest::Client>,
 }
 
 impl ProxyProvider {
     /// Create a new proxy provider.
     pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client: None,
+        }
+    }
+
+    pub(super) fn with_client(config: ProxyConfig, client: reqwest::Client) -> Self {
+        Self {
+            config,
+            client: Some(client),
+        }
     }
 
     /// Get the proxy endpoint.
@@ -151,9 +162,7 @@ impl Provider for ProxyProvider {
             }
             options.headers = Some(merged);
         }
-        rpi_plugin_sdk::provider::completions(&model, &options, true)
-            .stream_simple(&model, context, &options)
-            .await
+        crate::transport::stream(self.client.as_ref(), &model, context, &options, true).await
     }
 }
 

@@ -17,11 +17,14 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 ## 安装、升级与迁移
 
-本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
-宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
-`3fb44dee43fd7e23ee1b222117f221645ef721e1`。当前 crates.io 的 0.8.1 不包含此修复；
-正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
-其他扩展继续使用工作区固定的 SDK 0.3.20。
+本包将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 精确固定到
+已发布的 **0.8.3**，避免 SDK 源码接口变化影响未迁移的扩展。其他扩展继续使用
+工作区固定的 SDK 0.3.20，不需要随本包一起升级。
+
+宿主 0.8.3 支持插件生命周期时，每个 provider 注册独立复用一个惰性 runtime 和
+最多 16 个 HTTP 客户端；不同请求的 key、请求头和 provider 实例仍然独立。
+重载先取消请求并拒绝新请求，最后一个调用和字符串释放完成后再清理线程、卸载 DLL。
+宿主 0.8.2 缺少这项可选能力时自动退回每请求资源，原有认证和推理功能继续可用。
 
 从 0.1.2 开始，本包发布到 crates.io，并通过 GitHub Release 分发预编译包。
 仅更新宿主不会替换旧动态库内部的协议实现，升级时还需要 `rpi update` 更新本扩展。
@@ -153,7 +156,7 @@ cargo test -p rpi-providers
 中文 UTF-8 跨块、thinking 与 usage、响应未结束时取消、HTTP 401、唯一终态、思考开关，
 以及工具调用 → 工具结果 → 回答 → 新用户轮次的完整历史回传。
 
-宿主联调需要构建上述同一 SDK 提交的 CLI，再设置路径显式执行：
+宿主联调使用已发布的 0.8.3 CLI（也可检出 `v0.8.3` 构建），再设置路径显式执行：
 
 ```powershell
 $env:RPI_TEST_CLI = 'C:\path\to\pi-rust\target\debug\rpi.exe'
@@ -165,6 +168,8 @@ cargo test -p rpi-providers --test reliability --locked -- --include-ignored
 OpenAI key 隔离、端点 / 请求头覆盖和实际 CLI 推理，不访问 DeepSeek 服务。
 `reliability` 另覆盖四个 Provider 的流空闲超时、心跳与分帧、取消、禁用、独立总超时、
 兼容字段和思考历史，以及实际宿主通过扩展重试卡住的 SSE 请求。
+新增测试通过真实动态库验证四个 Provider 的连接复用、跨请求凭据隔离、生命周期取消、
+关闭后拒绝请求和客户端配置错误；旧宿主回退另使用正式发布的 0.8.2 CLI 验证。
 PR 工作流在 Linux、Windows、macOS 上执行这些离线检查，并验证宿主重载时将
 配置警告返回界面，不直接写入正在使用的终端。
 

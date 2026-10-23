@@ -16,13 +16,11 @@ prebuilt = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Use the SDK's maintained compat handling and stream idle watchdog.
-# Keep these three dependencies on one SDK revision. This reviewed commit
-# contains the unreleased transport fix; switch all three to its crates.io
-# release before merging/publishing. Unrelated extensions retain their SDK.
+# Keep provider transport and lifecycle handling on the same published SDK.
+# Unrelated extensions retain their independently pinned SDK versions.
 [dependencies]
-rpi-ai = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "3fb44dee43fd7e23ee1b222117f221645ef721e1", features = ["providers"] }
-rpi-plugin-sdk = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "3fb44dee43fd7e23ee1b222117f221645ef721e1", features = ["provider"] }
+rpi-ai = { version = "=0.8.3", features = ["providers"] }
+rpi-plugin-sdk = { version = "=0.8.3", features = ["provider"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +28,6 @@ reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "io-util", "fs", "process"] }
 
 [dev-dependencies]
-rpi-extensions = { version = "=0.8.1", git = "https://github.com/bigfish1913/pi-rust", rev = "3fb44dee43fd7e23ee1b222117f221645ef721e1" }
+rpi-extensions = { version = "=0.8.3" }
 tokio = { workspace = true, features = ["macros", "net", "io-util"] }
 tempfile = "3"

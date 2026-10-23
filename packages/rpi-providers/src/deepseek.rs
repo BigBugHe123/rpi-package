@@ -94,6 +94,7 @@ pub fn models() -> Vec<Model> {
 pub struct DeepSeekProvider {
     api_key: Option<String>,
     models: Vec<Model>,
+    client: Option<reqwest::Client>,
 }
 
 impl DeepSeekProvider {
@@ -101,6 +102,7 @@ impl DeepSeekProvider {
         Self {
             api_key,
             models: models(),
+            client: None,
         }
     }
 }
@@ -156,13 +158,25 @@ impl Provider for DeepSeekProvider {
         if options.api_key.is_none() {
             options.api_key = self.api_key.clone();
         }
-        let protocol = rpi_plugin_sdk::provider::completions(&model, &options, false);
-        protocol.stream_simple(&model, context, &options).await
+        crate::transport::stream(self.client.as_ref(), &model, context, &options, false).await
     }
 }
 
-fn create(_: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
-    Arc::new(DeepSeekProvider::new(options.api_key.clone()))
+fn create(
+    context: &rpi_plugin_sdk::provider::ProviderContext,
+    model: &Model,
+    options: &SimpleStreamOptions,
+) -> Result<Arc<dyn Provider>, String> {
+    let base = if model.base_url.is_empty() {
+        BASE_URL
+    } else {
+        &model.base_url
+    };
+    Ok(Arc::new(DeepSeekProvider {
+        api_key: options.api_key.clone(),
+        models: models(),
+        client: Some(context.client(base)?),
+    }))
 }
 
 crate::registration::register_provider!(
