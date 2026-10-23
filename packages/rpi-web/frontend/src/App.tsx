@@ -1,7 +1,9 @@
 import { createPortal } from "react-dom";
 import {
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,16 +12,20 @@ import {
   type ReactNode,
 } from "react";
 import {
+  Activity,
   AlertTriangle,
+  ArrowDown,
   ArrowUp,
   Bot,
   Check,
   ClipboardList,
   CircleStop,
+  CircleDollarSign,
   ChevronDown,
   Code2,
   Copy,
   Cpu,
+  Database,
   Files,
   Folder,
   Gauge,
@@ -68,9 +74,12 @@ import {
   type MessageKey,
 } from "./i18n";
 import { Splitter, useStoredNumber, Workbench } from "./Workbench";
+import { MenuSelect } from "./MenuSelect";
 import { LoginScreen } from "./LoginScreen";
 import {
+  ConfirmDialog,
   Modal,
+  PromptDialog,
   ProjectDialog,
   ProjectSidebar,
   RenameDialog,
@@ -85,6 +94,7 @@ import {
   eventsAfterSnapshot,
   toolTiming,
   isShellTool,
+  readOutput,
   shellCommand,
   shellOutput,
   planInfo,
@@ -145,6 +155,14 @@ type UiDialog = {
   };
 };
 
+type TextRequest =
+  | {
+      kind: "prompt";
+      title: string;
+      message?: string;
+      defaultValue?: string;
+    }
+  | { kind: "confirm"; title: string; message: string };
 type SlashCommand = {
   name: string;
   usage: string;
@@ -326,6 +344,8 @@ export default function App() {
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [tagsTarget, setTagsTarget] = useState<SessionSummary | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileSessionPicker, setMobileSessionPicker] = useState(false);
+  const [mobileSessionQuery, setMobileSessionQuery] = useState("");
   const [creatingSession, setCreatingSession] = useState(false);
   const creatingSessionRef = useRef(false);
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -393,7 +413,9 @@ export default function App() {
   );
   const [showQueueHistory, setShowQueueHistory] = useState(false);
   const [queueDraft, setQueueDraft] = useState("");
+  const queueInputRef = useRef<HTMLInputElement>(null);
   const [queueKind, setQueueKind] = useState("followUp");
+  const [queueEditId, setQueueEditId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [status, setStatus] = useState("connecting");
   const [loadingSession, setLoadingSession] = useState(false);
@@ -424,6 +446,24 @@ export default function App() {
   const activeDialogId = useRef("");
   const [dialogAnswer, setDialogAnswer] = useState("");
   const [dialogBusy, setDialogBusy] = useState(false);
+  const [textRequest, setTextRequest] = useState<TextRequest | null>(null);
+  const textRequestResolver = useRef<((value: string | null) => void) | null>(
+    null,
+  );
+
+  function requestText(request: TextRequest) {
+    return new Promise<string | null>((resolve) => {
+      textRequestResolver.current = resolve;
+      setTextRequest(request);
+    });
+  }
+
+  function resolveTextRequest(value: string | null) {
+    const resolve = textRequestResolver.current;
+    textRequestResolver.current = null;
+    setTextRequest(null);
+    resolve?.(value);
+  }
 
   const lastSeq = useRef(0);
   const noteSeq = useRef(0);
@@ -463,7 +503,25 @@ export default function App() {
       ),
     [sessions, sessionId, status],
   );
+  const mobileSessionResults = useMemo(() => {
+    const query = mobileSessionQuery.trim().toLowerCase();
+    return [...sidebarSessions]
+      .filter((entry) => !entry.archived)
+      .filter((entry) => {
+        if (!query) return true;
+        const projectName =
+          projects.find((item) => item.id === entry.projectId)?.name ?? "";
+        return `${entry.title} ${projectName}`.toLowerCase().includes(query);
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [mobileSessionQuery, projects, sidebarSessions]);
   const project = projects.find((entry) => entry.id === projectId);
+  const activeSession = sidebarSessions.find(
+    (entry) => entry.sessionId === sessionId,
+  );
+  const activeSessionRunning = ["running", "starting", "awaiting_input"].includes(
+    activeSession?.status ?? "",
+  );
   const slashCommands = useMemo<SlashCommand[]>(() => {
     const model = models.find(
       (entry) =>
@@ -815,6 +873,7 @@ export default function App() {
     dialogRequests.current.clear();
     activeDialogId.current = "";
     setDialog(null);
+    resolveTextRequest(null);
     setRuntime(null);
     setModels([]);
     setAuthProviders([]);
@@ -925,15 +984,6 @@ export default function App() {
         event.preventDefault();
         void createSession();
       }
-      if (key === "k") {
-        event.preventDefault();
-        setSidebar(true);
-        requestAnimationFrame(() =>
-          document
-            .querySelector<HTMLInputElement>(".sidebar-search input")
-            ?.focus(),
-        );
-      }
       if (key === "b") {
         event.preventDefault();
         setSidebar((value) => !value);
@@ -987,6 +1037,7 @@ export default function App() {
   useEffect(() => {
     if (!authChecked || (authRequired && !authenticated)) return;
     let cancelled = false;
+    setLoadingSession(true);
     void (async () => {
       try {
         const caps = await api.capabilities();
@@ -1048,6 +1099,7 @@ export default function App() {
     setApiKeyDraft("");
     setAuthMessage(null);
     setQueueDraft("");
+    setQueueEditId(null);
     setModels([]);
     setLeafId("");
     setHistoryHasMore(false);
@@ -1338,9 +1390,10 @@ export default function App() {
     }
   }, [rows, sessionId]);
 
-  useEffect(() => {
-    if (followingRef.current && transcriptRef.current)
-      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+  useLayoutEffect(() => {
+    if (!followingRef.current || !transcriptRef.current) return;
+    const node = transcriptRef.current;
+    node.scrollTop = node.scrollHeight - node.clientHeight;
   }, [rows, status]);
 
   const refreshDiagnostics = useCallback(
@@ -1405,23 +1458,25 @@ export default function App() {
 
   function persistedSettlementRows(value: HistoryResponse | null): Row[] {
     if (!value) return [];
-    return value.records.flatMap((record) => {
-      if (record.type !== "operation_finished") return [];
-      const outcome = String(record.outcome ?? "settled");
-      const error = record.error as { message?: string } | null | undefined;
-      const reason = error?.message ? ` · ${shortReason(error.message)}` : "";
-      return [
-        {
-          kind: "note" as const,
-          id: `settled-${String(record.runId ?? record.id)}`,
-          text: `Run ${outcome}${reason} · restored from session history`,
-          translation: {
-            key: "restoredRun" as const,
-            values: { outcome, reason },
-          },
+    const record = [...value.records]
+      .reverse()
+      .find((entry) => entry.type === "operation_finished");
+    if (!record) return [];
+
+    const outcome = String(record.outcome ?? "settled");
+    const error = record.error as { message?: string } | null | undefined;
+    const reason = error?.message ? ` · ${shortReason(error.message)}` : "";
+    return [
+      {
+        kind: "note" as const,
+        id: `settled-${String(record.runId ?? record.id)}`,
+        text: `Run ${outcome}${reason} · restored from session history`,
+        translation: {
+          key: "restoredRun" as const,
+          values: { outcome, reason },
         },
-      ];
-    });
+      },
+    ];
   }
 
   function historyRecordLabel(record: Record<string, unknown>): string {
@@ -1855,9 +1910,11 @@ export default function App() {
             : Array.isArray(display.instructions)
               ? display.instructions.join("\n")
               : t("oauthInstructions");
-        const value = window.prompt(
-          `${instructions}${url ? `\n\n${url}` : ""}`,
-        );
+        const value = await requestText({
+          kind: "prompt",
+          title: t("oauthSignIn"),
+          message: `${instructions}${url ? `\n\n${url}` : ""}`,
+        });
         if (!value?.trim()) return;
         result = await api.oauth(sessionId, provider, "exchange", {
           value: value.trim(),
@@ -1960,12 +2017,15 @@ export default function App() {
     if (queueSubmission.current.has(sessionId)) return;
     const message = queueDraft.trim();
     const draftRevision = queueDraftRevision.current;
+    const editingId = queueEditId;
     queueSubmission.current.add(sessionId);
     const navigation = navigationRevision.current;
     try {
+      if (editingId) await api.cancelQueued(sessionId, editingId);
       await api.queueMessage(sessionId, message, queueKind);
       if (navigation !== navigationRevision.current) return;
       if (queueDraftRevision.current === draftRevision) setQueueDraft("");
+      setQueueEditId(null);
       await refreshSessionDiagnostics();
     } catch (cause) {
       if (navigation !== navigationRevision.current) return;
@@ -1973,6 +2033,32 @@ export default function App() {
     } finally {
       queueSubmission.current.delete(sessionId);
     }
+  }
+
+  useEffect(() => {
+    if (queueEditId) queueInputRef.current?.focus();
+  }, [queueEditId]);
+
+  function isEditableQueueItem(item: QueueItem) {
+    return !item.status || item.status === "queued";
+  }
+
+  function editQueued(item: QueueItem) {
+    if (!isEditableQueueItem(item)) return;
+    queueDraftRevision.current++;
+    setQueueEditId(item.entryId);
+    setQueueDraft(item.text);
+    setQueueKind(item.queue);
+    setQueueOpen(true);
+    setPanel(false);
+    setWorkbenchOpen(false);
+    setInspector(true);
+  }
+
+  function cancelQueueEdit() {
+    queueDraftRevision.current++;
+    setQueueEditId(null);
+    setQueueDraft("");
   }
 
   async function cancelQueued(entryId: string) {
@@ -1993,7 +2079,11 @@ export default function App() {
     const defaultTitle = t("forkOf", {
       title: current?.title ?? sessionId.slice(0, 8),
     });
-    const title = window.prompt(t("forkName"), defaultTitle);
+    const title = await requestText({
+      kind: "prompt",
+      title: t("forkName"),
+      defaultValue: defaultTitle,
+    });
     if (title === null) return;
     try {
       const created = await api.fork(sessionId, entryId, title);
@@ -2009,10 +2099,11 @@ export default function App() {
   async function cloneCurrent() {
     if (!sessionId || !actions.has("clone")) return;
     const navigation = navigationRevision.current;
-    const title = window.prompt(
-      t("cloneName"),
-      t("cloneOf", { title: current?.title ?? sessionId.slice(0, 8) }),
-    );
+    const title = await requestText({
+      kind: "prompt",
+      title: t("cloneName"),
+      defaultValue: t("cloneOf", { title: current?.title ?? sessionId.slice(0, 8) }),
+    });
     if (title === null) return;
     try {
       const created = await api.clone(sessionId, title);
@@ -2028,7 +2119,12 @@ export default function App() {
   async function rewindTo(entryId: string) {
     if (!sessionId || !actions.has("history_mutation") || mutationPending)
       return;
-    if (!window.confirm(t("confirmRewind"))) return;
+    const confirmed = await requestText({
+      kind: "confirm",
+      title: t("rewind"),
+      message: t("confirmRewind"),
+    });
+    if (confirmed === null) return;
     const navigation = navigationRevision.current;
     setMutationPending(true);
     try {
@@ -2140,6 +2236,11 @@ export default function App() {
       projectRef.current = nextProject;
       setProjectId(nextProject);
     }
+    setLoadingSession(Boolean(id));
+    rowsSessionRef.current = id;
+    setRows(id ? (rowsBySession.current.get(id) ?? []) : []);
+    followingRef.current = true;
+    setFollowing(true);
     setSessionId(id);
     setPanel(false);
     if (window.innerWidth < 768) setSidebar(false);
@@ -2264,6 +2365,25 @@ export default function App() {
           onCancel={() => void answerDialog(null, true)}
         />
       )}
+      {textRequest?.kind === "prompt" && (
+        <PromptDialog
+          language={language}
+          title={textRequest.title}
+          message={textRequest.message}
+          defaultValue={textRequest.defaultValue}
+          onClose={() => resolveTextRequest(null)}
+          onSubmit={(value) => resolveTextRequest(value)}
+        />
+      )}
+      {textRequest?.kind === "confirm" && (
+        <ConfirmDialog
+          language={language}
+          title={textRequest.title}
+          message={textRequest.message}
+          onClose={() => resolveTextRequest(null)}
+          onConfirm={() => resolveTextRequest("confirmed")}
+        />
+      )}
       {projectDialog && (
         <ProjectDialog
           language={language}
@@ -2326,14 +2446,15 @@ export default function App() {
               </button>
             </div>
             <label htmlFor="settings-language">{t("language")}</label>
-            <select
-              id="settings-language"
+            <MenuSelect
+              label={t("language")}
               value={language}
-              onChange={(event) => setLanguage(event.target.value as Language)}
-            >
-              <option value="zh">简体中文</option>
-              <option value="en">English</option>
-            </select>
+              onChange={(value) => setLanguage(value as Language)}
+              options={[
+                { value: "zh", label: "简体中文" },
+                { value: "en", label: "English" },
+              ]}
+            />
             <div className="shortcut-list">
               <span>{t("newSession")}</span>
               <kbd>Ctrl / ⌘ N</kbd>
@@ -2436,17 +2557,16 @@ export default function App() {
                 >
                   <ShieldCheck size={14} />
                 </span>
-                <select
+                <MenuSelect
                   className="language-select"
+                  label={t("language")}
                   value={language}
-                  aria-label={t("language")}
-                  onChange={(event) =>
-                    setLanguage(event.target.value as Language)
-                  }
-                >
-                  <option value="en">{t("english")}</option>
-                  <option value="zh">{t("chinese")}</option>
-                </select>
+                  onChange={(value) => setLanguage(value as Language)}
+                  options={[
+                    { value: "en", label: t("english") },
+                    { value: "zh", label: t("chinese") },
+                  ]}
+                />
                 <button
                   className="icon-button"
                   aria-label={t("refreshSessions")}
@@ -2495,6 +2615,27 @@ export default function App() {
                 {current?.title ?? t("newSession")}
               </h1>
             </div>
+            <button
+              type="button"
+              className="mobile-session-switcher"
+              aria-label={t("switchSession")}
+              aria-expanded={mobileSessionPicker}
+              onClick={() => {
+                setMobileSessionQuery("");
+                setMobileSessionPicker(true);
+              }}
+            >
+              <span>
+                <small>{project?.name ?? "rpi"}</small>
+                <strong>{current?.title ?? t("newSession")}</strong>
+                {activeSessionRunning && (
+                  <small className="mobile-session-status">
+                    <span className="status-dot" /> {t("running")}
+                  </small>
+                )}
+              </span>
+              <ChevronDown size={15} aria-hidden="true" />
+            </button>
           </div>
           <div className="toolbar-actions">
             {supported.has("set_model") && (
@@ -2504,7 +2645,7 @@ export default function App() {
                 models={models}
                 supported={supported}
                 pending={modelPending}
-                className="badge selectable"
+                className="badge selectable toolbar-picker"
                 icon={<Cpu size={12} />}
                 onSelect={(entry) => void selectModel(entry)}
               />
@@ -2516,7 +2657,7 @@ export default function App() {
                 levels={levels}
                 supported={supported}
                 pending={thinkingPending}
-                className="badge selectable"
+                className="badge selectable toolbar-picker"
                 icon={<Gauge size={12} />}
                 onSelect={(level) => void selectThinkingLevel(level)}
               />
@@ -2534,7 +2675,7 @@ export default function App() {
             {actions.has("fork") && (
               <button
                 disabled={!sessionId}
-                className="icon-button"
+                className="icon-button toolbar-fork"
                 title={t("forkSession")}
                 aria-label={t("forkSession")}
                 onClick={() => void forkCurrent()}
@@ -2545,7 +2686,7 @@ export default function App() {
             {actions.has("clone") && (
               <button
                 disabled={!sessionId}
-                className="icon-button"
+                className="icon-button toolbar-clone"
                 title={t("cloneSession")}
                 aria-label={t("cloneSession")}
                 onClick={() => void cloneCurrent()}
@@ -2580,6 +2721,83 @@ export default function App() {
             )}
           </div>
         </header>
+
+        {mobileSessionPicker && (
+          <div
+            className="mobile-session-backdrop"
+            role="presentation"
+            onClick={() => setMobileSessionPicker(false)}
+          >
+            <section
+              className="mobile-session-sheet"
+              role="dialog"
+              aria-modal="true"
+              aria-label={t("switchSession")}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="mobile-session-sheet-heading">
+                <h2>{t("switchSession")}</h2>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={t("closePanel")}
+                  onClick={() => setMobileSessionPicker(false)}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <input
+                className="mobile-session-search"
+                value={mobileSessionQuery}
+                onChange={(event) => setMobileSessionQuery(event.target.value)}
+                placeholder={t("search")}
+                aria-label={t("search")}
+              />
+              <div className="mobile-session-list">
+                {mobileSessionResults.length > 0 ? (
+                  mobileSessionResults.map((entry) => {
+                    const entryProject = projects.find(
+                      (item) => item.id === entry.projectId,
+                    );
+                    const selected = entry.sessionId === sessionId;
+                    const entryRunning = [
+                      "running",
+                      "starting",
+                      "awaiting_input",
+                    ].includes(entry.status ?? "");
+                    return (
+                      <button
+                        type="button"
+                        className={`mobile-session-option${selected ? " selected" : ""}`}
+                        key={entry.sessionId}
+                        onClick={() => {
+                          select(entry.sessionId, entry.projectId);
+                          setMobileSessionPicker(false);
+                        }}
+                      >
+                        <span
+                          className={`mobile-session-option-status${entryRunning ? " running" : ""}`}
+                        />
+                        <span className="mobile-session-option-copy">
+                          <strong>{entry.title || t("newSession")}</strong>
+                          <small>
+                            {entryProject?.name ?? "rpi"}
+                            {entryRunning && ` · ${t("running")}`}
+                          </small>
+                        </span>
+                        {selected && <Check size={15} />}
+                      </button>
+                    );
+                  })
+                ) : (
+                  <p className="mobile-session-empty">
+                    {t("noMatchingSessions")}
+                  </p>
+                )}
+              </div>
+            </section>
+          </div>
+        )}
 
         {interrupted && (
           <div className="notice-banner">
@@ -2628,7 +2846,7 @@ export default function App() {
 
         <main className="main-content chat-layout">
           <div
-            className={`conversation-column ${rows.length === 0 && !loadingSession ? "empty-conversation" : ""}`}
+            className={`conversation-column ${rows.length === 0 && !loadingSession && !creatingSession ? "empty-conversation" : ""}`}
           >
             <div
               className="transcript"
@@ -2659,13 +2877,49 @@ export default function App() {
                 )}
 
                 {loadingSession && rows.length === 0 && (
-                  <div className="session-loading" role="status">
-                    <Loader2 size={15} className="spin" />
-                    <span>{t("loadingConversation")}</span>
+                  <div
+                    className="session-loading"
+                    role="status"
+                    aria-label={t("loadingConversation")}
+                  >
+                    <span className="sr-only">{t("loadingConversation")}</span>
+                    <div className="session-skeleton" aria-hidden="true">
+                      <div className="skeleton-message skeleton-assistant">
+                        <div className="skeleton-heading">
+                          <span className="skeleton-avatar" />
+                          <span className="skeleton-line skeleton-name" />
+                        </div>
+                        <div className="skeleton-body">
+                          <span className="skeleton-line skeleton-wide" />
+                          <span className="skeleton-line skeleton-medium" />
+                          <span className="skeleton-line skeleton-short" />
+                        </div>
+                      </div>
+                      <div className="skeleton-message skeleton-user">
+                        <div className="skeleton-heading">
+                          <span className="skeleton-line skeleton-user-name" />
+                          <span className="skeleton-avatar" />
+                        </div>
+                        <div className="skeleton-user-bubble">
+                          <span className="skeleton-line skeleton-medium" />
+                        </div>
+                      </div>
+                      <div className="skeleton-message skeleton-assistant">
+                        <div className="skeleton-heading">
+                          <span className="skeleton-avatar" />
+                          <span className="skeleton-line skeleton-name" />
+                        </div>
+                        <div className="skeleton-body">
+                          <span className="skeleton-line skeleton-wide" />
+                          <span className="skeleton-line skeleton-wide" />
+                          <span className="skeleton-line skeleton-medium" />
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 )}
 
-                {rows.length === 0 && !loadingSession && (
+                {rows.length === 0 && !loadingSession && !creatingSession && (
                   <div className="welcome">
                     <div className="welcome-symbol">
                       <Mark large />
@@ -2721,7 +2975,9 @@ export default function App() {
             </div>
             {!following && rows.length > 0 && (
               <button
+                type="button"
                 className="jump-to-bottom"
+                aria-label={t("jumpToBottom")}
                 onClick={() => {
                   followingRef.current = true;
                   setFollowing(true);
@@ -2731,7 +2987,8 @@ export default function App() {
                   });
                 }}
               >
-                {t("jumpToBottom")}
+                <ArrowDown size={14} aria-hidden="true" />
+                <span>{t("jumpToBottom")}</span>
               </button>
             )}
 
@@ -2776,16 +3033,27 @@ export default function App() {
                       {pendingQueueItems.map((item) => (
                         <div className="composer-queue-item" key={item.entryId}>
                           <span>{item.text || t("nonTextMessage")}</span>
-                          {item.status === "queued" && (
-                            <button
-                              type="button"
-                              className="icon-button"
-                              aria-label={t("cancelQueued")}
-                              title={t("cancelQueued")}
-                              onClick={() => void cancelQueued(item.entryId)}
-                            >
-                              <X size={13} />
-                            </button>
+                          {isEditableQueueItem(item) && (
+                            <span className="queue-item-actions">
+                              <button
+                                type="button"
+                                className="icon-button"
+                                aria-label={t("editQueued")}
+                                title={t("editQueued")}
+                                onClick={() => editQueued(item)}
+                              >
+                                <SquarePen size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="icon-button"
+                                aria-label={t("cancelQueued")}
+                                title={t("cancelQueued")}
+                                onClick={() => void cancelQueued(item.entryId)}
+                              >
+                                <X size={13} />
+                              </button>
+                            </span>
                           )}
                         </div>
                       ))}
@@ -2874,24 +3142,95 @@ export default function App() {
                           <strong>{queueItems.length}</strong>
                         </button>
                       )}
-                    <button
-                      type="button"
-                      className="danger stop-button"
-                      aria-label={t("abort")}
-                      title={t("abort")}
-                      onClick={() => void abort()}
-                      disabled={!busy || !supported.has("abort")}
-                    >
-                      <CircleStop size={15} />
-                    </button>
-                    <button
-                      className="send-button"
-                      aria-label={t("send")}
-                      disabled={!draft.trim() || !sessionId || sending}
-                    >
-                      <ArrowUp size={17} />
-                    </button>
+                    {busy && supported.has("abort") ? (
+                      <button
+                        type="button"
+                        className="send-button composer-action-stop"
+                        aria-label={t("abort")}
+                        title={t("abort")}
+                        onClick={() => void abort()}
+                      >
+                        <CircleStop size={15} />
+                      </button>
+                    ) : (
+                      <button
+                        className="send-button"
+                        aria-label={t("send")}
+                        disabled={!draft.trim() || !sessionId || sending}
+                      >
+                        <ArrowUp size={17} />
+                      </button>
+                    )}
                   </div>
+                </div>
+                <div
+                  className="composer-metrics"
+                  aria-label={`${t("eventsObserved")}, ${t("context")}, ${t("toolCalls")}, ${t("operations")}, ${t("tokens")}, ${t("cost")}, ${t("cacheHit")}`}
+                >
+                  <span
+                    className="composer-metric"
+                    title={t("eventsObserved")}
+                    aria-label={`${t("eventsObserved")}: ${seen}`}
+                  >
+                    <Activity size={12} aria-hidden="true" />
+                    <strong>{seen}</strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("context")}
+                    aria-label={`${t("context")}: ${runtime?.context ? `${runtime.context.percent}% / ${formatTokens(runtime.context.window)}` : "—"}`}
+                  >
+                    <Gauge size={12} aria-hidden="true" />
+                    <strong>
+                      {runtime?.context
+                        ? `${runtime.context.percent}% / ${formatTokens(runtime.context.window)}`
+                        : "—"}
+                    </strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("toolCalls")}
+                    aria-label={`${t("toolCalls")}: ${rows.filter((row) => row.kind === "tool").length}`}
+                  >
+                    <Wrench size={12} aria-hidden="true" />
+                    <strong>{rows.filter((row) => row.kind === "tool").length}</strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("operations")}
+                    aria-label={`${t("operations")}: ${runtime?.stats?.operationCount ?? historyData?.total ?? 0}`}
+                  >
+                    <History size={12} aria-hidden="true" />
+                    <strong>{runtime?.stats?.operationCount ?? historyData?.total ?? 0}</strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("tokens")}
+                    aria-label={`${t("tokens")}: ${runtime?.stats ? formatTokens(runtime.stats.totalTokens) : "—"}`}
+                  >
+                    <Cpu size={12} aria-hidden="true" />
+                    <strong>{runtime?.stats ? formatTokens(runtime.stats.totalTokens) : "—"}</strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("cost")}
+                    aria-label={`${t("cost")}: ${runtime?.stats ? `$${runtime.stats.costTotal.toFixed(4)}` : "—"}`}
+                  >
+                    <CircleDollarSign size={12} aria-hidden="true" />
+                    <strong>{runtime?.stats ? `$${runtime.stats.costTotal.toFixed(4)}` : "—"}</strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("cacheHit")}
+                    aria-label={`${t("cacheHit")}: ${runtime?.stats?.cacheHitRatio == null ? "—" : `${Math.round(runtime.stats.cacheHitRatio * 100)}%`}`}
+                  >
+                    <Database size={12} aria-hidden="true" />
+                    <strong>
+                      {runtime?.stats?.cacheHitRatio == null
+                        ? "—"
+                        : `${Math.round(runtime.stats.cacheHitRatio * 100)}%`}
+                    </strong>
+                  </span>
                 </div>
               </div>
             </form>
@@ -3184,21 +3523,46 @@ export default function App() {
                           </small>
                         )}
                       </div>
-                      {item.status === "queued" && (
-                        <button
-                          className="icon-button"
-                          title={t("cancelQueued")}
-                          aria-label={t("cancelQueued")}
-                          onClick={() => void cancelQueued(item.entryId)}
-                        >
-                          <X size={13} />
-                        </button>
+                      {isEditableQueueItem(item) && (
+                        <span className="queue-item-actions">
+                          <button
+                            type="button"
+                            className="icon-button"
+                            title={t("editQueued")}
+                            aria-label={t("editQueued")}
+                            onClick={() => editQueued(item)}
+                          >
+                            <SquarePen size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-button"
+                            title={t("cancelQueued")}
+                            aria-label={t("cancelQueued")}
+                            onClick={() => void cancelQueued(item.entryId)}
+                          >
+                            <X size={13} />
+                          </button>
+                        </span>
                       )}
                     </div>
                   ))}
                   {supported.has("queue_message") && (
                     <div className="queue-compose">
+                      {queueEditId && (
+                        <div className="queue-editing-label">
+                          <span>{t("editQueued")}</span>
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={cancelQueueEdit}
+                          >
+                            {t("cancelQueueEdit")}
+                          </button>
+                        </div>
+                      )}
                       <input
+                        ref={queueInputRef}
                         value={queueDraft}
                         onChange={(event) => {
                           queueDraftRevision.current++;
@@ -3210,21 +3574,22 @@ export default function App() {
                           if (event.key === "Enter") void queuePrompt();
                         }}
                       />
-                      <select
+                      <MenuSelect
+                        label={t("queueKind")}
                         value={queueKind}
-                        aria-label={t("queueKind")}
-                        onChange={(event) => setQueueKind(event.target.value)}
-                      >
-                        <option value="followUp">{t("followUp")}</option>
-                        <option value="steer">{t("steer")}</option>
-                        <option value="nextTurn">{t("nextTurn")}</option>
-                      </select>
+                        onChange={setQueueKind}
+                        options={[
+                          { value: "followUp", label: t("followUp") },
+                          { value: "steer", label: t("steer") },
+                          { value: "nextTurn", label: t("nextTurn") },
+                        ]}
+                      />
                       <button
                         type="button"
                         onClick={() => void queuePrompt()}
                         disabled={!queueDraft.trim()}
                       >
-                        {t("queue")}
+                        {t(queueEditId ? "saveQueueEdit" : "queue")}
                       </button>
                     </div>
                   )}
@@ -3514,6 +3879,7 @@ function Dropdown({
 }) {
   const [open, setOpen] = useState(false);
   const anchor = useRef<HTMLDivElement | null>(null);
+  const popover = useRef<HTMLDivElement | null>(null);
   const [position, setPosition] = useState({ top: 0, left: 0, width: 220 });
   useEffect(() => {
     if (!open) return;
@@ -3538,8 +3904,29 @@ function Dropdown({
       window.removeEventListener("resize", closeOnScroll);
     };
   }, [open]);
-  function toggle() {
-    if (disabled) return;
+  useEffect(() => {
+    if (!open) return;
+    const frame = requestAnimationFrame(() => {
+      const box = anchor.current?.getBoundingClientRect();
+      const menu = popover.current;
+      if (!box || !menu) return;
+      const width = Math.max(box.width, 224);
+      const height = menu.getBoundingClientRect().height;
+      const viewportBottom = window.innerHeight - 8;
+      const below = box.bottom + 6;
+      const top =
+        below + height <= viewportBottom
+          ? below
+          : Math.max(8, box.top - height - 6);
+      const left = align === "end" ? box.right - width : box.left;
+      setPosition({
+        top: Math.min(top, Math.max(8, viewportBottom - height)),
+        left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+        width,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [align, open]);  function toggle() {
     if (!open && anchor.current) {
       const box = anchor.current.getBoundingClientRect();
       const width = Math.max(box.width, 224);
@@ -3569,6 +3956,7 @@ function Dropdown({
       {open &&
         createPortal(
           <div
+            ref={popover}
             className="dropdown-popover"
             role="listbox"
             aria-label={label}
@@ -3719,7 +4107,10 @@ function ThinkingPicker({
   );
 }
 
-function RowView({ row, language }: { row: Row; language: Language }) {
+const RowView = memo(function RowView({
+  row,
+  language,
+}: { row: Row; language: Language }) {
   const t = (key: MessageKey) => translate(language, key);
   if (row.kind === "note") {
     const values = row.translation?.values;
@@ -3769,8 +4160,11 @@ function RowView({ row, language }: { row: Row; language: Language }) {
     const edits = editInfo(row.name, row.args);
     if (edits) return <EditCard row={row} edits={edits} language={language} />;
     const resultText = typeof row.result === "string" ? row.result : null;
-    const readResult =
-      row.name === "read" && row.status !== "error" && resultText !== null;
+    const readResultText =
+      row.name === "read" && row.status !== "error"
+        ? readOutput(row.result)
+        : null;
+    const readResult = readResultText !== null;
     const readPath = row.name === "read" ? pathOfArgs(row.args) : "";
     const showArgs = row.result === undefined && row.args !== undefined;
     return (
@@ -3795,7 +4189,7 @@ function RowView({ row, language }: { row: Row; language: Language }) {
               <pre>{safeJson(row.args)}</pre>
             </>
           ) : readResult ? (
-            <ReadCode path={readPath} text={resultText} language={language} />
+            <ReadCode path={readPath} text={readResultText ?? ""} language={language} />
           ) : resultText !== null ? (
             isMarkdownText(resultText) ? (
               <MarkdownBody text={resultText} language={language} />
@@ -3813,7 +4207,7 @@ function RowView({ row, language }: { row: Row; language: Language }) {
   }
 
   return <MessageRow row={row} language={language} />;
-}
+});
 
 function MessageRow({
   row,
@@ -4268,8 +4662,8 @@ function RuntimePanel({
       </div>
 
       <label htmlFor="model">{zh ? "模型" : "Model"}</label>
-      <select
-        id="model"
+      <MenuSelect
+        label={zh ? "模型" : "Model"}
         value={
           runtime?.modelId
             ? modelKey({ id: runtime.modelId, provider: runtime.provider })
@@ -4278,10 +4672,8 @@ function RuntimePanel({
         disabled={
           !supported.has("set_model") || pending !== "" || models.length === 0
         }
-        onChange={(event) => {
-          const next = models.find(
-            (entry) => modelKey(entry) === event.target.value,
-          );
+        onChange={(value) => {
+          const next = models.find((entry) => modelKey(entry) === value);
           if (!next) return;
           void run("model", async () => {
             await commandData(sessionId, "set_model", {
@@ -4291,14 +4683,14 @@ function RuntimePanel({
             return api.runtimeState(sessionId);
           });
         }}
-      >
-        <option value="">—</option>
-        {models.map((entry) => (
-          <option key={modelKey(entry)} value={modelKey(entry)}>
-            {entry.name} ({entry.provider})
-          </option>
-        ))}
-      </select>
+        options={[
+          { value: "", label: "—" },
+          ...models.map((entry) => ({
+            value: modelKey(entry),
+            label: `${entry.name} (${entry.provider})`,
+          })),
+        ]}
+      />
       {model?.contextWindow ? (
         <p className="muted">
           {t("context")} {Math.round(model.contextWindow / 1000)}k
@@ -4306,29 +4698,28 @@ function RuntimePanel({
       ) : null}
 
       <label htmlFor="thinking">{zh ? "思考深度" : "Thinking level"}</label>
-      <select
-        id="thinking"
+      <MenuSelect
+        label={zh ? "思考深度" : "Thinking level"}
         value={level}
         disabled={
           !supported.has("set_thinking_level") ||
           pending !== "" ||
           levels.length === 0
         }
-        onChange={(event) =>
+        onChange={(next) =>
           void run("thinking", async () => {
-            const next = event.target.value;
             await commandData(sessionId, "set_thinking_level", { level: next });
             return api.runtimeState(sessionId);
           })
         }
-      >
-        <option value="">—</option>
-        {levels.map((entry) => (
-          <option key={entry} value={entry}>
-            {valueLabel(language, entry)}
-          </option>
-        ))}
-      </select>
+        options={[
+          { value: "", label: "—" },
+          ...levels.map((entry) => ({
+            value: entry,
+            label: valueLabel(language, entry),
+          })),
+        ]}
+      />
 
       <h3 className="panel-heading">{zh ? "上下文" : "Context"}</h3>
       {context ? (
