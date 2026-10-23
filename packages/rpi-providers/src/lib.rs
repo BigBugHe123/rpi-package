@@ -4,6 +4,7 @@ pub mod llama_cpp;
 pub mod openrouter;
 pub mod proxy;
 mod registration;
+mod transport;
 
 rpi_plugin_sdk::export_plugin!(|api| {
     for register in [

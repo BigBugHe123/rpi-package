@@ -55,7 +55,8 @@ pub struct ProxyConfig {
     /// Optional API key for the proxy (not the underlying LLM provider).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Request timeout. Defaults to 600 seconds if not specified.
+    /// Total request timeout when `SimpleStreamOptions::timeout` is unset.
+    /// Per-request options take precedence; absent values use the SDK default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Duration>,
     /// Additional headers to send with each request.
@@ -101,12 +102,23 @@ impl ProxyConfig {
 /// needing direct API credentials.
 pub struct ProxyProvider {
     config: ProxyConfig,
+    client: Option<reqwest::Client>,
 }
 
 impl ProxyProvider {
     /// Create a new proxy provider.
     pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client: None,
+        }
+    }
+
+    pub(super) fn with_client(config: ProxyConfig, client: reqwest::Client) -> Self {
+        Self {
+            config,
+            client: Some(client),
+        }
     }
 
     /// Get the proxy endpoint.
@@ -139,20 +151,18 @@ impl Provider for ProxyProvider {
             model.base_url = self.config.endpoint.clone();
         }
         let mut options = options.clone();
+        options.timeout = options.timeout.or(self.config.timeout);
         if options.api_key.is_none() {
             options.api_key = self.config.api_key.clone();
         }
         if let Some(headers) = &self.config.headers {
-            let options_headers = options.headers.get_or_insert_with(Default::default);
-            for (key, value) in headers {
-                options_headers
-                    .entry(key.clone())
-                    .or_insert_with(|| value.clone());
+            let mut merged = headers.clone();
+            for (key, value) in options.headers.take().unwrap_or_default() {
+                rpi_ai::provider::set_http_header(&mut merged, &key, Some(&value));
             }
+            options.headers = Some(merged);
         }
-        rpi_plugin_sdk::provider::completions(&model, &options, true)
-            .stream_simple(&model, context, &options)
-            .await
+        crate::transport::stream(self.client.as_ref(), &model, context, &options, true).await
     }
 }
 
