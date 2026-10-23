@@ -425,6 +425,7 @@ export const api = {
   openSession: (id: string) =>
     request<SessionSummary>(`/sessions/${id}/open`, { method: "POST" }),
   runtimeState: (id: string) => commandData<RuntimeState>(id, "get_state"),
+  stats: (id: string) => commandData<unknown>(id, "get_stats"),
   models: (id: string) =>
     commandData<{ models: ModelDescriptor[] }>(id, "get_available_models"),
   thinkingLevels: (id: string) =>

@@ -326,6 +326,54 @@ function statNumber(
   return null;
 }
 
+function normalizeRuntimeStats(value: unknown): RuntimeState["stats"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const looksLikeStats = (candidate: Record<string, unknown>) =>
+    [
+      "input",
+      "output",
+      "inputTokens",
+      "outputTokens",
+      "cacheRead",
+      "cachedTokens",
+      "totalTokens",
+      "operationCount",
+    ].some((key) => key in candidate);
+  if (looksLikeStats(record))
+    return record as unknown as RuntimeState["stats"];
+  for (const key of ["stats", "usage", "data"]) {
+    const nested = record[key];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const nestedRecord = nested as Record<string, unknown>;
+      if (looksLikeStats(nestedRecord)) {
+        return nestedRecord as unknown as RuntimeState["stats"];
+      }
+    }
+  }
+  for (const nested of Object.values(record)) {
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const nestedRecord = nested as Record<string, unknown>;
+      if (looksLikeStats(nestedRecord)) {
+        return nestedRecord as unknown as RuntimeState["stats"];
+      }
+    }
+  }
+  return record as unknown as RuntimeState["stats"];
+}
+
+function usageNumber(value: unknown, keys: string[]): number {
+  if (!value || typeof value !== "object") return 0;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate;
+    }
+  }
+  return 0;
+}
+
 function inputTokenCount(stats: RuntimeState["stats"]) {
   return statNumber(stats, ["inputTokens", "input", "promptTokens"]);
 }
@@ -825,6 +873,38 @@ export default function App() {
             break;
           }
           if (roleOf(event.message) !== "assistant") break;
+          if (event.type === "message_end") {
+            const message = (event.message ?? {}) as Record<string, unknown>;
+            const usage = message.usage;
+            const input = usageNumber(usage, ["input", "inputTokens", "promptTokens"]);
+            const output = usageNumber(usage, ["output", "outputTokens", "completionTokens"]);
+            const cacheRead = usageNumber(usage, ["cacheRead", "cachedTokens"]);
+            const cacheWrite = usageNumber(usage, ["cacheWrite"]);
+            const total = usageNumber(usage, ["totalTokens"]) ||
+              input + output + cacheRead + cacheWrite;
+            if (total > 0) {
+              setRuntime((previous) => {
+                const currentStats = previous?.stats;
+                const currentTotal = totalTokenCount(currentStats);
+                if (currentTotal != null && currentTotal > 0) return previous;
+                return {
+                  ...(previous ?? {}),
+                  stats: {
+                    ...(currentStats ?? {}),
+                    messageCount: currentStats?.messageCount ?? 0,
+                    costTotal: currentStats?.costTotal ?? 0,
+                    input,
+                    output,
+                    cacheRead,
+                    cacheWrite,
+                    totalTokens: total,
+                    cachedTokens: cacheRead,
+                    uncachedTokens: Math.max(0, input - cacheRead),
+                  },
+                };
+              });
+            }
+          }
           const prefix = currentAssistant.current ?? `restored-${seq}`;
           currentAssistant.current = prefix;
           const rebuilt = rowsFromAssistant(
@@ -1479,6 +1559,20 @@ export default function App() {
             .queue(id, showQueueHistory)
             .then((value) => {
               if (current()) setQueueItems(value.items ?? []);
+            })
+            .catch(() => {}),
+        );
+      }
+      if (supported.has("get_stats")) {
+        jobs.push(
+          api.stats(id)
+            .then((rawStats) => {
+              if (!current()) return;
+              const stats = normalizeRuntimeStats(rawStats);
+              if (!stats) return;
+              setRuntime((previous) =>
+                previous ? { ...previous, stats } : { stats },
+              );
             })
             .catch(() => {}),
         );

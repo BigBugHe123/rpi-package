@@ -307,7 +307,18 @@ async function mockHost(page: Page) {
         case "get_stats":
           return route.fulfill({
             json: response(
-              { messageCount: 0, totalTokens: 0, costTotal: 0 },
+              {
+                messageCount: 1,
+                input: 100,
+                output: 252,
+                cacheRead: 20,
+                cacheWrite: 0,
+                totalTokens: 352,
+                cachedTokens: 20,
+                uncachedTokens: 80,
+                cost: 0.01,
+                costTotal: 0.01,
+              },
               body.type,
             ),
           });
@@ -4119,7 +4130,7 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
     "rg -n",
   );
   await page.locator(".shell-card summary").click();
-  await expect(page.locator(".shell-card .shell-prompt")).toHaveText("PS> ");
+  await expect(page.locator(".shell-card .shell-branch")).toHaveText("└");
 });
 
 test("mobile composer footer keeps model picker usable beside session metrics", async ({
@@ -4180,7 +4191,9 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   const footer = page.locator(".composer-footer");
   await expect(metrics.getByLabel(/^Context:/)).toBeVisible();
   await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
-  await expect(metrics.getByLabel(/^Input tokens:/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Input tokens: 100$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Output tokens: 252$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
   await metrics.locator(":scope > summary").click();
   await expect(metrics.getByLabel(/^Cached tokens:/)).toBeVisible();
   const metricsBox = await metrics.boundingBox();
