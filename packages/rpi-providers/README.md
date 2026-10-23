@@ -19,7 +19,7 @@ provider ID 不变，无需合并凭据。匿名目录就绪不代表本地服�
 
 本修复分支将 `rpi-ai`、`rpi-plugin-sdk` 和测试使用的 `rpi-extensions` 固定到
 宿主 [PR #88](https://github.com/bigfish1913/pi-rust/pull/88) 的同一提交
-`b158b6a8495f7e6dda051f46d1fa56df07e085a0`。当前 crates.io 的 0.8.1 不包含此修复；
+`3fb44dee43fd7e23ee1b222117f221645ef721e1`。当前 crates.io 的 0.8.1 不包含此修复；
 正式合并、发布前必须将这三项一起切换到包含修复的已发布 SDK，重新执行下面的验证。
 其他扩展继续使用工作区固定的 SDK 0.3.20。
 

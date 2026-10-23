@@ -158,6 +158,10 @@ async fn stub(reject: bool) -> (String, oneshot::Sender<()>, tokio::task::JoinHa
             return;
         }
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+        // A gateway may prepend a BOM, with its bytes split across HTTP chunks.
+        for byte in [b"\xef", b"\xbb", b"\xbf"] {
+            http_chunk(&mut socket, byte).await;
+        }
         http_chunk(
             &mut socket,
             sse(

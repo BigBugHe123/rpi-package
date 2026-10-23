@@ -2,8 +2,8 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rpi_ai::{
-    AssistantMessage, Content, Context, Message, Model, Provider, SimpleStreamOptions, StopReason,
-    StreamingProtocolCompat, ThinkingLevel,
+    AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, Provider,
+    SimpleStreamOptions, StopReason, StreamingProtocolCompat, ThinkingLevel,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -380,6 +380,91 @@ async fn every_loaded_provider_keeps_active_fragmented_streams_alive() {
             .unwrap();
         assert_eq!(message.stop_reason, StopReason::Stop, "{message:?}");
         assert_eq!(Content::text_only(&message.content, ""), "healthy");
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_loaded_provider_preserves_the_first_frame_after_a_leading_bom() {
+    let (_session, providers) = providers();
+    for provider in providers {
+        let mut fixture = Fixture::new(
+            vec![
+                (Duration::ZERO, format!("\u{feff}{}", frame("first", false))),
+                (Duration::ZERO, frame("\u{feff}second", true)),
+            ],
+            true,
+        )
+        .await;
+        let stream = provider
+            .stream_simple(
+                &model(provider.as_ref(), &fixture),
+                &Context::new(vec![]),
+                &options(Duration::from_secs(1)),
+            )
+            .await;
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop, "{message:?}");
+        assert_eq!(
+            Content::text_only(&message.content, ""),
+            "first\u{feff}second",
+            "{}",
+            provider.id()
+        );
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_loaded_provider_dispatches_cr_delimited_frames_while_response_stays_open() {
+    let (_session, providers) = providers();
+    for provider in providers {
+        // Exceed delta batching so this checks frame delivery independently of
+        // the provider's text coalescing policy.
+        let text = "early".repeat(1024);
+        let mut fixture = Fixture::new(
+            vec![(Duration::ZERO, frame(&text, false).replace('\n', "\r"))],
+            false,
+        )
+        .await;
+        let options = options(Duration::from_secs(1));
+        let mut stream = provider
+            .stream_simple(
+                &model(provider.as_ref(), &fixture),
+                &Context::new(vec![]),
+                &options,
+            )
+            .await;
+        let delta = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    AssistantMessageEvent::TextDelta { delta, .. } => return delta,
+                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
+                        panic!("{}: terminal before CR-delimited text", provider.id());
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{}: no text before EOF", provider.id());
+        })
+        .await
+        .unwrap();
+        assert_eq!(delta, text);
+        assert!(!fixture.server.is_finished());
+        options.signal.cancel();
+        let message = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            message.stop_reason,
+            StopReason::Aborted,
+            "{}: {message:?}",
+            provider.id()
+        );
         fixture.finish().await;
     }
 }
