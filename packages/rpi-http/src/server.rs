@@ -531,8 +531,14 @@ async fn command(
 async fn snapshot(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(options): Query<service::SnapshotOptions>,
 ) -> axum::response::Response {
-    HttpReply(service::snapshot(&state.backend, id).await.into_reply()).into_response()
+    HttpReply(
+        service::snapshot_with_options(&state.backend, id, options)
+            .await
+            .into_reply(),
+    )
+    .into_response()
 }
 
 // An absent body keeps the legacy default, but a malformed supplied body must

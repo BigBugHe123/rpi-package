@@ -74,6 +74,10 @@ export interface ChangedFile {
 export interface GitStatus {
   isRepository: boolean;
   branch: string | null;
+  isDetached?: boolean;
+  isWorktree?: boolean | null;
+  repositoryRoot?: string | null;
+  worktreePath?: string | null;
   files: ChangedFile[];
 }
 
@@ -271,6 +275,17 @@ export async function commandData<T>(
   return (response.data ?? {}) as T;
 }
 
+const gitRequests = new Map<string, Promise<GitStatus>>();
+function gitStatus(projectId: string) {
+  const existing = gitRequests.get(projectId);
+  if (existing) return existing;
+  const job = request<GitStatus>(`/projects/${projectId}/git/status`).finally(() => {
+    if (gitRequests.get(projectId) === job) gitRequests.delete(projectId);
+  });
+  gitRequests.set(projectId, job);
+  return job;
+}
+
 export const api = {
   projects: () =>
     request<{
@@ -310,8 +325,7 @@ export const api = {
     request<{ path: string; content: string }>(
       `/projects/${projectId}/file?${new URLSearchParams({ path })}`,
     ),
-  gitStatus: (projectId: string) =>
-    request<GitStatus>(`/projects/${projectId}/git/status`),
+  gitStatus: (projectId: string) => gitStatus(projectId),
   diff: (projectId: string, path: string, staged: boolean) =>
     request<{ path: string; patch: string }>(
       `/projects/${projectId}/git/diff?${new URLSearchParams({ path, staged: String(staged) })}`,

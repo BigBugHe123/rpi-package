@@ -323,7 +323,7 @@ fn parse_status(output: &str, prefix: &str) -> Vec<Value> {
 }
 
 pub async fn status(project: &Project) -> Reply {
-    let (valid, _) = git(project, &["rev-parse", "--show-toplevel"]).await?;
+    let (valid, repository_root) = git(project, &["rev-parse", "--show-toplevel"]).await?;
     if !valid {
         return Ok(json!({"isRepository":false,"files":[],"branch":null}));
     }
@@ -348,8 +348,26 @@ pub async fn status(project: &Project) -> Reply {
         branch = git(project, &["rev-parse", "--short", "HEAD"]).await?.1;
     }
     let (_, prefix) = git(project, &["rev-parse", "--show-prefix"]).await?;
+    let (_, directories) = git(
+        project,
+        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+    )
+    .await?;
+    let mut directories = directories.lines();
+    let is_worktree =
+        directories
+            .next()
+            .zip(directories.next())
+            .and_then(|(git_dir, common_dir)| {
+                let git_dir = project.root.join(git_dir).canonicalize().ok()?;
+                let common_dir = project.root.join(common_dir).canonicalize().ok()?;
+                Some(git_dir != common_dir)
+            });
     Ok(
-        json!({"isRepository":true,"branch":branch.trim(),"files":parse_status(&output, prefix.trim_end_matches(['\r', '\n']))}),
+        json!({"isRepository":true,"branch":branch.trim(),"isDetached":!named_branch,
+            "repositoryRoot":repository_root.trim(),"isWorktree":is_worktree,
+            "worktreePath":if is_worktree == Some(true) { Some(repository_root.trim()) } else { None },
+            "files":parse_status(&output, prefix.trim_end_matches(['\r', '\n']))}),
     )
 }
 
@@ -585,6 +603,55 @@ mod tests {
             .contains("-before"));
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[tokio::test]
+    async fn git_status_identifies_linked_worktrees_and_detached_heads() {
+        let root = fixture();
+        let project = Project::new(&root).unwrap();
+        assert_eq!(status(&project).await.unwrap()["isRepository"], false);
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            assert!(git(&project, &args).await.unwrap().0);
+        }
+        assert_eq!(status(&project).await.unwrap()["isWorktree"], false);
+        let linked = root.join("linked");
+        let linked_path = linked.to_str().unwrap();
+        assert!(
+            git(
+                &project,
+                &["worktree", "add", "-b", "test-worktree", linked_path]
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        std::fs::create_dir(linked.join("src")).unwrap();
+        let nested = Project::new(&linked.join("src")).unwrap();
+        let info = status(&nested).await.unwrap();
+        assert_eq!(info["isWorktree"], true);
+        assert_eq!(info["branch"], "test-worktree");
+        assert_eq!(
+            Path::new(info["worktreePath"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            linked.canonicalize().unwrap()
+        );
+        assert!(git(&nested, &["checkout", "--detach"]).await.unwrap().0);
+        let info = status(&nested).await.unwrap();
+        assert_eq!(info["isDetached"], true);
+        assert_ne!(info["branch"], "HEAD");
+        assert!(
+            git(&project, &["worktree", "remove", "--force", linked_path])
+                .await
+                .unwrap()
+                .0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn git_previews_staged_unstaged_and_untracked_changes() {
         let root = fixture();

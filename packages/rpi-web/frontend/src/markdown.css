@@ -98,7 +98,7 @@
   overflow-x: auto;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 0;
   background: var(--soft);
   color: var(--text);
   font-size: 13px;
@@ -192,12 +192,15 @@
   margin: 14px 0;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 0;
   background: var(--soft);
 }
 .markdown-body .markdown-code-block pre {
   margin: 0;
   padding: 13px 15px;
+  /* The wrapper owns the frame; the heading owns its single separator. */
+  border: 0;
+  border-radius: 0;
   overflow: auto;
   background: transparent;
   font-size: 12px;

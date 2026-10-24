@@ -751,7 +751,7 @@ test("mobile navigation opens without horizontal overflow", async ({
       .locator(".composer")
       .first()
       .evaluate((element) => getComputedStyle(element).borderRadius),
-  ).toBe("17px");
+  ).toBe("14px");
   expect(
     await page.locator(".toolbar").evaluate(
       (element) => element.scrollWidth <= element.clientWidth,
@@ -780,6 +780,11 @@ test("mobile navigation opens without horizontal overflow", async ({
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page.locator(".composer").first()).toHaveCSS(
+    "border-radius",
+    "17px",
+  );
 });
 
 test("mobile session actions keep the ellipsis control compact", async ({
@@ -2218,6 +2223,128 @@ test("an old prompt acknowledgement does not block a new chat or unlock its pend
   releases[1]();
   await (await newFinished).finished();
   expect(pending).toEqual([sessionId, "session-2"]);
+});
+
+for (const kind of ["single", "input", "multiple", "cancel"] as const) {
+  test(`ask_user ${kind} returns a native structured answer`, async ({
+    page,
+  }) => {
+    await mockHost(page);
+    let submitted: Record<string, unknown> | undefined;
+    await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          status: "awaiting_input",
+          messages: [],
+          lastSeq: 4,
+          events: [],
+          pendingDialogs: [
+            {
+              requestId: "ask-native",
+              toolCallId: "ask-1",
+              ui: {
+                kind: kind === "input" ? "input" : "selector",
+                question: "Choose a target",
+                context: "Native ask_user test",
+                options:
+                  kind === "input"
+                    ? []
+                    : [
+                        { title: "Linux", description: "Server build" },
+                        { title: "Windows" },
+                      ],
+                allowMultiple: kind === "multiple",
+                allowComment: kind === "multiple",
+                allowFreeform: kind === "input",
+              },
+            },
+          ],
+        },
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "ui_dialog_response") return route.fallback();
+      submitted = body;
+      return route.fulfill({ json: response({ accepted: true }, body.type) });
+    });
+    await page.goto("/");
+    const dialog = page.getByRole("dialog");
+    await expect(
+      dialog.getByRole("heading", { name: "Choose a target" }),
+    ).toBeVisible();
+    if (kind === "cancel") {
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect
+        .poll(() => submitted)
+        .toMatchObject({ requestId: "ask-native", cancelled: true });
+      expect(submitted).not.toHaveProperty("answer");
+      return;
+    }
+    if (kind !== "input")
+      await dialog.getByRole("button", { name: "Linux Server build" }).click();
+    if (kind === "multiple") {
+      await dialog
+        .getByRole("button", { name: "Windows", exact: true })
+        .click();
+      await expect(
+        dialog.getByRole("button", { name: "Windows", exact: true }),
+      ).toHaveAttribute("aria-pressed", "true");
+    }
+    if (kind !== "single") {
+      await dialog.getByRole("textbox").fill("Deploy to staging");
+      await dialog.getByRole("button", { name: "Submit", exact: true }).click();
+    }
+    const answer =
+      kind === "single"
+        ? { values: ["Linux"] }
+        : kind === "input"
+          ? { values: ["Deploy to staging"], text: "Deploy to staging" }
+          : { values: ["Linux", "Windows"], text: "Deploy to staging" };
+    await expect.poll(() => submitted?.answer).toEqual(answer);
+  });
+}
+
+test("history renders before the model catalog finishes loading", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_models",
+        ],
+      },
+    }),
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      if (route.request().postDataJSON().type !== "get_available_models")
+        return route.fallback();
+      await held;
+      return route.fulfill({ json: response({ models: [] }) });
+    },
+  );
+  await page.goto("/");
+  try {
+    await expect(page.locator(".transcript-note")).toContainText(
+      "Run completed",
+    );
+    await expect(
+      page.getByRole("status", { name: "Loading conversation" }),
+    ).toBeHidden();
+  } finally {
+    release();
+  }
 });
 
 test("consecutive permission dialogs remain independent of delayed acknowledgements", async ({
@@ -4133,6 +4260,155 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
   await expect(page.locator(".shell-card .shell-branch")).toHaveText("└");
 });
 
+for (const mode of [
+  "legacy messages",
+  "live messages",
+  "native totals",
+] as const) {
+  test(`token metrics survive diagnostics and reload with ${mode}`, async ({
+    page,
+  }) => {
+    await mockHost(page);
+    const legacy = mode !== "native totals";
+    const live = mode === "live messages";
+    const stats = {
+      messageCount: 4,
+      cachedTokens: legacy ? 0 : 800,
+      uncachedTokens: legacy ? 0 : 200,
+      totalTokens: legacy ? 0 : 1050,
+      costTotal: 0,
+      cacheHitRatio: null,
+    };
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, (route) => {
+      const { type } = route.request().postDataJSON();
+      if (type === "get_stats")
+        return route.fulfill({ json: response(stats, type) });
+      if (type === "get_state")
+        return route.fulfill({ json: response({ sessionId, stats }, type) });
+      return route.fallback();
+    });
+    await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          status: "ready",
+          lastSeq: 4,
+          events: [],
+          hasMore: true,
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "Earlier reply" }],
+              usage: { input: 10, output: 20, cacheRead: 0, totalTokens: 30 },
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "Latest reply" }],
+              usage: {
+                input: 1530,
+                output: 1182,
+                cacheRead: 158208,
+                cacheWrite: 0,
+                totalTokens: 160920,
+              },
+            },
+          ],
+        },
+      }),
+    );
+    if (live)
+      await page.route(`**/api/v1/sessions/${sessionId}/events**`, (route) => {
+        const events = [
+          { input: 100, output: 50, cacheRead: 100, totalTokens: 250 },
+          { input: 400, output: 120, cacheRead: 600, totalTokens: 1120 },
+        ]
+          .map(
+            (usage, index) =>
+              `id: ${5 + index}\nevent: message_end\ndata: ${JSON.stringify({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "Live reply" }],
+                  usage,
+                },
+              })}\n\n`,
+          )
+          .join("");
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: events,
+        });
+      });
+    for (const reload of [false, true]) {
+      const diagnostics = page.waitForResponse(
+        (res) =>
+          res.url().endsWith("/commands") &&
+          res.request().postDataJSON()?.type === "get_stats",
+      );
+      if (reload) await page.reload();
+      else await page.goto("/");
+      await diagnostics;
+      const metrics = page.locator(".composer-metrics");
+      await expect(
+        metrics.getByLabel(
+          `Cache hit: ${live ? "60%" : legacy ? "99%" : "80%"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(
+        metrics.getByLabel(
+          `Input tokens: ${live ? "1.0k" : legacy ? "160k" : "1.0k"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(
+        metrics.getByLabel(
+          `Output tokens: ${live ? "120" : legacy ? "1.2k" : "50"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await metrics.locator(":scope > summary").click();
+      await expect(
+        metrics.getByLabel(
+          `Cached tokens: ${live ? "600" : legacy ? "158k" : "800"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(metrics).not.toContainText("Usage from the latest response");
+      if (reload)
+        await metrics.screenshot({
+          path: test.info().outputPath("token-metrics.png"),
+        });
+    }
+  });
+}
+
+test("composer shows the active project path, branch and linked worktree on narrow screens", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/projects/project-a/git/status", (route) => route.fulfill({ json: {
+    isRepository: true, branch: "codex/a-long-worktree-branch", files: [],
+    isWorktree: true, worktreePath: "/workspace/pi-rust",
+  } }));
+  await page.goto("/");
+  const context = page.locator(".composer-workspace");
+  await expect(context.getByRole("button", { name: "/workspace/pi-rust", exact: true })).toBeVisible();
+  await expect(context.getByLabel("Branch: codex/a-long-worktree-branch", { exact: true })).toBeVisible();
+  await expect(context.getByText("worktree", { exact: true })).toBeVisible();
+  for (const width of [320, 375, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await context.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  }
+  await page.screenshot({ path: test.info().outputPath("project-context.png") });
+  await page.setViewportSize({ width: 375, height: 844 });
+  await page.getByRole("button", { name: "Toggle sidebar", exact: true }).click();
+  await page.getByRole("button", { name: "Open project: rpi-package", exact: true }).click();
+  await expect(context.getByRole("button", { name: "/workspace/rpi-package", exact: true })).toBeVisible();
+  await expect(context.getByLabel("Branch: main", { exact: true })).toBeVisible();
+  await expect(context.getByText("worktree", { exact: true })).toBeHidden();
+  await expect(context).not.toContainText("codex/a-long-worktree-branch");
+});
+
 test("mobile composer footer keeps model picker usable beside session metrics", async ({
   page,
 }) => {
@@ -4190,10 +4466,15 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   const metrics = page.locator(".composer-metrics");
   const footer = page.locator(".composer-footer");
   await expect(metrics.getByLabel(/^Context:/)).toBeVisible();
+  await expect(metrics.getByLabel("Context: 129k / 227k", { exact: true })).toContainText("129k / 227k");
   await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
   await expect(metrics.getByLabel(/^Input tokens: 100$/)).toBeVisible();
   await expect(metrics.getByLabel(/^Output tokens: 252$/)).toBeVisible();
   await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
+  await expect(metrics.getByLabel("Total tokens: 352", { exact: true })).toBeHidden();
+  await expect(metrics.getByLabel(/^Cached tokens:/)).toBeHidden();
+  await expect(metrics.getByLabel(/^Cost:/)).toBeHidden();
+  expect(await metrics.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await metrics.locator(":scope > summary").click();
   await expect(metrics.getByLabel(/^Cached tokens:/)).toBeVisible();
   const metricsBox = await metrics.boundingBox();
@@ -4201,6 +4482,23 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   expect(metricsBox).not.toBeNull();
   expect(footerBox).not.toBeNull();
   expect(metricsBox!.y).toBeGreaterThan(footerBox!.y + footerBox!.height - 1);
+
+  await metrics.locator(":scope > summary").click();
+  for (const width of [320, 375, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    const summary = metrics.locator(":scope > summary");
+    await expect(summary.locator(".composer-metric")).toHaveCount(4);
+    const layout = await summary.evaluate((element) => {
+      const tops = Array.from(element.querySelectorAll(".composer-metric"),
+        (item) => item.getBoundingClientRect().top);
+      return {
+        singleLine: Math.max(...tops) - Math.min(...tops) < 1,
+        fits: element.scrollWidth <= element.clientWidth,
+      };
+    });
+    expect(layout).toEqual({ singleLine: true, fits: true });
+    if (width === 375) await metrics.screenshot({ path: test.info().outputPath("compact-footer-mobile.png") });
+  }
 
   await model.click();
   const popover = page.getByRole("listbox", {
@@ -4214,4 +4512,5 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   expect(popoverBox!.y + popoverBox!.height).toBeLessThanOrEqual(844);
   await page.getByRole("option", { name: "Mobile model" }).click();
   await expect(popover).toBeHidden();
+
 });

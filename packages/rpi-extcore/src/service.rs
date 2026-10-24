@@ -934,10 +934,23 @@ pub async fn command(state: &Service, id: String, command: ApiCommand) -> (Reply
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SnapshotOptions {
+    pub limit: Option<usize>,
+}
+
 /// A read-only transcript snapshot plus the events that landed while it was
 /// being taken, so a client can render history and then follow `?after=` live
 /// without a gap or an overlap.
 pub async fn snapshot(state: &Service, id: String) -> ServiceReply {
+    snapshot_with_options(state, id, SnapshotOptions::default()).await
+}
+
+pub async fn snapshot_with_options(
+    state: &Service,
+    id: String,
+    options: SnapshotOptions,
+) -> ServiceReply {
     let session = state.sessions.read().await.get(&id).cloned();
     let Some(session) = session else {
         return (ReplyKind::NotFound, json!({"error":"session not found"})).into_reply();
@@ -946,7 +959,7 @@ pub async fn snapshot(state: &Service, id: String) -> ServiceReply {
     let start = host_snapshot.last_seq;
     let request_id = json!(uuid::Uuid::new_v4().to_string());
     let response = session
-        .send(json!({"type": "get_messages", "id": request_id}))
+        .send(json!({"type": "get_messages", "id": request_id, "limit": options.limit.unwrap_or(80).clamp(1, 400)}))
         .await;
     let response = match response {
         Ok(response) => response,
@@ -1051,6 +1064,56 @@ pub fn replay_gap(after: Option<u64>, first: Option<u64>, latest: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn snapshot_limits_native_history_without_losing_the_earlier_cursor() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let root = std::env::temp_dir().join(format!("rpi-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let service = Service::new(BackendConfig {
+            project: root.clone(),
+            registry: root.join("sessions.json"),
+            ..BackendConfig::default()
+        })
+        .unwrap();
+        let (writer, peer) = tokio::io::duplex(4096);
+        let (session, replies) = HostSession::test_connection(writer, 16);
+        service
+            .sessions
+            .write()
+            .await
+            .insert("history".into(), session);
+        let fixture = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let data = if request["type"] == "get_messages" {
+                    let limit = request["limit"].as_u64().unwrap_or(400);
+                    json!({
+                        "messages": (1000-limit..1000).map(|id| json!({"entryId":id.to_string(),"role":"user","content":"history"})).collect::<Vec<_>>(),
+                        "total": 1000, "firstId": (1000-limit).to_string(), "hasMore": true
+                    })
+                } else {
+                    json!({"records":[],"hasMore":false})
+                };
+                replies
+                    .send(json!({"type":"response","id":request["id"],"success":true,"data":data}))
+                    .unwrap();
+            }
+        });
+        for (limit, expected) in [(None, 80), (Some(10), 10), (Some(0), 1), (Some(999), 400)] {
+            let result =
+                snapshot_with_options(&service, "history".into(), SnapshotOptions { limit }).await;
+            assert_eq!(result.kind, ReplyKind::Success);
+            assert_eq!(result.value["messages"].as_array().unwrap().len(), expected);
+            assert_eq!(result.value["firstId"], (1000 - expected).to_string());
+            assert_eq!(result.value["hasMore"], true);
+            assert_eq!(result.value["total"], 1000);
+        }
+        fixture.abort();
+        service.shutdown().await;
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_auth_refresh_terminates_its_native_process() {

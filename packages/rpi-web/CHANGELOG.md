@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Show the session's project directory and Git branch beside the composer, with linked-worktree detection and compact path truncation on narrow screens.
+- Load the latest 80 messages for the initial snapshot and fetch model catalogs after history, while retaining native pagination for earlier messages.
+- Return native structured `ask_user` answers, including multiple choices and comments, without changing permission dialog responses.
+- Keep the mobile composer at its intended 14px corner radius instead of inheriting the desktop's 17px radius.
+- Use square corners for fenced code blocks and remove the nested preformatted border that doubled the frame and heading separator.
+- Restore token and cache metrics from the latest historical response when legacy session totals are unavailable, retain them across diagnostic refreshes, and derive input/output counts from native aggregate statistics.
+- Keep the composer footer on one line with input, output, cache hit rate and context usage/capacity; move total/cached tokens and secondary metrics into the expandable details.
+
 ## [0.1.7] - 2026-10-24
 
 ### Changed
