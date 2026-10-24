@@ -296,6 +296,12 @@ frontend commands below before `cargo build` / `cargo run` if you want the embed
 workspace; without it the server still compiles and serves a "frontend not built" page,
 and `--assets` can point at an existing bundle.
 
+### Shared backend
+
+The source implementation now composes the `rpi-http` API adapter with the frontend routes in this package. Shared native RPC, runs, session/workspace services, history, events and timing belong to `rpi-extcore`; ACP uses the same native driver and run/message semantics. The existing Web executable and extension still include everything needed to run the browser workspace.
+
+For an API-only service, see [rpi-http](../rpi-http/README.md). The dependency boundaries and compatibility contract are documented in [the architecture guide](../../docs/architecture/extension-core.md).
+
 ### How the frontend is built and served
 
 The frontend is a React application built with Vite. At release time, `npm ci` and `npm run build` run in `frontend/`; Vite writes `index.html`, JavaScript, CSS, and the favicon into `../assets/`. Cargo then runs `build.rs`, which inventories that directory and generates `include_bytes!` entries for every file. Both the native extension library and the standalone executable contain this bundle.

@@ -8,6 +8,10 @@ single `rpi --acp` process.
 Computer / Zed  ──ACP over stdio──▶  rpi --acp  ──spawn──▶  rpi --mode rpc  (per session)
 ```
 
+## Shared runtime
+
+The source implementation delegates native RPC children, isolated command requests, run acceptance/settlement, text reconciliation, history traversal and question answer validation to [rpi-extcore](../rpi-extcore/README.md). This package retains ACP serialization, capabilities, client requests and Zed/terminal-auth integration. Its existing extension and bridge entrypoints and session storage paths remain unchanged. See the [architecture contract](../../docs/architecture/extension-core.md).
+
 ## How it works
 
 Open WebUI Computer can use the same standard ACP entrypoint. Deploy and

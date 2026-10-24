@@ -1,5 +1,5 @@
-//! Read-only access to explicitly configured projects. Never accept arbitrary roots from HTTP.
-use axum::{http::StatusCode, Json};
+//! Read-only access to explicitly configured projects. Clients must use explicitly configured workspace roots.
+use crate::reply::ReplyKind;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 
 const FILE_LIMIT: u64 = 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 2 * 1024 * 1024;
-pub type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
+pub type Reply = crate::reply::ServiceResult;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Project {
@@ -54,9 +54,7 @@ impl Project {
     }
 }
 
-pub fn failure(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({"error": message})))
-}
+pub use crate::reply::failure;
 
 fn hidden(name: &str) -> bool {
     matches!(
@@ -67,9 +65,9 @@ fn hidden(name: &str) -> bool {
 
 /// Check components before resolving, then check the canonical target/ancestor.
 /// The ancestor check also covers deleted and untracked paths used by Git diff.
-fn resolve(root: &Path, relative: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+fn resolve(root: &Path, relative: &str) -> Result<PathBuf, (ReplyKind, Value)> {
     if relative.contains(['\\', '\0', ':']) {
-        return Err(failure(StatusCode::BAD_REQUEST, "invalid project path"));
+        return Err(failure(ReplyKind::InvalidInput, "invalid project path"));
     }
     let path = Path::new(relative);
     for part in path.components() {
@@ -77,7 +75,7 @@ fn resolve(root: &Path, relative: &str) -> Result<PathBuf, (StatusCode, Json<Val
             Component::Normal(name) if !hidden(&name.to_string_lossy()) => {}
             _ => {
                 return Err(failure(
-                    StatusCode::FORBIDDEN,
+                    ReplyKind::AccessDenied,
                     "path is outside the browsable project",
                 ))
             }
@@ -89,11 +87,11 @@ fn resolve(root: &Path, relative: &str) -> Result<PathBuf, (StatusCode, Json<Val
         match std::fs::canonicalize(ancestor) {
             Ok(actual) => {
                 if !actual.starts_with(root) {
-                    return Err(failure(StatusCode::FORBIDDEN, "path leaves the project"));
+                    return Err(failure(ReplyKind::AccessDenied, "path leaves the project"));
                 }
                 let inside = actual.strip_prefix(root).unwrap();
                 if inside.components().any(|part| matches!(part, Component::Normal(name) if hidden(&name.to_string_lossy()))) {
-                    return Err(failure(StatusCode::FORBIDDEN, "path is outside the browsable project"));
+                    return Err(failure(ReplyKind::AccessDenied, "path is outside the browsable project"));
                 }
                 // Use the checked canonical ancestor, rather than following the alias again.
                 let remainder = joined.strip_prefix(ancestor).unwrap();
@@ -106,9 +104,9 @@ fn resolve(root: &Path, relative: &str) -> Result<PathBuf, (StatusCode, Json<Val
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ancestor = ancestor
                     .parent()
-                    .ok_or_else(|| failure(StatusCode::NOT_FOUND, "path not found"))?;
+                    .ok_or_else(|| failure(ReplyKind::NotFound, "path not found"))?;
             }
-            Err(_) => return Err(failure(StatusCode::FORBIDDEN, "path is not accessible")),
+            Err(_) => return Err(failure(ReplyKind::AccessDenied, "path is not accessible")),
         }
     }
 }
@@ -117,12 +115,12 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
     let path = resolve(&project.root, relative)?;
     let mut directory = tokio::fs::read_dir(path)
         .await
-        .map_err(|_| failure(StatusCode::NOT_FOUND, "directory not found"))?;
+        .map_err(|_| failure(ReplyKind::NotFound, "directory not found"))?;
     let mut entries = Vec::new();
     while let Some(entry) = directory
         .next_entry()
         .await
-        .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read directory"))?
+        .map_err(|_| failure(ReplyKind::AccessDenied, "cannot read directory"))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
         if hidden(&name) {
@@ -131,7 +129,7 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
         let kind = entry
             .file_type()
             .await
-            .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read file type"))?;
+            .map_err(|_| failure(ReplyKind::AccessDenied, "cannot read file type"))?;
         if kind.is_symlink() || !(kind.is_file() || kind.is_dir()) {
             continue;
         }
@@ -140,7 +138,7 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
             "kind":if kind.is_dir() {"directory"} else {"file"},"size":metadata.map(|m|m.len()).unwrap_or(0)}));
         if entries.len() > 2000 {
             return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
+                ReplyKind::LimitExceeded,
                 "directory has too many entries; open a smaller directory",
             ));
         }
@@ -155,23 +153,23 @@ pub async fn files(project: &Project, relative: &str) -> Reply {
                 b["name"].as_str().unwrap_or("").to_lowercase(),
             ))
     });
-    Ok(Json(json!({"path":relative,"entries":entries})))
+    Ok(json!({"path":relative,"entries":entries}))
 }
 
 /// Direct child directories of a root, for the "open an existing folder" picker.
 pub async fn child_directories(
     root: &Path,
     relative: &str,
-) -> Result<Vec<(String, String)>, (StatusCode, Json<Value>)> {
+) -> Result<Vec<(String, String)>, (ReplyKind, Value)> {
     let path = resolve(root, relative)?;
     let mut directory = tokio::fs::read_dir(path)
         .await
-        .map_err(|_| failure(StatusCode::NOT_FOUND, "directory not found"))?;
+        .map_err(|_| failure(ReplyKind::NotFound, "directory not found"))?;
     let mut folders = Vec::new();
     while let Some(entry) = directory
         .next_entry()
         .await
-        .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read projects directory"))?
+        .map_err(|_| failure(ReplyKind::AccessDenied, "cannot read projects directory"))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
         if hidden(&name) {
@@ -180,7 +178,7 @@ pub async fn child_directories(
         let kind = entry
             .file_type()
             .await
-            .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read file type"))?;
+            .map_err(|_| failure(ReplyKind::AccessDenied, "cannot read file type"))?;
         if kind.is_symlink() || !kind.is_dir() {
             continue;
         }
@@ -192,7 +190,7 @@ pub async fn child_directories(
         folders.push((name, path));
         if folders.len() > 2000 {
             return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
+                ReplyKind::LimitExceeded,
                 "projects directory has too many folders",
             ));
         }
@@ -206,51 +204,48 @@ pub async fn file(project: &Project, relative: &str) -> Reply {
     // Reject devices/FIFOs before opening: opening one may otherwise block indefinitely.
     match tokio::fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(failure(StatusCode::BAD_REQUEST, "select a regular file")),
-        Err(_) => return Err(failure(StatusCode::NOT_FOUND, "file not found")),
+        Ok(_) => return Err(failure(ReplyKind::InvalidInput, "select a regular file")),
+        Err(_) => return Err(failure(ReplyKind::NotFound, "file not found")),
     }
     let handle = tokio::fs::File::open(path)
         .await
-        .map_err(|_| failure(StatusCode::NOT_FOUND, "file not found"))?;
+        .map_err(|_| failure(ReplyKind::NotFound, "file not found"))?;
     if !handle
         .metadata()
         .await
         .map(|m| m.is_file())
         .unwrap_or(false)
     {
-        return Err(failure(StatusCode::BAD_REQUEST, "select a regular file"));
+        return Err(failure(ReplyKind::InvalidInput, "select a regular file"));
     }
     let mut bytes = Vec::new();
     handle
         .take(FILE_LIMIT + 1)
         .read_to_end(&mut bytes)
         .await
-        .map_err(|_| failure(StatusCode::FORBIDDEN, "cannot read file"))?;
+        .map_err(|_| failure(ReplyKind::AccessDenied, "cannot read file"))?;
     if bytes.len() as u64 > FILE_LIMIT {
         return Err(failure(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            ReplyKind::LimitExceeded,
             "preview supports files up to 1 MiB",
         ));
     }
     if bytes.contains(&0) {
         return Err(failure(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ReplyKind::UnsupportedContent,
             "binary files cannot be previewed",
         ));
     }
     let content = String::from_utf8(bytes).map_err(|_| {
         failure(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ReplyKind::UnsupportedContent,
             "preview supports UTF-8 text files",
         )
     })?;
-    Ok(Json(json!({"path":relative,"content":content})))
+    Ok(json!({"path":relative,"content":content}))
 }
 
-async fn git(
-    project: &Project,
-    args: &[&str],
-) -> Result<(bool, String), (StatusCode, Json<Value>)> {
+async fn git(project: &Project, args: &[&str]) -> Result<(bool, String), (ReplyKind, Value)> {
     let mut child = crate::process::background_command("git")
         .args([
             "--no-pager",
@@ -269,7 +264,7 @@ async fn git(
         .spawn()
         .map_err(|_| {
             failure(
-                StatusCode::SERVICE_UNAVAILABLE,
+                ReplyKind::Unavailable,
                 "Git is not available on this server",
             )
         })?;
@@ -287,11 +282,11 @@ async fn git(
         )))
     })
     .await
-    .map_err(|_| failure(StatusCode::GATEWAY_TIMEOUT, "Git request timed out"))?
-    .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "Git request failed"))?;
+    .map_err(|_| failure(ReplyKind::Timeout, "Git request timed out"))?
+    .map_err(|_| failure(ReplyKind::Internal, "Git request failed"))?;
     result.ok_or_else(|| {
         failure(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            ReplyKind::LimitExceeded,
             "Git output is too large to preview",
         )
     })
@@ -330,7 +325,7 @@ fn parse_status(output: &str, prefix: &str) -> Vec<Value> {
 pub async fn status(project: &Project) -> Reply {
     let (valid, _) = git(project, &["rev-parse", "--show-toplevel"]).await?;
     if !valid {
-        return Ok(Json(json!({"isRepository":false,"files":[],"branch":null})));
+        return Ok(json!({"isRepository":false,"files":[],"branch":null}));
     }
     let (ok, output) = git(
         project,
@@ -345,10 +340,7 @@ pub async fn status(project: &Project) -> Reply {
     )
     .await?;
     if !ok {
-        return Err(failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot read Git status",
-        ));
+        return Err(failure(ReplyKind::Internal, "cannot read Git status"));
     }
     let (named_branch, mut branch) =
         git(project, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
@@ -356,19 +348,19 @@ pub async fn status(project: &Project) -> Reply {
         branch = git(project, &["rev-parse", "--short", "HEAD"]).await?.1;
     }
     let (_, prefix) = git(project, &["rev-parse", "--show-prefix"]).await?;
-    Ok(Json(
+    Ok(
         json!({"isRepository":true,"branch":branch.trim(),"files":parse_status(&output, prefix.trim_end_matches(['\r', '\n']))}),
-    ))
+    )
 }
 
 pub async fn diff(project: &Project, relative: &str, staged: bool) -> Reply {
     if relative.is_empty() {
-        return Err(failure(StatusCode::BAD_REQUEST, "select a changed file"));
+        return Err(failure(ReplyKind::InvalidInput, "select a changed file"));
     }
     let path = resolve(&project.root, relative)?;
     match tokio::fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(failure(StatusCode::BAD_REQUEST, "select a changed file")),
+        Ok(_) => return Err(failure(ReplyKind::InvalidInput, "select a changed file")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // A deleted file is valid, but a deleted directory is still a recursive pathspec.
             let (_, tracked) =
@@ -376,15 +368,15 @@ pub async fn diff(project: &Project, relative: &str, staged: bool) -> Reply {
             let (_, prefix) = git(project, &["rev-parse", "--show-prefix"]).await?;
             let expected = format!("{}{relative}", prefix.trim_end_matches(['\r', '\n']));
             if !tracked.split('\0').any(|name| name == expected) {
-                return Err(failure(StatusCode::BAD_REQUEST, "select a changed file"));
+                return Err(failure(ReplyKind::InvalidInput, "select a changed file"));
             }
         }
-        Err(_) => return Err(failure(StatusCode::FORBIDDEN, "file is not accessible")),
+        Err(_) => return Err(failure(ReplyKind::AccessDenied, "file is not accessible")),
     }
     let (valid, _) = git(project, &["rev-parse", "--show-toplevel"]).await?;
     if !valid {
         return Err(failure(
-            StatusCode::BAD_REQUEST,
+            ReplyKind::InvalidInput,
             "project is not a Git repository",
         ));
     }
@@ -401,15 +393,12 @@ pub async fn diff(project: &Project, relative: &str, staged: bool) -> Reply {
     args.extend(["--", relative]);
     let (ok, mut patch) = git(project, &args).await?;
     if !ok {
-        return Err(failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot read Git diff",
-        ));
+        return Err(failure(ReplyKind::Internal, "cannot read Git diff"));
     }
     if patch.is_empty() && !staged {
         let (_, output) = git(project, &["status", "--porcelain=v1", "-z", "--", relative]).await?;
         if output.starts_with("?? ") {
-            let Json(value) = file(project, relative).await?;
+            let value = file(project, relative).await?;
             let content = value["content"].as_str().unwrap_or("");
             patch = format!(
                 "--- /dev/null\n+++ b/{relative}\n@@ -0,0 +1,{} @@\n",
@@ -422,7 +411,7 @@ pub async fn diff(project: &Project, relative: &str, staged: bool) -> Reply {
             }
         }
     }
-    Ok(Json(json!({"path":relative,"staged":staged,"patch":patch})))
+    Ok(json!({"path":relative,"staged":staged,"patch":patch}))
 }
 
 #[cfg(test)]
@@ -447,10 +436,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             diff(&project, "large.txt", false).await.unwrap_err().0,
-            StatusCode::PAYLOAD_TOO_LARGE
+            ReplyKind::LimitExceeded
         );
         std::fs::write(root.join("large.txt"), "after\n").unwrap();
-        assert!(diff(&project, "large.txt", false).await.unwrap().0["patch"]
+        assert!(diff(&project, "large.txt", false).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("+after"));
@@ -470,7 +459,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(200), file(&project, "pipe"))
             .await
             .unwrap();
-        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(result.unwrap_err().0, ReplyKind::InvalidInput);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -480,7 +469,7 @@ mod tests {
         std::fs::write(root.join("hello.rs"), "你好\nfn main() {}\n").unwrap();
         std::fs::write(root.join("binary"), [0, 1, 2]).unwrap();
         std::fs::write(root.join("large"), vec![b'a'; FILE_LIMIT as usize + 1]).unwrap();
-        assert!(file(&p, "hello.rs").await.unwrap().0["content"]
+        assert!(file(&p, "hello.rs").await.unwrap()["content"]
             .as_str()
             .unwrap()
             .contains("你好"));
@@ -496,11 +485,11 @@ mod tests {
         }
         assert_eq!(
             file(&p, "binary").await.unwrap_err().0,
-            StatusCode::UNSUPPORTED_MEDIA_TYPE
+            ReplyKind::UnsupportedContent
         );
         assert_eq!(
             file(&p, "large").await.unwrap_err().0,
-            StatusCode::PAYLOAD_TOO_LARGE
+            ReplyKind::LimitExceeded
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -530,7 +519,7 @@ mod tests {
         std::fs::write(root.join(".env"), "PRIVATE_AFTER\n").unwrap();
         std::fs::write(root.join("src/.env"), "PRIVATE_AFTER\n").unwrap();
         for requested in ["*", "src"] {
-            if let Ok(Json(value)) = diff(&p, requested, false).await {
+            if let Ok(value) = diff(&p, requested, false).await {
                 assert!(
                     !value["patch"].as_str().unwrap().contains("PRIVATE_"),
                     "{requested} expanded into a private file"
@@ -564,9 +553,9 @@ mod tests {
         std::fs::create_dir(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/new.txt"), "new\n").unwrap();
         let p = Project::new(&root.join("nested")).unwrap();
-        let Json(value) = status(&p).await.unwrap();
+        let value = status(&p).await.unwrap();
         assert_eq!(value["files"][0]["path"], "new.txt");
-        assert!(diff(&p, "new.txt", false).await.unwrap().0["patch"]
+        assert!(diff(&p, "new.txt", false).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("+new"));
@@ -578,7 +567,7 @@ mod tests {
         let root = fixture();
         let p = Project::new(&root).unwrap();
         git(&p, &["init"]).await.unwrap();
-        let Json(status) = status(&p).await.unwrap();
+        let status = status(&p).await.unwrap();
         assert_ne!(status["branch"], "HEAD");
         for name in ["sample[1].txt", "sample1.txt"] {
             std::fs::write(root.join(name), "before\n").unwrap();
@@ -586,11 +575,11 @@ mod tests {
         git(&p, &["add", "."]).await.unwrap();
         std::fs::write(root.join("sample[1].txt"), "literal file\n").unwrap();
         std::fs::write(root.join("sample1.txt"), "other file\n").unwrap();
-        let Json(value) = diff(&p, "sample[1].txt", false).await.unwrap();
+        let value = diff(&p, "sample[1].txt", false).await.unwrap();
         assert!(value["patch"].as_str().unwrap().contains("+literal file"));
         assert!(!value["patch"].as_str().unwrap().contains("+other file"));
         std::fs::remove_file(root.join("sample[1].txt")).unwrap();
-        assert!(diff(&p, "sample[1].txt", false).await.unwrap().0["patch"]
+        assert!(diff(&p, "sample[1].txt", false).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("-before"));
@@ -614,23 +603,20 @@ mod tests {
         git(&p, &["add", "sample.txt"]).await.unwrap();
         std::fs::write(root.join("sample.txt"), "working\n").unwrap();
         std::fs::write(root.join("new file.txt"), "new\n").unwrap();
-        assert!(diff(&p, "sample.txt", true).await.unwrap().0["patch"]
+        assert!(diff(&p, "sample.txt", true).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("+staged"));
-        assert!(diff(&p, "sample.txt", false).await.unwrap().0["patch"]
+        assert!(diff(&p, "sample.txt", false).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("+working"));
-        assert!(diff(&p, "new file.txt", false).await.unwrap().0["patch"]
+        assert!(diff(&p, "new file.txt", false).await.unwrap()["patch"]
             .as_str()
             .unwrap()
             .contains("+new"));
         assert_eq!(
-            status(&p).await.unwrap().0["files"]
-                .as_array()
-                .unwrap()
-                .len(),
+            status(&p).await.unwrap()["files"].as_array().unwrap().len(),
             2
         );
         std::fs::remove_dir_all(root).unwrap();

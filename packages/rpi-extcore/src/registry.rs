@@ -105,7 +105,7 @@ impl Registry {
         if self.get(id).is_none() {
             return Err("session not found".into());
         }
-        let normalized_tags = tags.map(|tags| normalize_tags(tags)).transpose()?;
+        let normalized_tags = tags.map(normalize_tags).transpose()?;
         let previous = self.preferences(id);
         let value = self.preferences.entry(id.into()).or_default();
         if let Some(pinned) = pinned {

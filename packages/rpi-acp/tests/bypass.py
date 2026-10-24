@@ -16,6 +16,7 @@ def backend():
         "args": sys.argv[1:], "gate": os.environ.get("RPI_PERMISSION_GATE"),
     }), encoding="utf-8")
     session_id = sys.argv[sys.argv.index("--session-id") + 1]
+    print(json.dumps(dict(type="ready", protocol="rpi")), flush=True)
     for line in sys.stdin:
         command = json.loads(line)
         if command["type"] == "get_state":

@@ -31,6 +31,7 @@ fn main() {
         )
         .unwrap();
     }
+    send(json!({"type":"ready","protocol":"rpi"}));
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         let message: Value = serde_json::from_str(&line).unwrap();
@@ -45,6 +46,12 @@ fn main() {
         match message["type"].as_str().unwrap_or("") {
             "get_state" => send(
                 json!({"type":"response", "id":message["id"], "command":"get_state", "success":true, "data":{"leafId":null,"sessionId":session_id}}),
+            ),
+            "get_available_models" => send(
+                json!({"type":"response","id":message["id"],"command":"get_available_models","success":true,"data":{"models":[]}}),
+            ),
+            "get_available_thinking_levels" => send(
+                json!({"type":"response","id":message["id"],"command":"get_available_thinking_levels","success":true,"data":{"levels":[]}}),
             ),
             "prompt" => {
                 assert!(message["message"].is_string());

@@ -151,9 +151,29 @@ pub struct BufferedEvent {
     pub value: Value,
 }
 
+/// Native launch settings independent of any client protocol.
+#[derive(Clone, Debug)]
+pub struct SessionOptions {
+    pub executable: PathBuf,
+    pub project: PathBuf,
+    pub session_id: String,
+    pub session_dir: Option<PathBuf>,
+    pub saved_session: Option<PathBuf>,
+    pub fork_source: Option<String>,
+    pub timings_dir: PathBuf,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub permission_gate: bool,
+    pub bypass: bool,
+}
+
 pub struct HostSession {
     worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     ready: Value,
+    raw_events: broadcast::Sender<Value>,
+    run_gate: Arc<Mutex<()>>,
+    cancellation: tokio::sync::watch::Sender<u64>,
+    writer_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     events: broadcast::Sender<BufferedEvent>,
     commands: mpsc::Sender<Outbound>,
     pending: Pending,
@@ -216,20 +236,54 @@ impl HostSession {
         fork_source: Option<&str>,
         timings_dir: PathBuf,
     ) -> Result<Arc<Self>, String> {
-        let mut timings = crate::timing::ToolTimings::load(
-            timings_dir.join(format!("{}.json", fork_source.unwrap_or(session_id))),
-        )?;
+        Self::spawn_options(SessionOptions {
+            executable: rpi_bin,
+            project,
+            session_id: session_id.to_owned(),
+            session_dir,
+            saved_session: None,
+            fork_source: fork_source.map(str::to_owned),
+            timings_dir,
+            model: None,
+            provider: None,
+            permission_gate: false,
+            bypass: false,
+        })
+        .await
+    }
+
+    pub async fn spawn_options(options: SessionOptions) -> Result<Arc<Self>, String> {
+        let session_id = &options.session_id;
+        let mut timings = crate::timing::ToolTimings::load(options.timings_dir.join(format!(
+            "{}.json",
+            options.fork_source.as_deref().unwrap_or(session_id)
+        )))?;
         timings.set_session(session_id);
-        let mut command = crate::process::background_command(&rpi_bin);
+        let mut command = crate::process::background_command(&options.executable);
         command.arg("--mode").arg("rpc");
-        if let Some(source) = fork_source {
+        if let Some(path) = &options.saved_session {
+            command.arg("--session").arg(path);
+        } else if let Some(source) = &options.fork_source {
             command.arg("--fork").arg(source);
         } else {
             command.arg("--session-id").arg(session_id);
         }
-        if let Some(dir) = session_dir {
-            command.arg("--session-dir").arg(dir);
+        if let Some(directory) = &options.session_dir {
+            command.arg("--session-dir").arg(directory);
         }
+        if let Some(model) = &options.model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(provider) = &options.provider {
+            command.arg("--provider").arg(provider);
+        }
+        crate::process::configure_permission_gate(
+            &mut command,
+            options.bypass,
+            !options.permission_gate,
+        );
+        let project = options.project;
+        let rpi_bin = options.executable;
         let mut child = command
             .current_dir(project)
             .stdin(std::process::Stdio::piped())
@@ -242,6 +296,7 @@ impl HostSession {
         let mut reader = BufReader::new(stdout);
         let ready = read_ready(&mut reader, Duration::from_secs(15)).await?;
 
+        let (raw_events, _) = broadcast::channel(16_384);
         let (events, _) = broadcast::channel(512);
         let (commands, outbound) = mpsc::channel::<Outbound>(32);
         let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
@@ -261,6 +316,10 @@ impl HostSession {
         let session = Arc::new(Self {
             worker: StdMutex::new(None),
             ready: ready.clone(),
+            raw_events: raw_events.clone(),
+            run_gate: Arc::new(Mutex::new(())),
+            cancellation: tokio::sync::watch::channel(0).0,
+            writer_abort: StdMutex::new(None),
             events: events.clone(),
             commands,
             pending: pending.clone(),
@@ -276,6 +335,7 @@ impl HostSession {
             }
         });
 
+        *session.writer_abort.lock().expect("writer abort") = Some(writer.abort_handle());
         let pending_reader = pending.clone();
         let events_reader = events.clone();
         let state_reader = state.clone();
@@ -310,7 +370,7 @@ impl HostSession {
                 };
                 if value["type"] == "response" {
                     timings.response(&mut value);
-                    timings.response(&mut value);
+                    let _ = raw_events.send(value.clone());
                     if value["success"] == true
                         && value["data"]["accepted"] == true
                         && matches!(
@@ -335,6 +395,7 @@ impl HostSession {
                     }
                 } else {
                     timings.event(&mut value);
+                    let _ = raw_events.send(value.clone());
                     publish(
                         &events_reader,
                         &history_reader,
@@ -345,6 +406,7 @@ impl HostSession {
                     .await;
                 }
             }
+            let _ = raw_events.send(json!({"type":"host_closed"}));
             timings.finish_active();
             {
                 let mut state = state_reader.write().await;
@@ -370,6 +432,104 @@ impl HostSession {
 
         *session.worker.lock().expect("host worker") = Some(worker);
         Ok(session)
+    }
+
+    async fn ensure_running(&self) -> Result<(), String> {
+        if self.state.read().await.status == "closed" {
+            Err("rpi backend stopped; restart the connection to restore saved history".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn try_run_lease(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        self.run_gate
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| "a prompt is already running".into())
+    }
+    pub async fn begin_prompt(&self, message: String) -> Result<crate::run::PromptRun, String> {
+        let lease = self.try_run_lease()?;
+        let events = self.subscribe_raw();
+        let cancellation = self.cancellation.subscribe();
+        let id = json!(uuid::Uuid::new_v4().to_string());
+        self.notify(json!({"type":"prompt","id":id,"message":message}))
+            .await?;
+        Ok(crate::run::PromptRun::new(events, cancellation, id, lease))
+    }
+    pub async fn abort_run(&self) -> Result<(), String> {
+        self.cancellation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.notify(json!({"type":"abort"})).await
+    }
+
+    pub fn subscribe_raw(&self) -> broadcast::Receiver<Value> {
+        self.raw_events.subscribe()
+    }
+
+    pub async fn notify(&self, value: Value) -> Result<(), String> {
+        self.ensure_running().await?;
+        self.commands
+            .send(Outbound {
+                value,
+                pending_id: None,
+            })
+            .await
+            .map_err(|_| "native rpi host command channel closed".into())
+    }
+
+    pub async fn terminate(&self) {
+        self.cancellation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.state.write().await.status = "closed".into();
+        if let Some(abort) = self.writer_abort.lock().expect("writer abort").take() {
+            abort.abort();
+        }
+        let worker = self.worker.lock().expect("host worker").take();
+        if let Some(worker) = worker {
+            worker.abort();
+            let _ = worker.await;
+        }
+        let mut pending = self.pending.lock().expect("pending requests");
+        for (_, reply) in pending.drain() {
+            let _ = reply.send(Err("native rpi host closed".into()));
+        }
+        let _ = self.raw_events.send(json!({"type":"host_closed"}));
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_connection(
+        stdin: impl AsyncWrite + Unpin + Send + 'static,
+        capacity: usize,
+    ) -> (Arc<Self>, TestEvents) {
+        let (commands, outbound) = mpsc::channel(32);
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (raw_events, _) = broadcast::channel(capacity);
+        let writer = tokio::spawn(write_commands(stdin, outbound, pending.clone()));
+        let abort = writer.abort_handle();
+        let session = Arc::new(Self {
+            worker: StdMutex::new(None),
+            ready: json!({"type":"ready","protocol":"rpi"}),
+            raw_events,
+            run_gate: Arc::new(Mutex::new(())),
+            cancellation: tokio::sync::watch::channel(0).0,
+            writer_abort: StdMutex::new(Some(abort)),
+            events: broadcast::channel(capacity).0,
+            commands,
+            pending,
+            state: Arc::new(RwLock::new(HostState {
+                status: "ready".into(),
+                last_error: None,
+                latest_settlement: None,
+                pending_dialogs: vec![],
+                title: None,
+                created_at: 0,
+                updated_at: 0,
+                last_seq: 0,
+            })),
+            history: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        (session.clone(), TestEvents(session))
     }
 
     pub fn ready(&self) -> Value {
@@ -442,14 +602,134 @@ impl HostSession {
         }
     }
 
+    /// Read authoritative session state while no prompt lease is held.
+    pub async fn state(&self) -> Result<Value, String> {
+        let _prompt = self.try_run_lease()?;
+        let response = self
+            .send_timeout(
+                json!({"type":"get_state"}),
+                std::time::Duration::from_secs(15),
+            )
+            .await?;
+        if response["success"] != true {
+            return Err(format!(
+                "open session: {}",
+                response["error"].as_str().unwrap_or("invalid RPC response")
+            ));
+        }
+        if !response["data"].is_object() {
+            return Err("open session: invalid RPC state data".into());
+        }
+        Ok(response["data"].clone())
+    }
+
+    async fn runtime_command(&self, kind: &str, params: Value) -> Result<Value, String> {
+        self.command(kind, params, Duration::from_secs(15)).await
+    }
+    /// The model catalog the child can switch to (`get_available_models`).
+    pub async fn available_models(&self) -> Result<Value, String> {
+        Ok(self
+            .runtime_command("get_available_models", json!({}))
+            .await?["models"]
+            .clone())
+    }
+
+    /// Read the child's state without acquiring the prompt lock. Used by
+    /// `session/set_config_option`, which must also work while a prompt runs
+    /// (the locked [`Self::state`] would reject it).
+    pub async fn state_unlocked(&self) -> Result<Value, String> {
+        self.runtime_command("get_state", json!({})).await
+    }
+
+    /// Switch the child's active model (`set_model`).
+    pub async fn set_model(&self, model_id: &str, provider: Option<&str>) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("modelId".to_string(), json!(model_id));
+        // Keep the legacy field for older rpi RPC hosts; current hosts ignore it.
+        params.insert("model".to_string(), json!(model_id));
+        if let Some(provider) = provider {
+            params.insert("provider".to_string(), json!(provider));
+        }
+        self.runtime_command("set_model", Value::Object(params))
+            .await?;
+        Ok(())
+    }
+
+    /// The thinking levels the current model supports (`get_available_thinking_levels`).
+    pub async fn available_thinking_levels(&self) -> Result<Value, String> {
+        Ok(self
+            .runtime_command("get_available_thinking_levels", json!({}))
+            .await?["levels"]
+            .clone())
+    }
+
+    /// Switch the child's thinking level (`set_thinking_level`).
+    pub async fn set_thinking_level(&self, level: &str) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("level".to_string(), json!(level));
+        self.runtime_command("set_thinking_level", Value::Object(params))
+            .await?;
+        Ok(())
+    }
+
     pub async fn send(&self, value: Value) -> Result<Value, String> {
-        dispatch(
-            &self.commands,
-            &self.pending,
-            value,
-            Duration::from_secs(300),
-        )
-        .await
+        self.send_timeout(value, Duration::from_secs(300)).await
+    }
+
+    pub async fn send_timeout(&self, value: Value, timeout: Duration) -> Result<Value, String> {
+        self.ensure_running().await?;
+        dispatch(&self.commands, &self.pending, value, timeout).await
+    }
+
+    pub async fn command(
+        &self,
+        kind: &str,
+        mut params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let object = params
+            .as_object_mut()
+            .ok_or_else(|| format!("{kind}: params must be an object"))?;
+        object.insert("type".into(), json!(kind));
+        let response = self.send_timeout(params, timeout).await?;
+        if response["success"] != true {
+            return Err(format!(
+                "{kind}: {}",
+                response["error"].as_str().unwrap_or("invalid RPC response")
+            ));
+        }
+        Ok(response["data"].clone())
+    }
+}
+
+impl Drop for HostSession {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.lock().expect("host worker").take() {
+            worker.abort();
+        }
+        if let Some(writer) = self.writer_abort.lock().expect("writer abort").take() {
+            writer.abort();
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestEvents(Arc<HostSession>);
+#[cfg(feature = "test-support")]
+impl TestEvents {
+    pub fn send(&self, value: Value) -> Result<usize, broadcast::error::SendError<Value>> {
+        let mut delivered = false;
+        if value["type"] == "response" {
+            if let Some(key) = value["id"].as_str() {
+                if let Some(reply) = self.0.pending.lock().expect("pending").remove(key) {
+                    delivered = reply.send(Ok(value.clone())).is_ok();
+                }
+            }
+        }
+        match self.0.raw_events.send(value) {
+            Err(_) if delivered => Ok(0),
+            result => result,
+        }
     }
 }
 
