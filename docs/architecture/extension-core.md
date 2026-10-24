@@ -52,9 +52,17 @@ This branch changes source and documentation only; it does not publish a release
 Validated on 2026-10-24 on Windows x64 with the installed rpi 0.7.1 host:
 
 - `cargo test --workspace --locked` passed, including the existing optional-feature defaults.
-- The 133 tests for extcore, HTTP, ACP and Web passed after the final source edits.
+- The 138 tests for extcore, HTTP, ACP and Web passed after the review fixes.
 - Clippy passed with `-D warnings` for all four affected packages and their targets.
 - Native Web startup/configuration/authentication/project/session checks and API-only HTTP smoke checks passed without model calls.
 - ACP streaming, restart, permission-policy, plugin lifecycle, native goal/tool continuation and registry-auth checks passed.
 - All 13 Open WebUI/Pipe and native UI-adapter tests passed in an isolated Python environment.
 - All 21 release-distribution tooling tests passed. No publication was performed.
+
+Review follow-up on 2026-10-24:
+
+- Resolve a relative HTTP config filename against the launch directory before resolving its JSON paths. CLI filesystem paths are anchored to the launch directory; bare executable names retain PATH lookup. Native smoke checks use a relative config filename and a different child working directory, and verify the actual transcript location.
+- Normal exit, forced termination, shutdown timeout and owner drop share idempotent finalization: publish `host_closed` to raw and projected/replay subscribers, clear dialogs, fail pending commands, and persist interrupted tool timings. Serialized cleanup retains ownership of the worker when a shutdown caller is cancelled; termination finalization survives cancellation of its caller.
+- Regression tests exercise both cancellation stages, stalled-host shutdown, interrupted timing persistence and repeated cleanup. The native HTTP smoke test also verifies that deleting a live session delivers its terminal SSE event.
+- Rechecked ACP streaming/restart, native plugin/goal behavior, all 13 UI-adapter checks and Web configuration plus standalone/extension IPv4/IPv6 startup. The direct native termination probe now receives both close events.
+- Linux target checks passed for all extcore/ACP targets. The broader Linux check could not compile the HTTP test dependency `ring` because this Windows environment lacks `x86_64-linux-gnu-gcc`; Linux runtime tests were not run here.

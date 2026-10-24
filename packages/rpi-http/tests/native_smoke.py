@@ -27,16 +27,20 @@ with tempfile.TemporaryDirectory(prefix='rpi-http-native-') as directory:
                RPI_OFFLINE='1', ANTHROPIC_API_KEY='fixture-only', RPI_HTTP_PASSWORD='fixture-password')
     for name in ['RPI_HTTP_ALLOWED_HOSTS', 'RPI_WEB_ALLOWED_HOSTS', 'RPI_WEB_PASSWORD']:
         env.pop(name, None)
-    config = root / 'http.json'
-    config.write_text(json.dumps({'project': '.', 'rpiBin': host, 'port': 31337,
+    config = root / 'config' / 'http.json'
+    config.parent.mkdir()
+    (root / 'workspace').mkdir()
+    config.write_text(json.dumps({'project': '../workspace', 'rpiBin': host, 'port': 31337,
                                  'registry': 'state/sessions.json', 'sessionDir': 'history'}))
     process = None
     log = None
 
-    def request(path, data=None):
+    def request(path, data=None, method=None):
         payload = None if data is None else json.dumps(data).encode()
-        req = urllib.request.Request(base + path, payload, {'Content-Type': 'application/json', 'X-Rpi-Web': '1'})
+        req = urllib.request.Request(base + path, payload, {'Content-Type': 'application/json', 'X-Rpi-Web': '1'}, method=method)
         with opener.open(req, timeout=15) as response:
+            if response.status == 204:
+                return None
             return json.load(response)
 
     def expect_status(path, status, body=None):
@@ -52,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix='rpi-http-native-') as directory:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         log = (root / 'server.log').open('w', encoding='utf-8')
-        process = subprocess.Popen([binary, '--port', '0', '--config', str(config)], cwd=root, env=env,
+        process = subprocess.Popen([binary, '--port', '0', '--config', str(config.relative_to(root))], cwd=root, env=env,
             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         for _ in range(150):
@@ -97,11 +101,25 @@ with tempfile.TemporaryDirectory(prefix='rpi-http-native-') as directory:
         sid = request('/api/v1/sessions', {})['sessionId']
         path = '/api/v1/sessions/' + sid
         assert request(path + '/commands', {'type': 'get_state'})['success']
+        assert list((config.parent / 'history').glob('**/*.jsonl')), 'session history must resolve against the config directory'
+        assert not (root / 'workspace' / 'config').exists(), 'paths must not be reinterpreted relative to the child cwd'
         request(path + '/rename', {'title': 'Shared HTTP session'})
         request(path + '/metadata', {'tags': ['http', 'shared'], 'pinned': True})
         assert request(path + '/snapshot')['sessionId'] == sid
         with opener.open(base + path + '/events', timeout=10) as stream:
             assert stream.readline().startswith(b'event: ready')
+        transient = request('/api/v1/sessions', {})['sessionId']
+        transient_path = '/api/v1/sessions/' + transient
+        with opener.open(base + transient_path + '/events', timeout=10) as stream:
+            assert stream.readline().startswith(b'event: ready')
+            request(transient_path, method='DELETE')
+            for _ in range(64):
+                line = stream.readline()
+                if line.startswith(b'event: host_closed'):
+                    break
+                assert line, 'SSE ended before delivering host_closed'
+            else:
+                raise AssertionError('SSE did not publish host_closed')
         stop()
         start()
         session = next(session for session in request('/api/v1/sessions')['sessions'] if session['sessionId'] == sid)
@@ -110,6 +128,7 @@ with tempfile.TemporaryDirectory(prefix='rpi-http-native-') as directory:
         request(path + '/open', {})
         assert request(path + '/commands', {'type': 'get_state'})['success']
         print(json.dumps({'passed': True, 'headless': True, 'nativeRpc': True, 'snapshot': True,
-            'sse': True, 'authentication': True, 'restart': True, 'metadata': True, 'noModelCalls': True}))
+            'sse': True, 'sessionCloseEvent': True, 'relativeConfigPaths': True,
+            'authentication': True, 'restart': True, 'metadata': True, 'noModelCalls': True}))
     finally:
         stop()

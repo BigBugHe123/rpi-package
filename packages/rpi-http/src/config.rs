@@ -7,7 +7,8 @@ pub const HELP: &str = "rpi-http [--config PATH] [--project PATH] [--rpi-bin PAT
          [--add-project PATH]... [--projects-root PATH] [--help] [--version]
 
 Serves /api/v1 over HTTP/SSE without frontend assets.
-JSON paths are relative to the config file; CLI options override JSON.
+JSON paths are relative to the config file; CLI paths use the working directory.
+CLI options override JSON. Bare executable names use PATH.
 Authentication: RPI_HTTP_PASSWORD and RPI_HTTP_ALLOWED_HOSTS.
 Legacy RPI_WEB_* variables remain accepted.";
 
@@ -19,6 +20,12 @@ pub enum Launch {
 }
 
 pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot read working directory: {error}"))?;
+    from_args_at(args, &cwd)
+}
+
+fn from_args_at(args: impl IntoIterator<Item = String>, cwd: &Path) -> Result<Launch, String> {
     let args = args.into_iter().collect::<Vec<_>>();
     let mut config_file = None;
     let mut options = Vec::new();
@@ -58,6 +65,7 @@ pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, Strin
         index += 1;
     }
     let mut config = if let Some(path) = config_file {
+        let path = resolve(cwd, &path);
         let bytes = std::fs::read(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let mut config: AppConfig = serde_json::from_slice(&bytes)
@@ -68,9 +76,7 @@ pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, Strin
         for project in &mut config.projects {
             *project = resolve(base, project);
         }
-        if config.rpi_bin.components().count() > 1 {
-            config.rpi_bin = resolve(base, &config.rpi_bin);
-        }
+        config.rpi_bin = resolve_executable(base, &config.rpi_bin);
         for path in [&mut config.session_dir, &mut config.projects_root]
             .into_iter()
             .flatten()
@@ -79,26 +85,38 @@ pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, Strin
         }
         config
     } else {
-        AppConfig::default()
+        AppConfig {
+            project: cwd.to_path_buf(),
+            ..AppConfig::default()
+        }
     };
     for (name, value) in options {
         match name.as_str() {
-            "--project" => config.project = PathBuf::from(value),
-            "--rpi-bin" => config.rpi_bin = PathBuf::from(value),
+            "--project" => config.project = resolve(cwd, Path::new(&value)),
+            "--rpi-bin" => config.rpi_bin = resolve_executable(cwd, Path::new(&value)),
             "--bind" => config.bind = value,
             "--port" => {
                 config.port = value
                     .parse()
                     .map_err(|_| "--port must be between 0 and 65535")?
             }
-            "--registry" => config.registry = PathBuf::from(value),
-            "--session-dir" => config.session_dir = Some(PathBuf::from(value)),
-            "--add-project" => config.projects.push(PathBuf::from(value)),
-            "--projects-root" => config.projects_root = Some(PathBuf::from(value)),
+            "--registry" => config.registry = resolve(cwd, Path::new(&value)),
+            "--session-dir" => config.session_dir = Some(resolve(cwd, Path::new(&value))),
+            "--add-project" => config.projects.push(resolve(cwd, Path::new(&value))),
+            "--projects-root" => config.projects_root = Some(resolve(cwd, Path::new(&value))),
             _ => unreachable!(),
         }
     }
     Ok(Launch::Run(Box::new(config)))
+}
+
+fn resolve_executable(base: &Path, path: &Path) -> PathBuf {
+    // Preserve a bare command for PATH lookup, including custom executable names.
+    if path.components().count() > 1 || path.to_string_lossy().contains(['/', '\\']) {
+        resolve(base, path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn resolve(base: &Path, path: &Path) -> PathBuf {
@@ -135,9 +153,57 @@ mod tests {
         assert_eq!(config.rpi_bin, directory.join("bin/rpi"));
         assert_eq!(
             config.projects,
-            [directory.join("extra"), PathBuf::from("other")]
+            [
+                directory.join("extra"),
+                std::env::current_dir().unwrap().join("other")
+            ]
         );
         assert_eq!(config.session_dir, Some(directory.join("history")));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn relative_config_and_cli_paths_are_anchored_before_launching_the_child() {
+        let cwd = std::env::temp_dir().join(format!("rpi-http-relative-{}", uuid::Uuid::new_v4()));
+        let directory = cwd.join("config");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("http.json"), r#"{"project":"../workspace","sessionDir":"history","registry":"state/sessions.json","rpiBin":"./rpi","projectsRoot":"managed"}"#).unwrap();
+        let Launch::Run(config) = from_args_at(["--config=config/http.json".into()], &cwd).unwrap()
+        else {
+            panic!("expected server config")
+        };
+        assert_eq!(config.project, directory.join("../workspace"));
+        assert_eq!(config.session_dir, Some(directory.join("history")));
+        assert_eq!(config.registry, directory.join("state/sessions.json"));
+        assert_eq!(config.rpi_bin, directory.join("./rpi"));
+        assert_eq!(config.projects_root, Some(directory.join("managed")));
+        let Launch::Run(config) = from_args_at(
+            [
+                "--config=config/http.json".into(),
+                "--project=workspace".into(),
+                "--session-dir=history".into(),
+                "--registry=state/sessions.json".into(),
+                "--rpi-bin=./rpi".into(),
+                "--projects-root=managed".into(),
+                "--add-project=extra".into(),
+            ],
+            &cwd,
+        )
+        .unwrap() else {
+            panic!("expected server config")
+        };
+        assert_eq!(config.project, cwd.join("workspace"));
+        assert_eq!(config.session_dir, Some(cwd.join("history")));
+        assert_eq!(config.registry, cwd.join("state/sessions.json"));
+        assert_eq!(config.rpi_bin, cwd.join("./rpi"));
+        assert_eq!(config.projects_root, Some(cwd.join("managed")));
+        assert_eq!(config.projects, vec![cwd.join("extra")]);
+        for executable in ["rpi", "custom-host"] {
+            assert_eq!(
+                resolve_executable(&cwd, Path::new(executable)),
+                PathBuf::from(executable)
+            );
+        }
+        std::fs::remove_dir_all(cwd).unwrap();
     }
 }
