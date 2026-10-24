@@ -43,6 +43,7 @@ import {
   ShieldCheck,
   Sparkles,
   SquarePen,
+  Sigma,
   Sun,
   Search,
   Terminal,
@@ -77,6 +78,7 @@ import {
 import { Splitter, useStoredNumber, Workbench } from "./Workbench";
 import { MenuSelect } from "./MenuSelect";
 import { LoginScreen } from "./LoginScreen";
+import { ProjectContext } from "./ProjectContext";
 import {
   ConfirmDialog,
   Modal,
@@ -137,6 +139,7 @@ type ToolRow = Extract<Row, { kind: "tool" }>;
 
 type UiDialogOption = {
   title?: string;
+  description?: string;
   value?: unknown;
   permission?: string;
 };
@@ -152,6 +155,9 @@ type UiDialog = {
     kind?: string;
     options?: UiDialogOption[];
     allowFreeform?: boolean;
+    allowMultiple?: boolean;
+    allowComment?: boolean;
+    suggest?: string;
     freeform?: boolean;
   };
 };
@@ -374,11 +380,19 @@ function usageNumber(value: unknown, keys: string[]): number {
 }
 
 function inputTokenCount(stats: RuntimeState["stats"]) {
-  return statNumber(stats, ["inputTokens", "input", "promptTokens"]);
+  const input = statNumber(stats, ["inputTokens", "input", "promptTokens"]);
+  if (input != null) return input;
+  const cached = cachedTokenCount(stats);
+  const uncached = statNumber(stats, ["uncachedTokens"]);
+  return cached != null && uncached != null ? cached + uncached : null;
 }
 
 function outputTokenCount(stats: RuntimeState["stats"]) {
-  return statNumber(stats, ["outputTokens", "output", "completionTokens"]);
+  const output = statNumber(stats, ["outputTokens", "output", "completionTokens"]);
+  if (output != null) return output;
+  const total = statNumber(stats, ["totalTokens"]);
+  const input = inputTokenCount(stats);
+  return total != null && input != null ? Math.max(0, total - input) : null;
 }
 
 function cachedTokenCount(stats: RuntimeState["stats"]) {
@@ -411,6 +425,33 @@ function cacheHitRatio(stats: RuntimeState["stats"]): number | null {
   const input = inputTokenCount(stats);
   const total = uncached != null ? cached + uncached : (input ?? 0);
   return total > 0 ? cached / total : null;
+}
+
+/** Native message usage keeps cache reads/writes separate from uncached input. */
+function latestMessageStats(messages: unknown[]): RuntimeState["stats"] {
+  for (const message of [...messages].reverse()) {
+    if (!message || typeof message !== "object") continue;
+    if (roleOf(message) !== "assistant") continue;
+    const usage = (message as Record<string, unknown>).usage;
+    const input = usageNumber(usage, ["input", "inputTokens", "promptTokens"]);
+    const output = usageNumber(usage, ["output", "outputTokens", "completionTokens"]);
+    const cached = usageNumber(usage, ["cacheRead", "cachedTokens"]);
+    const written = usageNumber(usage, ["cacheWrite"]);
+    const total = usageNumber(usage, ["totalTokens"]) || input + output + cached + written;
+    if (total <= 0) continue;
+    const cost = (usage as Record<string, unknown>).cost;
+    return {
+      messageCount: 1,
+      inputTokens: input + cached + written,
+      outputTokens: output,
+      cachedTokens: cached,
+      uncachedTokens: input + written,
+      totalTokens: total,
+      cacheHitRatio: null,
+      costTotal: typeof cost === "number" ? cost : usageNumber(cost, ["total"]),
+    };
+  }
+  return null;
 }
 
 /** One line of a provider error, for a transcript row. */
@@ -500,6 +541,18 @@ export default function App() {
     hasMore: boolean;
   } | null>(null);
   const [runtime, setRuntime] = useState<RuntimeState | null>(null);
+  const [messageStats, setMessageStats] = useState<{
+    sessionId: string;
+    stats: RuntimeState["stats"];
+  } | null>(null);
+  const usingMessageStats =
+    (totalTokenCount(runtime?.stats) ?? 0) <= 0 &&
+    (inputTokenCount(runtime?.stats) ?? 0) <= 0 &&
+    (outputTokenCount(runtime?.stats) ?? 0) <= 0 &&
+    messageStats?.sessionId === sessionId && !!messageStats.stats;
+  const displayStats = usingMessageStats
+    ? { ...runtime?.stats, ...messageStats!.stats! }
+    : runtime?.stats;
   const [authProviders, setAuthProviders] = useState<AuthProviderStatus[]>([]);
   const [authProvider, setAuthProvider] = useState("");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -876,36 +929,8 @@ export default function App() {
           }
           if (roleOf(event.message) !== "assistant") break;
           if (event.type === "message_end") {
-            const message = (event.message ?? {}) as Record<string, unknown>;
-            const usage = message.usage;
-            const input = usageNumber(usage, ["input", "inputTokens", "promptTokens"]);
-            const output = usageNumber(usage, ["output", "outputTokens", "completionTokens"]);
-            const cacheRead = usageNumber(usage, ["cacheRead", "cachedTokens"]);
-            const cacheWrite = usageNumber(usage, ["cacheWrite"]);
-            const total = usageNumber(usage, ["totalTokens"]) ||
-              input + output + cacheRead + cacheWrite;
-            if (total > 0) {
-              setRuntime((previous) => {
-                const currentStats = previous?.stats;
-                const currentTotal = totalTokenCount(currentStats);
-                if (currentTotal != null && currentTotal > 0) return previous;
-                return {
-                  ...(previous ?? {}),
-                  stats: {
-                    ...(currentStats ?? {}),
-                    messageCount: currentStats?.messageCount ?? 0,
-                    costTotal: currentStats?.costTotal ?? 0,
-                    input,
-                    output,
-                    cacheRead,
-                    cacheWrite,
-                    totalTokens: total,
-                    cachedTokens: cacheRead,
-                    uncachedTokens: Math.max(0, input - cacheRead),
-                  },
-                };
-              });
-            }
+            const stats = latestMessageStats([event.message]);
+            if (stats) setMessageStats({ sessionId: activeSessionRef.current, stats });
           }
           const prefix = currentAssistant.current ?? `restored-${seq}`;
           currentAssistant.current = prefix;
@@ -1293,6 +1318,7 @@ export default function App() {
     const restoreSnapshotStatus = (
       snapshot: Awaited<ReturnType<typeof snapshotOf>>,
     ) => {
+      setMessageStats({ sessionId, stats: latestMessageStats(snapshot.messages) });
       if (snapshot.status) {
         setStatus(snapshot.status);
         setRunActive(["running", "awaiting_input"].includes(snapshot.status));
@@ -1434,27 +1460,6 @@ export default function App() {
         setRuntime(state);
         setRunActive(Boolean(state.activeOperation));
         setStatus(state.activeOperation ? "running" : "ready");
-        // Slash commands resolve names locally, so keep the catalogs warm.
-        if (capabilities.supportedCommands.includes("get_available_models")) {
-          void api
-            .models(sessionId)
-            .then((data) => {
-              if (!cancelled) setModels(data.models ?? []);
-            })
-            .catch(() => {});
-        }
-        if (
-          capabilities.supportedCommands.includes(
-            "get_available_thinking_levels",
-          )
-        ) {
-          void api
-            .thinkingLevels(sessionId)
-            .then((data) => {
-              if (!cancelled) setLevels(data.levels ?? []);
-            })
-            .catch(() => {});
-        }
       } catch (cause) {
         failConnection(cause);
         return;
@@ -1500,6 +1505,28 @@ export default function App() {
       if (cancelled) return;
       connect(after);
       setLoadingSession(false);
+      // Slash commands resolve names locally, so keep the catalogs warm.
+      if (capabilities.supportedCommands.includes("get_available_models")) {
+        void api
+          .models(sessionId)
+          .then((data) => {
+            if (!cancelled) setModels(data.models ?? []);
+          })
+          .catch(() => {});
+      }
+      if (
+        capabilities.supportedCommands.includes(
+          "get_available_thinking_levels",
+        )
+      ) {
+        void api
+          .thinkingLevels(sessionId)
+          .then((data) => {
+            if (!cancelled) setLevels(data.levels ?? []);
+          })
+          .catch(() => {});
+      }
+
     })();
 
     return () => {
@@ -2560,6 +2587,7 @@ export default function App() {
     >
       {dialog && (
         <DialogOverlay
+          key={dialog.requestId}
           dialog={dialog}
           answer={dialogAnswer}
           busy={dialogBusy}
@@ -3259,25 +3287,14 @@ export default function App() {
                   disabled={!sessionId}
                   aria-label={t("sendPlaceholder")}
                 />
+                <ProjectContext project={project} tick={settleTick} language={language}
+                  loadGit={actions.has("git_diff")} onOpen={() => {
+                    setSidebar(true);
+                    requestAnimationFrame(() => document.querySelector<HTMLElement>(".selected-project .project-name")?.focus());
+                  }} />
                 <div className="composer-footer">
                   <div className="composer-options">
-                    <button
-                      type="button"
-                      className="composer-project"
-                      title={project?.path}
-                      onClick={() => {
-                        setSidebar(true);
-                        requestAnimationFrame(() =>
-                          document
-                            .querySelector<HTMLElement>(
-                              ".selected-project .project-name",
-                            )
-                            ?.focus(),
-                        );
-                      }}
-                    >
-                      <Folder size={12} /> {project?.name ?? t("workspace")}
-                    </button>
+
                     {supported.has("set_model") && (
                       <ModelPicker
                         language={language}
@@ -3365,72 +3382,86 @@ export default function App() {
                 </div>
                 <details
                   className="composer-metrics"
-                  aria-label={`${t("cacheHit")}, ${t("context")}, ${t("inputTokens")}, ${t("outputTokens")}, ${t("cachedTokens")}, ${t("toolCalls")}, ${t("operations")}, ${t("cost")}, ${t("eventsObserved")}`}
+                  aria-label={`${t("inputTokens")}, ${t("outputTokens")}, ${t("totalTokens")}, ${t("cacheHit")}, ${t("context")}, ${t("cachedTokens")}, ${t("toolCalls")}, ${t("operations")}, ${t("cost")}, ${t("eventsObserved")}`}
                 >
                   <summary className="composer-metrics-summary">
                     <span
                       className="composer-metric"
-                      title={t("cacheHit")}
-                      aria-label={`${t("cacheHit")}: ${cacheHitRatio(runtime?.stats) == null ? "—" : `${Math.round(cacheHitRatio(runtime?.stats)! * 100)}%`}`}
-                    >
-                      <Database size={12} aria-hidden="true" />
-                      <strong>
-                        {cacheHitRatio(runtime?.stats) == null
-                          ? "—"
-                          : `${Math.round(cacheHitRatio(runtime?.stats)! * 100)}%`}
-                      </strong>
-                    </span>
-                    <span
-                      className="composer-metric"
-                      title={t("context")}
-                      aria-label={`${t("context")}: ${runtime?.context ? `${runtime.context.percent}% / ${formatTokens(runtime.context.window)}` : "—"}`}
-                    >
-                      <Gauge size={12} aria-hidden="true" />
-                      <strong>
-                        {runtime?.context
-                          ? `${runtime.context.percent}% / ${formatTokens(runtime.context.window)}`
-                          : "—"}
-                      </strong>
-                    </span>
-                    <span
-                      className="composer-metric"
                       title={t("inputTokens")}
-                      aria-label={`${t("inputTokens")}: ${inputTokenCount(runtime?.stats) == null ? "—" : formatTokens(inputTokenCount(runtime?.stats)!)}`}
+                      aria-label={`${t("inputTokens")}: ${inputTokenCount(displayStats) == null ? "—" : formatTokens(inputTokenCount(displayStats)!)}`}
                     >
                       <ArrowDown size={12} aria-hidden="true" />
                       <strong>
-                        {inputTokenCount(runtime?.stats) == null
+                        {inputTokenCount(displayStats) == null
                           ? "—"
-                          : formatTokens(inputTokenCount(runtime?.stats)!)}
+                          : formatTokens(inputTokenCount(displayStats)!)}
                       </strong>
                     </span>
                     <span
                       className="composer-metric"
                       title={t("outputTokens")}
-                      aria-label={`${t("outputTokens")}: ${outputTokenCount(runtime?.stats) == null ? "—" : formatTokens(outputTokenCount(runtime?.stats)!)}`}
+                      aria-label={`${t("outputTokens")}: ${outputTokenCount(displayStats) == null ? "—" : formatTokens(outputTokenCount(displayStats)!)}`}
                     >
                       <ArrowUp size={12} aria-hidden="true" />
                       <strong>
-                        {outputTokenCount(runtime?.stats) == null
+                        {outputTokenCount(displayStats) == null
                           ? "—"
-                          : formatTokens(outputTokenCount(runtime?.stats)!)}
+                          : formatTokens(outputTokenCount(displayStats)!)}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={t("cacheHit")}
+                      aria-label={`${t("cacheHit")}: ${cacheHitRatio(displayStats) == null ? "—" : `${Math.round(cacheHitRatio(displayStats)! * 100)}%`}`}
+                    >
+                      <Database size={12} aria-hidden="true" />
+                      <strong>
+                        {cacheHitRatio(displayStats) == null
+                          ? "—"
+                          : `${Math.round(cacheHitRatio(displayStats)! * 100)}%`}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={`${t("context")}: ${runtime?.context ? `${formatTokens(runtime.context.tokens)} / ${formatTokens(runtime.context.window)} (${runtime.context.percent}%)` : "—"}`}
+                      aria-label={`${t("context")}: ${runtime?.context ? `${formatTokens(runtime.context.tokens)} / ${formatTokens(runtime.context.window)}` : "—"}`}
+                    >
+                      <Gauge size={12} aria-hidden="true" />
+                      <strong>
+                        {runtime?.context
+                          ? `${formatTokens(runtime.context.tokens)} / ${formatTokens(runtime.context.window)}`
+                          : "—"}
                       </strong>
                     </span>
                     <span className="composer-metrics-more">{t("details")}</span>
                   </summary>
                   <div className="composer-metrics-detail">
-                  <span
-                    className="composer-metric"
-                    title={t("cachedTokens")}
-                    aria-label={`${t("cachedTokens")}: ${cachedTokenCount(runtime?.stats) == null ? "—" : formatTokens(cachedTokenCount(runtime?.stats)!)}`}
-                  >
-                    <Database size={12} aria-hidden="true" />
-                    <strong>
-                      {cachedTokenCount(runtime?.stats) == null
-                        ? "—"
-                        : formatTokens(cachedTokenCount(runtime?.stats)!)}
-                    </strong>
-                  </span>
+                    <span
+                      className="composer-metric"
+                      title={t("cachedTokens")}
+                      aria-label={`${t("cachedTokens")}: ${cachedTokenCount(displayStats) == null ? "—" : formatTokens(cachedTokenCount(displayStats)!)}`}
+                    >
+                      <Database size={12} aria-hidden="true" />
+                      <strong>
+                        {cachedTokenCount(displayStats) == null
+                          ? "—"
+                          : formatTokens(cachedTokenCount(displayStats)!)}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={t("totalTokens")}
+                      aria-label={`${t("totalTokens")}: ${totalTokenCount(displayStats) == null ? "—" : formatTokens(totalTokenCount(displayStats)!)}`}
+                    >
+                      <Sigma size={12} aria-hidden="true" />
+                      <strong>
+                        {totalTokenCount(displayStats) == null
+                          ? "—"
+                          : formatTokens(totalTokenCount(displayStats)!)}
+                      </strong>
+                    </span>
+
+
                   <span
                     className="composer-metric"
                     title={t("toolCalls")}
@@ -3450,10 +3481,10 @@ export default function App() {
                   <span
                     className="composer-metric"
                     title={t("cost")}
-                    aria-label={`${t("cost")}: ${costTotal(runtime?.stats) == null ? "—" : `$${costTotal(runtime?.stats)!.toFixed(4)}`}`}
+                    aria-label={`${t("cost")}: ${costTotal(displayStats) == null ? "—" : `$${costTotal(displayStats)!.toFixed(4)}`}`}
                   >
                     <CircleDollarSign size={12} aria-hidden="true" />
-                    <strong>{costTotal(runtime?.stats) == null ? "—" : `$${costTotal(runtime?.stats)!.toFixed(4)}`}</strong>
+                    <strong>{costTotal(displayStats) == null ? "—" : `$${costTotal(displayStats)!.toFixed(4)}`}</strong>
                   </span>
                   <span
                     className="composer-metric"
@@ -3557,67 +3588,67 @@ export default function App() {
                 <span>{t("operations")}</span>
                 <strong>{historyData?.total ?? 0}</strong>
               </div>
-              {runtime?.stats && (
+              {displayStats && (
                 <>
                   <div className="stat-row">
                     <span>{t("tokens")}</span>
                     <strong>
-                      {totalTokenCount(runtime.stats) == null
+                      {totalTokenCount(displayStats) == null
                         ? "—"
-                        : formatTokens(totalTokenCount(runtime.stats)!)}
+                        : formatTokens(totalTokenCount(displayStats)!)}
                     </strong>
                   </div>
                   <div className="stat-row">
                     <span>{t("inputTokens")}</span>
                     <strong>
-                      {inputTokenCount(runtime.stats) == null
+                      {inputTokenCount(displayStats) == null
                         ? "—"
-                        : formatTokens(inputTokenCount(runtime.stats)!)}
+                        : formatTokens(inputTokenCount(displayStats)!)}
                     </strong>
                   </div>
                   <div className="stat-row">
                     <span>{t("outputTokens")}</span>
                     <strong>
-                      {outputTokenCount(runtime.stats) == null
+                      {outputTokenCount(displayStats) == null
                         ? "—"
-                        : formatTokens(outputTokenCount(runtime.stats)!)}
+                        : formatTokens(outputTokenCount(displayStats)!)}
                     </strong>
                   </div>
                   <div className="stat-row">
                     <span>{t("cachedTokens")}</span>
                     <strong>
-                      {cachedTokenCount(runtime.stats) == null
+                      {cachedTokenCount(displayStats) == null
                         ? "—"
-                        : formatTokens(cachedTokenCount(runtime.stats)!)}
+                        : formatTokens(cachedTokenCount(displayStats)!)}
                     </strong>
                   </div>
                   <div className="stat-row">
                     <span>{t("cost")}</span>
                     <strong>
-                      {costTotal(runtime.stats) == null
+                      {costTotal(displayStats) == null
                         ? "—"
-                        : `$${costTotal(runtime.stats)!.toFixed(4)}`}
+                        : `$${costTotal(displayStats)!.toFixed(4)}`}
                     </strong>
                   </div>
                   <div className="stat-row">
                     <span>{t("cacheHit")}</span>
                     <strong>
-                      {cacheHitRatio(runtime.stats) == null
+                      {cacheHitRatio(displayStats) == null
                         ? "—"
-                        : `${Math.round(cacheHitRatio(runtime.stats)! * 100)}%`}
+                        : `${Math.round(cacheHitRatio(displayStats)! * 100)}%`}
                     </strong>
                   </div>
                   <div className="stats-breakdown">
                     <div className="muted">
-                      {runtime.stats.provider ?? t("unknownProvider")} ·{" "}
-                      {runtime.stats.modelId ?? t("unknownModel")}
+                      {displayStats.provider ?? t("unknownProvider")} ·{" "}
+                      {displayStats.modelId ?? t("unknownModel")}
                     </div>
-                    {Object.entries(runtime.stats.operationCounts ?? {}).map(
+                    {Object.entries(displayStats.operationCounts ?? {}).map(
                       ([name, value]) => {
                         const maximum = Math.max(
                           1,
                           ...Object.values(
-                            runtime.stats?.operationCounts ?? {},
+                            displayStats.operationCounts ?? {},
                           ),
                         );
                         return (
@@ -4020,8 +4051,35 @@ function DialogOverlay({
   const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
   const ui = dialog.ui;
   const options = ui.options ?? [];
+  const structured =
+    ui.purpose !== "permission" &&
+    (ui.kind === "selector" || ui.kind === "input");
+  const multiple = structured && !!ui.allowMultiple;
+  const comment = structured && !!ui.allowComment;
+  const [selected, setSelected] = useState<number[]>([]);
+  const optionValue = (index: number) =>
+    options[index].value ??
+    options[index].permission ??
+    options[index].title ??
+    String(index);
   const freeform =
     Boolean(ui.allowFreeform ?? ui.freeform) || options.length === 0;
+  const canSubmit = selected.length > 0 || (freeform && !!answer.trim());
+  const submit = () => {
+    if (!canSubmit || busy) return;
+    onSubmit(
+      structured
+        ? {
+            values: selected.length
+              ? selected.map((index) => String(optionValue(index)))
+              : [answer],
+            ...(answer.trim() && (ui.kind === "input" || comment)
+              ? { text: answer }
+              : {}),
+          }
+        : answer,
+    );
+  };
   return (
     <div className="dialog-backdrop" role="presentation">
       <form
@@ -4031,7 +4089,7 @@ function DialogOverlay({
         aria-labelledby="native-dialog-title"
         onSubmit={(event) => {
           event.preventDefault();
-          if (freeform) onSubmit(answer);
+          submit();
         }}
       >
         <div className="dialog-heading">
@@ -4064,15 +4122,33 @@ function DialogOverlay({
                   type="button"
                   key={`${option.title ?? "option"}-${index}`}
                   disabled={busy}
-                  onClick={() => onSubmit(value)}
+                  aria-pressed={
+                    multiple || comment ? selected.includes(index) : undefined
+                  }
+                  onClick={() => {
+                    if (multiple)
+                      setSelected((previous) =>
+                        previous.includes(index)
+                          ? previous.filter((item) => item !== index)
+                          : [...previous, index],
+                      );
+                    else if (comment) setSelected([index]);
+                    else
+                      onSubmit(
+                        structured ? { values: [String(value)] } : value,
+                      );
+                  }}
                 >
-                  {option.title ?? String(value)}
+                  <span>
+                    {option.title ?? String(value)}
+                    {option.description && <small>{option.description}</small>}
+                  </span>
                 </button>
               );
             })}
           </div>
         )}
-        {freeform && (
+        {(freeform || comment) && (
           <>
             <label htmlFor="dialog-answer">{t("answer")}</label>
             <textarea
@@ -4081,20 +4157,23 @@ function DialogOverlay({
               onChange={(event) => onAnswer(event.target.value)}
               autoFocus
               rows={4}
+              placeholder={ui.suggest}
             />
-            <div className="dialog-actions">
-              <button type="button" onClick={onCancel} disabled={busy}>
-                {t("cancel")}
-              </button>
-              <button
-                type="submit"
-                className="primary"
-                disabled={busy || !answer.trim()}
-              >
-                {t("submit")}
-              </button>
-            </div>
           </>
+        )}
+        {(freeform || multiple || comment) && (
+          <div className="dialog-actions">
+            <button type="button" onClick={onCancel} disabled={busy}>
+              {t("cancel")}
+            </button>
+            <button
+              type="submit"
+              className="primary"
+              disabled={busy || !canSubmit}
+            >
+              {t("submit")}
+            </button>
+          </div>
         )}
       </form>
     </div>

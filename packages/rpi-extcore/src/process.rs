@@ -1,8 +1,8 @@
-//! Background children must not allocate a console when Web has no console.
+//! Background children must not allocate a console for protocol adapters without a console.
 use std::ffi::OsStr;
 use tokio::process::Command;
 
-pub(crate) fn background_command(program: impl AsRef<OsStr>) -> Command {
+pub fn background_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     command.kill_on_drop(true);
     #[cfg(windows)]
@@ -54,4 +54,50 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; pu
             "background stderr"
         );
     }
+}
+
+/// Native permission policy selected by the caller, never inferred from a protocol.
+pub fn configure_permission_gate(command: &mut Command, bypass: bool, no_auto_gate: bool) {
+    if bypass {
+        command.arg("--bypass").env("RPI_PERMISSION_GATE", "0");
+    } else if !no_auto_gate {
+        command.arg("--permission-gate");
+    }
+}
+
+use std::path::{Path, PathBuf};
+pub fn resolve_rpi_executable() -> PathBuf {
+    if let Some(path) = env_non_empty("RPI_BIN") {
+        return PathBuf::from(path);
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if is_rpi_binary(&current) {
+            return current;
+        }
+        if let Some(sibling) = sibling_rpi(current.parent()) {
+            return sibling;
+        }
+    }
+    PathBuf::from("rpi")
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether an executable path looks like the `rpi` host (not `rpi-acp`).
+pub fn is_rpi_binary(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.eq_ignore_ascii_case("rpi"))
+        .unwrap_or(false)
+}
+
+pub fn sibling_rpi(dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir?;
+    let candidate = dir.join(format!("rpi{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }

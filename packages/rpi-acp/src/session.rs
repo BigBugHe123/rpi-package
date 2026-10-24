@@ -17,15 +17,19 @@
 //! We spawn one child per ACP session with `current_dir = session/new.cwd`, so
 //! the agent's tools run in the client's workspace.
 
-use crate::diagln;
+use rpi_extcore::host::{HostSession, SessionOptions};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(test)]
+use tokio::process::Command;
+use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::protocol::{ContentBlock, Writer};
@@ -38,15 +42,8 @@ pub fn set_permission_bypass(enabled: bool) {
     PERMISSION_BYPASS.store(enabled, Ordering::Release);
 }
 
-fn configure_permission_gate(command: &mut Command, bypass: bool, no_auto_gate: bool) {
-    if bypass {
-        // Forward the flag to current gates, and disable environment activation
-        // for older gate versions that do not understand --bypass yet.
-        command.arg("--bypass").env("RPI_PERMISSION_GATE", "0");
-    } else if !no_auto_gate {
-        command.arg("--permission-gate");
-    }
-}
+#[cfg(test)]
+use rpi_extcore::process::configure_permission_gate;
 
 /// Read `--model` / `--provider` from this process's own argv. A Zed launch
 /// such as `rpi --acp --model gateway/model` carries the model in the host's
@@ -81,264 +78,68 @@ fn forwarded_model_provider_from(args: &[String]) -> (Option<String>, Option<Str
 
 /// A live ACP session backed by one `rpi --mode rpc` child process.
 pub struct Session {
-    /// The child process. `kill`-ed on shutdown.
-    child: TokioMutex<Option<Child>>,
-    /// The child's command channel.
-    stdin: TokioMutex<Box<dyn AsyncWrite + Unpin + Send>>,
-    cancellation: watch::Sender<u64>,
-    prompt_lock: TokioMutex<()>,
-    /// Every line the child writes to stdout, fanned out to whichever prompt
-    /// turn is currently subscribed. Buffered generously: a prompt turn can
-    /// emit many deltas between two reads.
-    events: broadcast::Sender<Value>,
-    /// Per-session command id counter (matches `response.id`).
-    next_id: AtomicU64,
-    stopped: AtomicBool,
+    rpc: Arc<HostSession>,
+    #[cfg(test)]
+    events: Option<rpi_extcore::host::TestEvents>,
 }
 
 impl Session {
-    /// Spawn `rpi --mode rpc` rooted at `cwd`.
-    pub fn spawn(id: String, cwd: PathBuf, saved: Option<&Path>) -> Result<Arc<Self>, String> {
-        let executable = resolve_rpi_executable();
-
-        let mut command = Command::new(&executable);
-        command
-            .arg("--mode")
-            .arg("rpc")
-            .current_dir(&cwd)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+    pub async fn spawn(
+        id: String,
+        cwd: PathBuf,
+        saved: Option<&Path>,
+    ) -> Result<Arc<Self>, String> {
         let directory = crate::history::session_directory(&id)?;
-        command.arg("--session-dir").arg(&directory);
-        if let Some(path) = saved {
-            // An exact file restore fails if missing rather than creating an empty session.
-            command.arg("--session").arg(path);
-        } else {
-            command.arg("--session-id").arg(&id);
-        }
-        // Ask the child to load the (optional) permission-gate extension so the
-        // ACP client's approval UI is used for dangerous tools. Harmless when
-        // the extension is not installed. --bypass explicitly disables gating;
-        // the legacy environment variable only opts out of auto-enabling it.
-        configure_permission_gate(
-            &mut command,
-            PERMISSION_BYPASS.load(Ordering::Acquire),
-            env_flag("RPI_ACP_NO_PERMISSION_GATE"),
-        );
-        // Seed the child with the model/provider the host was launched with, so
-        // a Zed `args: ["--acp", "--model", "gateway/model"]` actually applies
-        // to the session instead of silently falling back to the default model.
         let (model, provider) = forwarded_model_provider();
-        if let Some(model) = model {
-            command.arg("--model").arg(model);
-        }
-        if let Some(provider) = provider {
-            command.arg("--provider").arg(provider);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("spawn `rpi --mode rpc`: {e}"))?;
-        // One line per session: the most common Zed-side failure is this path
-        // pointing at a binary that no longer exists (e.g. a cleaned target dir).
-        diagln!(
-            "[rpi-acp] session {id}: child pid {} = {} --mode rpc",
-            child.id().unwrap_or(0),
-            executable.display()
-        );
-
-        let stdin = child.stdin.take().ok_or("child stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("child stdout unavailable")?;
-        let stderr = child.stderr.take();
-
-        // Fan every stdout line out to subscribers. `broadcast` (not mpsc)
-        // because the prompt turn for this session subscribes *before* sending
-        // the command, so no event between subscribe and completion is lost.
-        let (events, _) = broadcast::channel::<Value>(16_384);
-        let tx = events.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(line) {
-                    Ok(value) => {
-                        let _ = tx.send(value);
-                    }
-                    Err(error) => diagln!("[rpi-acp] child produced invalid json: {error}"),
-                }
-            }
-            // Terminal marker so a pending prompt can finish if the child dies.
-            let _ = tx.send(json!({"type": "session_end"}));
-        });
-
-        if let Some(stderr) = stderr {
-            let session = id.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    diagln!("[rpi-acp:{session}] {line}");
-                }
-            });
-        }
-
+        let rpc = HostSession::spawn_options(SessionOptions {
+            executable: resolve_rpi_executable(),
+            project: cwd,
+            session_id: id,
+            session_dir: Some(directory.clone()),
+            saved_session: saved.map(Path::to_path_buf),
+            fork_source: None,
+            timings_dir: directory.join("tool-timings"),
+            model,
+            provider,
+            permission_gate: !env_flag("RPI_ACP_NO_PERMISSION_GATE"),
+            bypass: PERMISSION_BYPASS.load(Ordering::Acquire),
+        })
+        .await?;
         Ok(Arc::new(Self {
-            child: TokioMutex::new(Some(child)),
-            stdin: TokioMutex::new(Box::new(stdin)),
-            cancellation: watch::channel(0).0,
-            prompt_lock: TokioMutex::new(()),
-            events,
-            next_id: AtomicU64::new(1),
-            stopped: AtomicBool::new(false),
+            rpc,
+            #[cfg(test)]
+            events: None,
         }))
     }
 
     async fn send(&self, value: Value) -> Result<(), String> {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(
-                "rpi backend stopped; restart the ACP connection to restore saved history".into(),
-            );
-        }
-        let mut stdin = self.stdin.lock().await;
-        let mut buf = value.to_string();
-        buf.push('\n');
-        stdin
-            .write_all(buf.as_bytes())
-            .await
-            .map_err(|e| format!("write to child: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("flush child stdin: {e}"))
+        self.rpc.notify(value).await
     }
 
     /// Wait for backend startup and obtain the authoritative active branch.
     pub async fn state(&self) -> Result<Value, String> {
-        let _prompt = self
-            .prompt_lock
-            .try_lock()
-            .map_err(|_| "a prompt is already running")?;
-        let mut events = self.events.subscribe();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.send(json!({"id": id, "type": "get_state"})).await?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .map_err(|e| format!("backend disconnected: {e}"))?;
-                if event["type"] == "session_end" {
-                    return Err(
-                        "rpi exited while opening the session; check the agent stderr log".into(),
-                    );
-                }
-                if event["type"] == "response" && event["id"] == id {
-                    if event["success"] != true {
-                        return Err(format!(
-                            "open session: {}",
-                            event["error"].as_str().unwrap_or("invalid RPC response")
-                        ));
-                    }
-                    if !event["data"].is_object() {
-                        return Err("open session: invalid RPC state data".into());
-                    }
-                    return Ok(event["data"].clone());
-                }
-            }
-        })
-        .await
-        .map_err(|_| "timed out waiting for rpi session startup".to_string())?
+        self.rpc.state().await
     }
 
-    /// Send an RPC command and await its matching `response` object. Reads the
-    /// child's event stream on a fresh subscription, so it can run while a
-    /// prompt is active (the `id` filters out unrelated events).
-    async fn command(&self, kind: &str, mut params: Value) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let object = params
-            .as_object_mut()
-            .ok_or_else(|| format!("{kind}: params must be an object"))?;
-        object.insert("id".to_string(), json!(id));
-        object.insert("type".to_string(), json!(kind));
-        // Subscribe before sending: the child can answer before the next line
-        // runs, and `broadcast` drops events for subscribers that join late.
-        let mut events = self.events.subscribe();
-        self.send(params).await?;
-
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .map_err(|e| format!("backend disconnected: {e}"))?;
-                if event["type"] == "session_end" {
-                    return Err(format!("rpi exited while running {kind}"));
-                }
-                if event["type"] == "response" && event["id"] == id {
-                    if event["success"] != true {
-                        return Err(format!(
-                            "{kind}: {}",
-                            event["error"].as_str().unwrap_or("invalid RPC response")
-                        ));
-                    }
-                    return Ok(event["data"].clone());
-                }
-            }
-        })
-        .await
-        .map_err(|_| format!("timed out waiting for {kind}"))?
-    }
-
-    /// The model catalog the child can switch to (`get_available_models`).
     pub async fn available_models(&self) -> Result<Value, String> {
-        Ok(self.command("get_available_models", json!({})).await?["models"].clone())
+        self.rpc.available_models().await
     }
-
-    /// Read the child's state without acquiring the prompt lock. Used by
-    /// `session/set_config_option`, which must also work while a prompt runs
-    /// (the locked [`Self::state`] would reject it).
     pub async fn state_unlocked(&self) -> Result<Value, String> {
-        self.command("get_state", json!({})).await
+        self.rpc.state_unlocked().await
     }
-
-    /// Switch the child's active model (`set_model`).
     pub async fn set_model(&self, model_id: &str, provider: Option<&str>) -> Result<(), String> {
-        let mut params = serde_json::Map::new();
-        params.insert("modelId".to_string(), json!(model_id));
-        // Keep the legacy field for older rpi RPC hosts; current hosts ignore it.
-        params.insert("model".to_string(), json!(model_id));
-        if let Some(provider) = provider {
-            params.insert("provider".to_string(), json!(provider));
-        }
-        self.command("set_model", Value::Object(params)).await?;
-        Ok(())
+        self.rpc.set_model(model_id, provider).await
     }
-
-    /// The thinking levels the current model supports (`get_available_thinking_levels`).
     pub async fn available_thinking_levels(&self) -> Result<Value, String> {
-        Ok(self
-            .command("get_available_thinking_levels", json!({}))
-            .await?["levels"]
-            .clone())
+        self.rpc.available_thinking_levels().await
     }
-
-    /// Switch the child's thinking level (`set_thinking_level`).
     pub async fn set_thinking_level(&self, level: &str) -> Result<(), String> {
-        let mut params = serde_json::Map::new();
-        params.insert("level".to_string(), json!(level));
-        self.command("set_thinking_level", Value::Object(params))
-            .await?;
-        Ok(())
+        self.rpc.set_thinking_level(level).await
     }
 
     /// Ask the child to abort the current run (`session/cancel`).
     pub async fn abort(&self) -> Result<(), String> {
-        self.cancellation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        self.send(json!({"type": "abort"})).await
+        self.rpc.abort_run().await
     }
 
     /// Run one prompt turn to completion, streaming `session/update`
@@ -349,25 +150,14 @@ impl Session {
         acp_session_id: &str,
         blocks: &[ContentBlock],
     ) -> Result<&'static str, String> {
-        let Ok(_prompt) = self.prompt_lock.try_lock() else {
-            return Err("a prompt is already running".into());
-        };
-        let mut cancellation = self.cancellation.subscribe();
+        let mut run = self.rpc.begin_prompt(prompt_text(blocks)).await?;
         let mut cancelled = false;
         let mut dialogs = DialogTasks::default();
-        let mut text = StreamText::default();
-        let mut stream_error = None;
-        let mut accepted = false;
-        let mut rx = self.events.subscribe();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let content = prompt_text(blocks);
-        self.send(json!({"id": id, "type": "prompt", "message": content}))
-            .await?;
 
         let stop_reason = 'prompt: loop {
             let event = tokio::select! {
                 biased;
-                _ = cancellation.changed(), if !cancelled => {
+                _ = run.cancellation.changed(), if !cancelled => {
                     cancelled = true;
                     dialogs.cancel_all(writer, acp_session_id).await;
                     continue;
@@ -376,63 +166,25 @@ impl Session {
                     if let Some(Ok(id)) = result { dialogs.pending.remove(&id); }
                     continue;
                 }
-                event = rx.recv() => event,
+                event = run.events.recv() => event,
             };
             match event {
                 Ok(value) => {
-                    if value.get("type").and_then(Value::as_str) == Some("response")
-                        && value.get("id").and_then(Value::as_u64) == Some(id)
-                    {
-                        if value["success"] != true {
-                            let message = value
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("agent rejected the prompt");
-                            break 'prompt if cancelled {
-                                Ok("cancelled")
-                            } else {
-                                Err(message.into())
-                            };
-                        }
-                        if value.pointer("/data/accepted") != Some(&Value::Bool(true)) {
-                            break 'prompt Err("rpi did not acknowledge prompt acceptance".into());
-                        }
-                        accepted = true;
-                        continue;
+                    let progress = run.tracker.observe(&value, cancelled);
+                    for delta in progress.deltas {
+                        writer
+                            .notify(
+                                "session/update",
+                                json!({"sessionId":acp_session_id,"update":text_update(delta)}),
+                            )
+                            .await;
                     }
-                    if value["type"] == "agent_settled" && accepted {
-                        let outcome = value
-                            .get("outcome")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown");
-                        if let Some(error) = stream_error {
-                            break 'prompt Err(error);
-                        }
-                        if let Some(final_text) = value.get("finalText").and_then(Value::as_str) {
-                            match text.complete(final_text) {
-                                Ok(Some(update)) => {
-                                    writer
-                                        .notify(
-                                            "session/update",
-                                            json!({"sessionId":acp_session_id,"update":update}),
-                                        )
-                                        .await
-                                }
-                                Ok(None) => {}
-                                Err(error) => break 'prompt Err(error),
-                            }
-                        }
-                        diagln!("[rpi-acp] session {acp_session_id}: prompt {id} outcome {outcome}, text bytes {}, repaired bytes {}", text.text.len(), text.repaired);
-                        break 'prompt match outcome {
-                            "aborted" => Ok("cancelled"),
-                            "failed" => Err(value["error"].as_str().filter(|error| !error.is_empty()).map(str::to_owned).or_else(|| text.error.clone()).unwrap_or_else(|| "rpi run failed before completing the reply; check the agent stderr log".into())),
-                            "completed" if text.stop_reason.as_deref() == Some("length") => Ok("max_tokens"),
-                            "completed" => Ok("end_turn"),
-                            other => Err(format!("rpi run did not complete: {other}")),
-                        };
-                    }
-                    if value.get("type").and_then(Value::as_str) == Some("session_end") {
-                        break 'prompt Err("rpi session ended before the prompt completed".into());
+                    if let Some(outcome) = progress.outcome {
+                        break 'prompt outcome.map(|outcome| match outcome {
+                            rpi_extcore::run::RunOutcome::Completed => "end_turn",
+                            rpi_extcore::run::RunOutcome::Cancelled => "cancelled",
+                            rpi_extcore::run::RunOutcome::TokenLimit => "max_tokens",
+                        });
                     }
                     // A plugin opened a UI dialog (e.g. a permission gate). Ask
                     // the ACP client, then answer the plugin.
@@ -458,14 +210,13 @@ impl Session {
                         }
                         continue;
                     }
-                    let updates = match text.event(&value) {
-                        Ok(updates) => updates,
-                        // Keep draining until the backend completes; returning
-                        // early would allow a new prompt while this run is active.
-                        Err(error) => {
-                            stream_error.get_or_insert(error);
-                            continue;
-                        }
+                    let updates = if matches!(
+                        value["type"].as_str(),
+                        Some("message_start" | "message_update" | "message_end")
+                    ) {
+                        Vec::new()
+                    } else {
+                        translate_event(&value).into_iter().collect::<Vec<_>>()
                     };
                     for update in updates {
                         writer
@@ -510,133 +261,52 @@ impl Session {
 
     /// Kill the child (session/close, process shutdown).
     pub async fn kill(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.cancellation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
-        }
+        self.rpc.terminate().await;
     }
 }
 
-/// ACP chunks append text. Reconcile with cumulative backend snapshots so a
-/// dropped delta or an early RPC completion cannot silently truncate a reply.
+#[cfg(test)]
 #[derive(Default)]
-struct StreamText {
-    text: String,
-    thinking: String,
-    stop_reason: Option<String>,
-    error: Option<String>,
-    repaired: usize,
+struct StreamText(rpi_extcore::message::MessageProjection);
+#[cfg(test)]
+impl std::ops::Deref for StreamText {
+    type Target = rpi_extcore::message::MessageProjection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
-
+#[cfg(test)]
 impl StreamText {
     fn event(&mut self, event: &Value) -> Result<Vec<Value>, String> {
-        let kind = event["type"].as_str().unwrap_or("");
-        let message = &event["message"];
-        if kind == "message_start" && message["role"] == "assistant" {
-            *self = Self {
-                repaired: self.repaired,
-                ..Self::default()
-            };
-            return Ok(Vec::new());
+        let mut updates = self
+            .0
+            .event(event)?
+            .into_iter()
+            .map(text_update)
+            .collect::<Vec<_>>();
+        if !matches!(
+            event["type"].as_str(),
+            Some("message_start" | "message_update" | "message_end")
+        ) {
+            updates.extend(translate_event(event));
         }
-        if matches!(kind, "message_update" | "message_end") && message["role"] == "assistant" {
-            if kind == "message_end" {
-                self.stop_reason = message["stopReason"].as_str().map(str::to_owned);
-                self.error = message["errorMessage"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-            }
-            if let Some(blocks) = message["content"].as_array() {
-                let mut updates = Vec::new();
-                for (block_type, field, variant, sent) in [
-                    (
-                        "thinking",
-                        "thinking",
-                        "agent_thought_chunk",
-                        &mut self.thinking,
-                    ),
-                    ("text", "text", "agent_message_chunk", &mut self.text),
-                ] {
-                    let parts: Vec<&str> = blocks
-                        .iter()
-                        .filter(|b| b["type"] == block_type)
-                        .filter_map(|b| b[field].as_str())
-                        .collect();
-                    if !parts.is_empty() {
-                        if let Some(update) = append_snapshot(sent, &parts.concat(), variant)? {
-                            if kind == "message_end" {
-                                self.repaired +=
-                                    update["content"]["text"].as_str().unwrap_or("").len();
-                            }
-                            updates.push(update);
-                        }
-                    }
-                }
-                // Older RPC senders may omit snapshots. Fall back only when the
-                // delta's content kind is absent, never append it twice.
-                let delta_type = match event["eventType"].as_str() {
-                    Some("text_delta") => "text",
-                    Some("thinking_delta") => "thinking",
-                    _ => "",
-                };
-                if kind != "message_end" && !blocks.iter().any(|b| b["type"] == delta_type) {
-                    if let Some(update) = self.delta(event) {
-                        updates.push(update);
-                    }
-                }
-                return Ok(updates);
-            }
-        }
-        Ok(self.delta(event).into_iter().collect())
+        Ok(updates)
     }
-
-    fn delta(&mut self, event: &Value) -> Option<Value> {
-        let update = translate_event(event);
-        if let Some(update) = &update {
-            let sent = match update["sessionUpdate"].as_str() {
-                Some("agent_message_chunk") => Some(&mut self.text),
-                Some("agent_thought_chunk") => Some(&mut self.thinking),
-                _ => None,
-            };
-            if let Some(sent) = sent {
-                sent.push_str(update["content"]["text"].as_str().unwrap_or(""));
-            }
-        }
-        update
-    }
-
-    fn complete(&mut self, final_text: &str) -> Result<Option<Value>, String> {
-        let update = append_snapshot(&mut self.text, final_text, "agent_message_chunk")?;
-        if let Some(update) = &update {
-            self.repaired += update["content"]["text"].as_str().unwrap_or("").len();
-        }
-        Ok(update)
+    fn complete(&mut self, text: &str) -> Result<Option<Value>, String> {
+        Ok(self.0.complete(text)?.map(text_update))
     }
 }
-
-fn append_snapshot(
-    sent: &mut String,
-    complete: &str,
-    variant: &str,
-) -> Result<Option<Value>, String> {
-    if let Some(suffix) = complete.strip_prefix(sent.as_str()) {
-        if suffix.is_empty() {
-            return Ok(None);
-        }
-        let update = json!({"sessionUpdate":variant,"content":{"type":"text","text":suffix}});
-        *sent = complete.to_owned();
-        return Ok(Some(update));
-    }
-    // A delayed partial snapshot must not replace or duplicate newer text.
-    if sent.starts_with(complete) {
-        return Ok(None);
-    }
-    Err("rpi final message differs from the streamed text; reload this session to recover the saved reply".into())
+fn text_update(delta: Value) -> Value {
+    let kind = if delta["kind"] == "thinking" {
+        "agent_thought_chunk"
+    } else {
+        "agent_message_chunk"
+    };
+    json!({"sessionUpdate":kind,"content":{"type":"text","text":delta["text"]}})
 }
 
+#[cfg(test)]
+use rpi_extcore::process::sibling_rpi;
 /// Locate the `rpi` host binary to spawn in `--mode rpc`.
 ///
 /// Resolution order:
@@ -649,41 +319,7 @@ fn append_snapshot(
 ///
 /// The standalone binary must NOT use `current_exe()` unconditionally: there it
 /// is `rpi-acp`, so spawning it would recurse instead of starting an agent.
-pub fn resolve_rpi_executable() -> PathBuf {
-    if let Some(path) = env_non_empty("RPI_BIN") {
-        return PathBuf::from(path);
-    }
-    if let Ok(current) = std::env::current_exe() {
-        if is_rpi_binary(&current) {
-            return current;
-        }
-        if let Some(sibling) = sibling_rpi(current.parent()) {
-            return sibling;
-        }
-    }
-    PathBuf::from("rpi")
-}
-
-fn env_non_empty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// Whether an executable path looks like the `rpi` host (not `rpi-acp`).
-pub(crate) fn is_rpi_binary(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| stem.eq_ignore_ascii_case("rpi"))
-        .unwrap_or(false)
-}
-
-fn sibling_rpi(dir: Option<&Path>) -> Option<PathBuf> {
-    let dir = dir?;
-    let candidate = dir.join(format!("rpi{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
-}
+pub use rpi_extcore::process::{is_rpi_binary, resolve_rpi_executable};
 
 /// Owns each pending client request separately, so the event stream keeps advancing.
 #[derive(Default)]
@@ -1244,14 +880,10 @@ mod tests {
 
     fn test_session() -> (Arc<Session>, tokio::io::DuplexStream) {
         let (stdin, commands) = tokio::io::duplex(8192);
+        let (rpc, events) = HostSession::test_connection(stdin, 64);
         let session = Arc::new(Session {
-            child: TokioMutex::new(None),
-            stdin: TokioMutex::new(Box::new(stdin)),
-            cancellation: watch::channel(0).0,
-            prompt_lock: TokioMutex::new(()),
-            events: broadcast::channel(64).0,
-            next_id: AtomicU64::new(1),
-            stopped: AtomicBool::new(false),
+            rpc,
+            events: Some(events),
         });
         (session, commands)
     }
@@ -1266,10 +898,10 @@ mod tests {
     }
 
     fn settle_prompt(session: &Session, command: &Value, mut result: Value) {
-        session.events.send(json!({"type":"response","id":command["id"],"command":"prompt","success":true,"data":{"accepted":true}})).unwrap();
+        session.events.as_ref().unwrap().send(json!({"type":"response","id":command["id"],"command":"prompt","success":true,"data":{"accepted":true}})).unwrap();
         result["type"] = json!("agent_settled");
         result["runId"] = json!("test-run");
-        session.events.send(result).unwrap();
+        session.events.as_ref().unwrap().send(result).unwrap();
     }
 
     #[tokio::test]
@@ -1298,7 +930,7 @@ mod tests {
             let mut response = response;
             response["type"] = json!("response");
             response["id"] = command["id"].clone();
-            session.events.send(response).unwrap();
+            session.events.as_ref().unwrap().send(response).unwrap();
             assert_eq!(state.await.unwrap(), expected);
         }
     }
@@ -1331,11 +963,15 @@ mod tests {
         // A previous run's settlement before this acknowledgement is unrelated.
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"agent_settled","runId":"old","outcome":"completed"}))
             .unwrap();
-        session.events.send(json!({"type":"response","id":command["id"],"success":true,"data":{"accepted":true}})).unwrap();
+        session.events.as_ref().unwrap().send(json!({"type":"response","id":command["id"],"success":true,"data":{"accepted":true}})).unwrap();
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"message_update","eventType":"text_delta","delta":"前半段🌊"}))
             .unwrap();
         assert_eq!(
@@ -1347,7 +983,7 @@ mod tests {
             session.prompt(&writer, "s", &[]).await,
             Err("a prompt is already running".into())
         );
-        session.events.send(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"前半段🌊，后半段。"}],"stopReason":"stop"}})).unwrap();
+        session.events.as_ref().unwrap().send(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"前半段🌊，后半段。"}],"stopReason":"stop"}})).unwrap();
         assert_eq!(
             read_json(&mut replies).await["params"]["update"]["content"]["text"],
             "，后半段。"
@@ -1355,6 +991,8 @@ mod tests {
         assert!(!prompt.is_finished());
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"agent_settled","runId":"current","outcome":"completed"}))
             .unwrap();
         assert_eq!(
@@ -1406,10 +1044,10 @@ mod tests {
             let mut response = response;
             response["type"] = json!("response");
             response["id"] = command["id"].clone();
-            session.events.send(response).unwrap();
+            session.events.as_ref().unwrap().send(response).unwrap();
             if let Some(mut settlement) = settlement {
                 settlement["type"] = json!("agent_settled");
-                session.events.send(settlement).unwrap();
+                session.events.as_ref().unwrap().send(settlement).unwrap();
             }
             assert_eq!(
                 tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
@@ -1431,17 +1069,21 @@ mod tests {
             async move { session.prompt(&writer, "s", &[]).await }
         });
         let command = read_json(&mut commands).await;
-        session.events.send(json!({"type":"response","id":command["id"],"success":true,"data":{"accepted":true}})).unwrap();
+        session.events.as_ref().unwrap().send(json!({"type":"response","id":command["id"],"success":true,"data":{"accepted":true}})).unwrap();
         // Do not yield: deterministically evict the acknowledgement from the
         // small test channel before the prompt reads it.
         for _ in 0..100 {
             session
                 .events
+                .as_ref()
+                .unwrap()
                 .send(json!({"type":"message_update","eventType":"text_delta","delta":"x"}))
                 .unwrap();
         }
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"agent_settled","outcome":"completed"}))
             .unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
@@ -1474,6 +1116,8 @@ mod tests {
         let command = read_json(&mut commands).await;
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"message_update","eventType":"text_delta","delta":"前半段🌊"}))
             .unwrap();
         settle_prompt(
@@ -1558,7 +1202,7 @@ mod tests {
                 async move { session.prompt(&writer, "s", &[]).await }
             });
             let command = read_json(&mut commands).await;
-            session.events.send(json!({"type":"message_end","message":{"role":"assistant", "content":[{"type":"text","text":"partial"}],"stopReason":reason,"errorMessage":"provider disconnected"}})).unwrap();
+            session.events.as_ref().unwrap().send(json!({"type":"message_end","message":{"role":"assistant", "content":[{"type":"text","text":"partial"}],"stopReason":reason,"errorMessage":"provider disconnected"}})).unwrap();
             settle_prompt(
                 &session,
                 &command,
@@ -1581,13 +1225,20 @@ mod tests {
             async move { session.prompt(&writer, "s", &[]).await }
         });
         let command = read_json(&mut commands).await;
-        session.events.send(permission_event("q")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(permission_event("q"))
+            .unwrap();
         assert_eq!(
             read_json(&mut replies).await["method"],
             "session/request_permission"
         );
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"ui_dialog_closed","requestId":"q"}))
             .unwrap();
         settle_prompt(&session, &command, json!({"outcome":"completed"}));
@@ -1614,13 +1265,25 @@ mod tests {
             async move { session.prompt(&writer, "s", &[]).await }
         });
         let command = read_json(&mut commands).await;
-        session.events.send(permission_event("q1")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(permission_event("q1"))
+            .unwrap();
         let first = read_json(&mut replies).await;
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"ui_dialog_closed","requestId":"q1"}))
             .unwrap();
-        session.events.send(permission_event("q2")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(permission_event("q2"))
+            .unwrap();
         let second = read_json(&mut replies).await;
         let answer = json!({"outcome":{"outcome":"selected","optionId":"0"}});
         writer
@@ -1654,7 +1317,12 @@ mod tests {
             async move { session.prompt(&writer, "s", &[]).await }
         });
         let command = read_json(&mut commands).await;
-        session.events.send(permission_event("q")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(permission_event("q"))
+            .unwrap();
         read_json(&mut replies).await;
         session.abort().await.unwrap();
         assert_eq!(read_json(&mut commands).await["type"], "abort");
@@ -1767,16 +1435,28 @@ mod tests {
             async move { session.prompt(&writer, "s", &[]).await }
         });
         let command = read_json(&mut commands).await;
-        session.events.send(question_event("q1")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(question_event("q1"))
+            .unwrap();
         let first = read_json(&mut replies).await;
         session
             .events
+            .as_ref()
+            .unwrap()
             .send(json!({"type":"ui_dialog_closed","requestId":"q1"}))
             .unwrap();
         let closed = read_json(&mut replies).await;
         assert_eq!(closed["method"], crate::questions::CLOSED_METHOD);
         assert_eq!(closed["params"]["requestId"], "q1");
-        session.events.send(question_event("q2")).unwrap();
+        session
+            .events
+            .as_ref()
+            .unwrap()
+            .send(question_event("q2"))
+            .unwrap();
         let second = read_json(&mut replies).await;
         let answer = json!({"answer":{"values":["Rust"]}});
         writer

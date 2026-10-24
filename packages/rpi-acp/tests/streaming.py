@@ -39,6 +39,7 @@ def backend():
         emit(dict(type="message_end", message=dict(role="assistant", stopReason=reason,
                                                    errorMessage=error, content=[dict(type="text", text=text)])))
 
+    emit(dict(type="ready", protocol="rpi"))
     for line in sys.stdin:
         command = json.loads(line)
         kind = command["type"]

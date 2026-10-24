@@ -850,7 +850,7 @@ async fn open_session(
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err("cwd must be an existing absolute directory".into());
     }
-    let session = Session::spawn(id.to_owned(), cwd, saved)?;
+    let session = Session::spawn(id.to_owned(), cwd, saved).await?;
     match session.state().await {
         Ok(state) if state["sessionId"] == id => Ok((session, state)),
         result => {

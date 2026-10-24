@@ -11,7 +11,7 @@ fn now_ms() -> u64 {
 }
 
 // Replay anchors must describe elapsed time at delivery, not at original emission.
-pub(crate) fn refresh_event(event: &mut Value) {
+pub fn refresh_event(event: &mut Value) {
     if let Some(timing) = event.get_mut("webTiming") {
         if timing["running"] == true {
             let now = now_ms();
@@ -30,7 +30,7 @@ struct Timing {
     elapsed_ms: u64,
 }
 
-pub(crate) struct ToolTimings {
+pub struct ToolTimings {
     path: PathBuf,
     finished: HashMap<String, Timing>,
     active: HashMap<String, Instant>,
@@ -57,7 +57,7 @@ impl ToolTimings {
             );
         }
         if let Err(error) = self.save() {
-            eprintln!("rpi-web: cannot save interrupted tool timings: {error}");
+            eprintln!("rpi-extcore: cannot save interrupted tool timings: {error}");
         }
     }
     pub fn load(path: PathBuf) -> Result<Self, String> {
@@ -101,7 +101,7 @@ impl ToolTimings {
                         },
                     );
                     if let Err(error) = self.save() {
-                        eprintln!("rpi-web: cannot save tool timings: {error}");
+                        eprintln!("rpi-extcore: cannot save tool timings: {error}");
                     }
                 }
             }

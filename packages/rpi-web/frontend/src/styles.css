@@ -929,7 +929,7 @@ code {
   margin: 14px 0;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 0;
   background: var(--soft);
 }
 .markdown-code-heading {
@@ -969,6 +969,8 @@ code {
 .markdown-code-block pre {
   margin: 0;
   padding: 13px 15px;
+  border: 0;
+  border-radius: 0;
   overflow: auto;
   background: transparent;
   font-size: 12px;
@@ -3646,6 +3648,15 @@ details[open] > summary:before {
 .dialog-options button {
   justify-content: flex-start;
   text-align: left;
+}
+.dialog-options button[aria-pressed="true"] {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+.dialog-options button small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
 }
 
 .tool-elapsed {

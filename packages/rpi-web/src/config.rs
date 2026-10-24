@@ -248,7 +248,7 @@ fn configure_with_agent(
             bind: (config.bind != "127.0.0.1").then_some(config.bind),
             port: Some(config.port),
             session_dir: config.session_dir,
-            registry: (config.registry != crate::registry::default_path())
+            registry: (config.registry != rpi_extcore::registry::default_path())
                 .then_some(config.registry),
             allowed_hosts: None,
         };
@@ -359,7 +359,7 @@ mod tests {
         let f = Fixture::new();
         let config = f.run(&[]);
         assert_eq!(config.project, f.0.join("work"));
-        assert_eq!(config.registry, crate::registry::default_path());
+        assert_eq!(config.registry, rpi_extcore::registry::default_path());
         assert_eq!(config.port, 3030);
         assert_eq!(config.rpi_bin, Path::new("rpi"));
         let config = f.run(&[
