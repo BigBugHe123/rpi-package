@@ -599,6 +599,18 @@ impl HostSession {
         self.ready.clone()
     }
 
+    /// Whether the native ready frame advertises an optional RPC command.
+    /// Hosts that omit `supportedCommands` are treated as legacy-compatible:
+    /// the caller may still probe the command and handle an unsupported error.
+    pub fn supports_command(&self, command: &str) -> bool {
+        self.ready
+            .get("supportedCommands")
+            .and_then(Value::as_array)
+            .map_or(true, |commands| {
+                commands.iter().any(|value| value.as_str() == Some(command))
+            })
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<BufferedEvent> {
         self.runtime.events.subscribe()
     }
@@ -739,6 +751,33 @@ impl HostSession {
         Ok(())
     }
 
+    /// Read the complete currently selected native session branch.
+    pub async fn session_branch(&self) -> Result<Vec<Value>, String> {
+        let data = self
+            .runtime_command("get_session_branch", json!({}))
+            .await?;
+        data.get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| "get_session_branch: invalid entries data".into())
+    }
+
+    /// Append a protocol-neutral custom entry to the native session branch.
+    pub async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Value,
+    ) -> Result<Value, String> {
+        if custom_type.trim().is_empty() {
+            return Err("append_entry: custom type is required".into());
+        }
+        self.runtime_command(
+            "append_entry",
+            json!({"customType": custom_type, "data": data}),
+        )
+        .await
+    }
+
     pub async fn send(&self, value: Value) -> Result<Value, String> {
         self.send_timeout(value, Duration::from_secs(300)).await
     }
@@ -793,6 +832,7 @@ impl Drop for HostSession {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
 pub struct TestEvents(Arc<HostSession>);
 #[cfg(any(test, feature = "test-support"))]
 impl TestEvents {
