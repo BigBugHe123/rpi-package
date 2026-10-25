@@ -69,9 +69,13 @@ fn publish_from(root: &Path, params: &Value) -> Result<String, String> {
             json!({"path":file,"name":name,"size":metadata.len(),"mimeType":mime_type(file)}),
         );
     }
-    Ok(json!({"content":[{"type":"text","text":"Files ready."}],
-        "details":{"type":"artifact_publication","version":1,"files":cards}})
-    .to_string())
+    let details = json!({"type":"artifact_publication","version":1,"files":cards});
+    // Native history retains details, but providers send content to the model.
+    // Keep the complete result available to the Agent both now and after recovery.
+    Ok(
+        json!({"content":[{"type":"text","text":details.to_string()}],"details":details})
+            .to_string(),
+    )
 }
 
 fn mime_type(path: &str) -> &'static str {
@@ -180,6 +184,11 @@ mod tests {
         assert_eq!(
             result["details"]["files"],
             json!([{"path":"report.pdf","name":"report.pdf","mimeType":"application/pdf","size":6}])
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            result["details"],
+            "The model-visible result must include the same file data as native details"
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         assert_eq!(
