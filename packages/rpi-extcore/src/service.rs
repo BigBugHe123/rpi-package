@@ -957,10 +957,20 @@ pub async fn snapshot_with_options(
     };
     let host_snapshot = session.snapshot().await;
     let start = host_snapshot.last_seq;
-    let request_id = json!(uuid::Uuid::new_v4().to_string());
-    let response = session
-        .send(json!({"type": "get_messages", "id": request_id, "limit": options.limit.unwrap_or(80).clamp(1, 400)}))
-        .await;
+    // These are independent read-only requests. Dispatch both after the same
+    // sequence boundary so snapshot latency is bounded by the slower request,
+    // rather than the sum of both native RPC round trips.
+    let messages_request = session.send(json!({
+        "type": "get_messages",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "limit": options.limit.unwrap_or(80).clamp(1, 400),
+    }));
+    let history_request = session.send(json!({
+        "type": "get_history",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "limit": 100,
+    }));
+    let (response, history_response) = tokio::join!(messages_request, history_request);
     let response = match response {
         Ok(response) => response,
         Err(error) => {
@@ -982,9 +992,7 @@ pub async fn snapshot_with_options(
             .into_reply();
     }
     let data = &response["data"];
-    let history = session
-        .send(json!({"type": "get_history", "id": uuid::Uuid::new_v4().to_string(), "limit": 100}))
-        .await
+    let history = history_response
         .ok()
         .filter(|value| value["success"] == Value::Bool(true))
         .and_then(|value| value.get("data").cloned())
