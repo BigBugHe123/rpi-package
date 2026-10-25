@@ -1443,8 +1443,9 @@ export default function App() {
     };
 
     void (async () => {
-      // Sequential on purpose: reopen first (a bridge restart leaves only the
-      // registry entry), then read state, then history, then follow live events.
+      // Reopen first because a bridge restart leaves only the registry entry.
+      // Once the native host is ready, runtime state and the bounded transcript
+      // snapshot are independent reads; keep their network/RPC latency parallel.
       try {
         await api.openSession(sessionId);
         if (cancelled) return;
@@ -1454,24 +1455,25 @@ export default function App() {
         return;
       }
 
+      let after = 0;
       try {
-        const state = await api.runtimeState(sessionId);
+        const snapshotPromise = capabilities.supportedCommands.includes(
+          "get_messages",
+        )
+          ? snapshotOf(sessionId)
+          : Promise.resolve(null);
+        const [state, snapshot] = await Promise.all([
+          api.runtimeState(sessionId),
+          snapshotPromise,
+        ]);
         if (cancelled) return;
         setRuntime(state);
         setRunActive(Boolean(state.activeOperation));
         setStatus(state.activeOperation ? "running" : "ready");
-      } catch (cause) {
-        failConnection(cause);
-        return;
-      }
 
-      let after = 0;
-      if (capabilities.supportedCommands.includes("get_messages")) {
-        try {
+        if (snapshot) {
           // Native truth for history; the events captured while the snapshot was
           // taken are applied in order, so `after` continues exactly where it ends.
-          const snapshot = await snapshotOf(sessionId);
-          if (cancelled) return;
           restoreSnapshotStatus(snapshot);
           setRows((previous) => {
             const restored = rowsFromMessages(snapshot.messages);
@@ -1497,10 +1499,10 @@ export default function App() {
           lastSeq.current = snapshot.lastSeq;
           after = snapshot.lastSeq;
           setSeen(snapshot.events.length);
-        } catch (cause) {
-          failConnection(cause);
-          return;
         }
+      } catch (cause) {
+        failConnection(cause);
+        return;
       }
       if (cancelled) return;
       connect(after);
