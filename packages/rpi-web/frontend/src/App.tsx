@@ -35,6 +35,7 @@ import {
   Loader2,
   LogOut,
   Moon,
+  Paperclip,
   PanelLeft,
   Play,
   RefreshCw,
@@ -84,6 +85,7 @@ import {
   Modal,
   PromptDialog,
   ProjectDialog,
+  ProjectRenameDialog,
   ProjectSidebar,
   RenameDialog,
   TagsDialog,
@@ -104,6 +106,8 @@ import {
   todoItems,
   editInfo,
   isMarkdownText,
+  imageBlocksOf,
+  type ImageBlock,
   type PlanInfo,
   type TodoItem,
   type EditInfo,
@@ -113,6 +117,13 @@ import {
   textOf,
   type Row,
 } from "./transcript";
+
+type Attachment = {
+  name: string;
+  path: string;
+  size: number;
+  previewUrl?: string;
+};
 
 const EVENT_TYPES = [
   "ready",
@@ -345,8 +356,7 @@ function normalizeRuntimeStats(value: unknown): RuntimeState["stats"] {
       "totalTokens",
       "operationCount",
     ].some((key) => key in candidate);
-  if (looksLikeStats(record))
-    return record as unknown as RuntimeState["stats"];
+  if (looksLikeStats(record)) return record as unknown as RuntimeState["stats"];
   for (const key of ["stats", "usage", "data"]) {
     const nested = record[key];
     if (nested && typeof nested === "object" && !Array.isArray(nested)) {
@@ -388,7 +398,11 @@ function inputTokenCount(stats: RuntimeState["stats"]) {
 }
 
 function outputTokenCount(stats: RuntimeState["stats"]) {
-  const output = statNumber(stats, ["outputTokens", "output", "completionTokens"]);
+  const output = statNumber(stats, [
+    "outputTokens",
+    "output",
+    "completionTokens",
+  ]);
   if (output != null) return output;
   const total = statNumber(stats, ["totalTokens"]);
   const input = inputTokenCount(stats);
@@ -417,7 +431,10 @@ function costTotal(stats: RuntimeState["stats"]) {
 
 function cacheHitRatio(stats: RuntimeState["stats"]): number | null {
   if (!stats) return null;
-  if (typeof stats.cacheHitRatio === "number" && Number.isFinite(stats.cacheHitRatio)) {
+  if (
+    typeof stats.cacheHitRatio === "number" &&
+    Number.isFinite(stats.cacheHitRatio)
+  ) {
     return Math.max(0, Math.min(1, stats.cacheHitRatio));
   }
   const cached = cachedTokenCount(stats) ?? 0;
@@ -434,10 +451,15 @@ function latestMessageStats(messages: unknown[]): RuntimeState["stats"] {
     if (roleOf(message) !== "assistant") continue;
     const usage = (message as Record<string, unknown>).usage;
     const input = usageNumber(usage, ["input", "inputTokens", "promptTokens"]);
-    const output = usageNumber(usage, ["output", "outputTokens", "completionTokens"]);
+    const output = usageNumber(usage, [
+      "output",
+      "outputTokens",
+      "completionTokens",
+    ]);
     const cached = usageNumber(usage, ["cacheRead", "cachedTokens"]);
     const written = usageNumber(usage, ["cacheWrite"]);
-    const total = usageNumber(usage, ["totalTokens"]) || input + output + cached + written;
+    const total =
+      usageNumber(usage, ["totalTokens"]) || input + output + cached + written;
     if (total <= 0) continue;
     const cost = (usage as Record<string, unknown>).cost;
     return {
@@ -484,6 +506,8 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsRoot, setProjectsRoot] = useState("");
   const [projectDialog, setProjectDialog] = useState(false);
+  const [projectRenameTarget, setProjectRenameTarget] =
+    useState<Project | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [tagsTarget, setTagsTarget] = useState<SessionSummary | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -549,7 +573,8 @@ export default function App() {
     (totalTokenCount(runtime?.stats) ?? 0) <= 0 &&
     (inputTokenCount(runtime?.stats) ?? 0) <= 0 &&
     (outputTokenCount(runtime?.stats) ?? 0) <= 0 &&
-    messageStats?.sessionId === sessionId && !!messageStats.stats;
+    messageStats?.sessionId === sessionId &&
+    !!messageStats.stats;
   const displayStats = usingMessageStats
     ? { ...runtime?.stats, ...messageStats!.stats! }
     : runtime?.stats;
@@ -574,6 +599,9 @@ export default function App() {
   const [queueKind, setQueueKind] = useState("followUp");
   const [queueEditId, setQueueEditId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState("connecting");
   const [loadingSession, setLoadingSession] = useState(false);
   const [runActive, setRunActive] = useState(false);
@@ -608,6 +636,14 @@ export default function App() {
     null,
   );
 
+  useEffect(() => {
+    setAttachments((current) => {
+      current.forEach((file) => {
+        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+      });
+      return [];
+    });
+  }, [sessionId]);
   function requestText(request: TextRequest) {
     return new Promise<string | null>((resolve) => {
       textRequestResolver.current = resolve;
@@ -680,9 +716,11 @@ export default function App() {
   const activeSession = sidebarSessions.find(
     (entry) => entry.sessionId === sessionId,
   );
-  const activeSessionRunning = ["running", "starting", "awaiting_input"].includes(
-    activeSession?.status ?? "",
-  );
+  const activeSessionRunning = [
+    "running",
+    "starting",
+    "awaiting_input",
+  ].includes(activeSession?.status ?? "");
   const slashCommands = useMemo<SlashCommand[]>(() => {
     const model = models.find(
       (entry) =>
@@ -930,7 +968,8 @@ export default function App() {
           if (roleOf(event.message) !== "assistant") break;
           if (event.type === "message_end") {
             const stats = latestMessageStats([event.message]);
-            if (stats) setMessageStats({ sessionId: activeSessionRef.current, stats });
+            if (stats)
+              setMessageStats({ sessionId: activeSessionRef.current, stats });
           }
           const prefix = currentAssistant.current ?? `restored-${seq}`;
           currentAssistant.current = prefix;
@@ -979,6 +1018,7 @@ export default function App() {
               name: String(event.toolName ?? "tool"),
               args: event.args,
               result: event.partialResult,
+              images: imageBlocksOf(event.partialResult),
               timing: toolTiming(event.webTiming),
               status: "running",
             }),
@@ -989,6 +1029,7 @@ export default function App() {
             upsertTool(previous, String(event.toolCallId ?? seq), {
               name: String(event.toolName ?? "tool"),
               result: event.result,
+              images: imageBlocksOf(event.result),
               timing: toolTiming(event.webTiming),
               status: event.isError ? "error" : "done",
             }),
@@ -1318,7 +1359,10 @@ export default function App() {
     const restoreSnapshotStatus = (
       snapshot: Awaited<ReturnType<typeof snapshotOf>>,
     ) => {
-      setMessageStats({ sessionId, stats: latestMessageStats(snapshot.messages) });
+      setMessageStats({
+        sessionId,
+        stats: latestMessageStats(snapshot.messages),
+      });
       if (snapshot.status) {
         setStatus(snapshot.status);
         setRunActive(["running", "awaiting_input"].includes(snapshot.status));
@@ -1363,6 +1407,7 @@ export default function App() {
             (row) =>
               row.kind === "note" &&
               row.id !== "retry-note" &&
+              row.translation?.key !== "restoredRun" &&
               !restoredIds.has(row.id),
           ),
         ]);
@@ -1481,7 +1526,10 @@ export default function App() {
             return [
               ...restored,
               ...previous.filter(
-                (row) => row.kind === "note" && !ids.has(row.id),
+                (row) =>
+                  row.kind === "note" &&
+                  row.translation?.key !== "restoredRun" &&
+                  !ids.has(row.id),
               ),
             ];
           });
@@ -1517,9 +1565,7 @@ export default function App() {
           .catch(() => {});
       }
       if (
-        capabilities.supportedCommands.includes(
-          "get_available_thinking_levels",
-        )
+        capabilities.supportedCommands.includes("get_available_thinking_levels")
       ) {
         void api
           .thinkingLevels(sessionId)
@@ -1528,7 +1574,6 @@ export default function App() {
           })
           .catch(() => {});
       }
-
     })();
 
     return () => {
@@ -1596,7 +1641,8 @@ export default function App() {
       }
       if (supported.has("get_stats")) {
         jobs.push(
-          api.stats(id)
+          api
+            .stats(id)
             .then((rawStats) => {
               if (!current()) return;
               const stats = normalizeRuntimeStats(rawStats);
@@ -1650,7 +1696,7 @@ export default function App() {
     return [
       {
         kind: "note" as const,
-        id: `settled-${String(record.runId ?? record.id)}`,
+        id: "restored-settlement",
         text: `Run ${outcome} · restored from session history`,
         translation: {
           key: "restoredRun" as const,
@@ -1724,13 +1770,15 @@ export default function App() {
     setHistoryHasMore(Boolean(value?.hasMore));
     if (value) {
       setRows((previous) => {
-        const existing = new Set(previous.map((row) => row.id));
-        return [
-          ...previous,
-          ...persistedSettlementRows(value).filter(
-            (row) => !existing.has(row.id),
-          ),
-        ];
+        if (
+          previous.some(
+            (row) =>
+              row.kind === "note" && row.translation?.key === "restoredRun",
+          )
+        ) {
+          return previous;
+        }
+        return [...previous, ...persistedSettlementRows(value)];
       });
     }
   }
@@ -1942,21 +1990,68 @@ export default function App() {
     }
   }
 
+  async function uploadFiles(files: FileList | null) {
+    if (!files || !projectId || !sessionId) return;
+    setUploading(true);
+    setError("");
+    try {
+      const uploaded: Attachment[] = [];
+      for (const file of Array.from(files)) {
+        const result = await api.upload(projectId, file);
+        uploaded.push({
+          ...result,
+          previewUrl: file.type.startsWith("image/")
+            ? URL.createObjectURL(file)
+            : undefined,
+        });
+      }
+      setAttachments((current) => [...current, ...uploaded]);
+    } catch (cause) {
+      setError(`${t("uploadFailed")}: ${errorText(cause)}`);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function removeAttachment(path: string) {
+    setAttachments((current) => {
+      const removed = current.find((file) => file.path === path);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return current.filter((file) => file.path !== path);
+    });
+  }
+
   async function submit(event?: FormEvent) {
     event?.preventDefault();
     const message = draft.trim();
-    if (!message || !sessionId || sendingRef.current) return;
-    if (message.startsWith("/")) {
+    if (
+      (!message && attachments.length === 0) ||
+      !sessionId ||
+      sendingRef.current
+    )
+      return;
+    if (message.startsWith("/") && attachments.length === 0) {
       void runSlash(message);
       return;
     }
     if (!supported.has("prompt")) return;
+    const attachedText = attachments.length
+      ? `\n\n${t("attachedFiles")}:\n${attachments.map((file) => `- ${file.path}`).join("\n")}`
+      : "";
+    const submissionMessage = `${message}${attachedText}`.trim();
     const targetSession = sessionId;
     const navigation = navigationRevision.current;
     const submission = ++sendingRevision.current;
     const wasBusy = busy;
     const editingQueueId = queueEditId;
     const shouldQueue = wasBusy || Boolean(editingQueueId);
+    const clearAttachments = () => {
+      attachments.forEach((file) => {
+        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+      });
+      setAttachments([]);
+    };
     sendingRef.current = true;
     setSending(true);
     setDraft("");
@@ -1967,7 +2062,7 @@ export default function App() {
     if (!shouldQueue)
       setRows((previous) => [
         ...previous,
-        { kind: "text", id: key, role: "user", text: message },
+        { kind: "text", id: key, role: "user", text: submissionMessage },
       ]);
     if (!shouldQueue) {
       setStatus("running");
@@ -1976,15 +2071,20 @@ export default function App() {
     try {
       if (shouldQueue) {
         if (!supported.has("queue_message")) throw new Error(t("runBusy"));
-        if (editingQueueId) await api.cancelQueued(targetSession, editingQueueId);
-        const queued = await api.queueMessage(targetSession, message, queueKind);
+        if (editingQueueId)
+          await api.cancelQueued(targetSession, editingQueueId);
+        const queued = await api.queueMessage(
+          targetSession,
+          submissionMessage,
+          queueKind,
+        );
         if (navigation === navigationRevision.current) {
           setQueueItems((previous) => [
             ...previous.filter((item) => item.entryId !== editingQueueId),
             {
               entryId: queued.entryId,
               queue: queued.queue || queueKind,
-              text: message,
+              text: submissionMessage,
               status: "queued",
             },
           ]);
@@ -1992,8 +2092,12 @@ export default function App() {
           showQueueNotice(message);
           void refreshDiagnostics(targetSession);
         }
+        clearAttachments();
       } else {
-        await commandData(targetSession, "prompt", { message });
+        await commandData(targetSession, "prompt", {
+          message: submissionMessage,
+        });
+        clearAttachments();
       }
     } catch (cause) {
       if (!draftBySession.current.get(targetSession))
@@ -2261,9 +2365,7 @@ export default function App() {
 
   function isEditableQueueItem(item: QueueItem) {
     return (
-      !item.status ||
-      item.status === "queued" ||
-      item.status === "pending"
+      !item.status || item.status === "queued" || item.status === "pending"
     );
   }
 
@@ -2292,9 +2394,7 @@ export default function App() {
     const navigation = navigationRevision.current;
     const previous = queueItems;
     if (queueEditId === entryId) cancelQueueEdit();
-    setQueueItems((items) =>
-      items.filter((item) => item.entryId !== entryId),
-    );
+    setQueueItems((items) => items.filter((item) => item.entryId !== entryId));
     try {
       await api.cancelQueued(sessionId, entryId);
       if (navigation !== navigationRevision.current) return;
@@ -2335,7 +2435,9 @@ export default function App() {
     const title = await requestText({
       kind: "prompt",
       title: t("cloneName"),
-      defaultValue: t("cloneOf", { title: current?.title ?? sessionId.slice(0, 8) }),
+      defaultValue: t("cloneOf", {
+        title: current?.title ?? sessionId.slice(0, 8),
+      }),
     });
     if (title === null) return;
     try {
@@ -2633,6 +2735,24 @@ export default function App() {
           }}
         />
       )}
+      {projectRenameTarget && (
+        <ProjectRenameDialog
+          language={language}
+          project={projectRenameTarget}
+          onClose={() => setProjectRenameTarget(null)}
+          onSave={async (name) => {
+            const result = await api.renameProject(
+              projectRenameTarget.id,
+              name,
+            );
+            setProjects((previous) =>
+              previous.map((project) =>
+                project.id === result.project.id ? result.project : project,
+              ),
+            );
+          }}
+        />
+      )}
       {renameTarget && (
         <RenameDialog
           language={language}
@@ -2735,6 +2855,7 @@ export default function App() {
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
+              onRenameProject={setProjectRenameTarget}
               onEditTags={setTagsTarget}
               onMetadata={updateSessionMetadata}
             />
@@ -2872,13 +2993,14 @@ export default function App() {
             </button>
           </div>
           <div className="toolbar-actions">
-            <span
-              className={`connection ${status === "error" ? "offline" : ""}`}
-              title={connectionLabel}
-            >
-              <span className="status-dot" /> {" "}
-              {connectionLabel}
-            </span>
+            {!activeSessionRunning && (
+              <span
+                className={`connection ${status === "error" ? "offline" : ""}`}
+                title={connectionLabel}
+              >
+                <span className="status-dot" /> {connectionLabel}
+              </span>
+            )}
             {actions.has("fork") && (
               <button
                 disabled={!sessionId}
@@ -3216,57 +3338,112 @@ export default function App() {
                   ))}
                 </div>
               )}
-              {queueOpen && pendingQueueItems.length > 0 && (
+              {pendingQueueItems.length > 0 && (
                 <div
-                  className="composer-queue-panel"
+                  className={`composer-queue-panel${queueOpen ? " is-open" : ""}`}
                   aria-label={t("queue")}
                 >
-                  <div className="composer-queue-heading">
+                  <button
+                    type="button"
+                    className="composer-queue-heading"
+                    aria-expanded={queueOpen}
+                    onClick={() => setQueueOpen((value) => !value)}
+                  >
                     <span>
-                      <ListTodo size={13} /> {t("queue")}
+                      <ListTodo size={13} />
+                      <strong>{t("queue")}</strong>
+                      <em>{pendingQueueItems.length}</em>
+                      {!queueOpen && pendingQueueItems[0]?.text && (
+                        <span className="composer-queue-preview">
+                          {pendingQueueItems[0].text}
+                        </span>
+                      )}
                     </span>
-                    <button
-                      type="button"
-                      className="icon-button"
-                      aria-label={t("closeQueue")}
-                      title={t("closeQueue")}
-                      onClick={() => setQueueOpen(false)}
-                    >
-                      <X size={13} />
-                    </button>
-                  </div>
-                  <div className="composer-queue-list">
-                    {pendingQueueItems.map((item) => (
-                      <div className="composer-queue-item" key={item.entryId}>
-                        <span>{item.text || t("nonTextMessage")}</span>
-                        {isEditableQueueItem(item) && (
-                          <span className="queue-item-actions">
-                            <button
-                              type="button"
-                              className="icon-button"
-                              aria-label={t("editQueued")}
-                              title={t("editQueued")}
-                              onClick={() => editQueued(item)}
-                            >
-                              <SquarePen size={13} />
-                            </button>
-                            <button
-                              type="button"
-                              className="icon-button"
-                              aria-label={t("cancelQueued")}
-                              title={t("cancelQueued")}
-                              onClick={() => void cancelQueued(item.entryId)}
-                            >
-                              <X size={13} />
-                            </button>
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                    <ChevronDown size={14} aria-hidden="true" />
+                  </button>
+                  {queueOpen && (
+                    <div className="composer-queue-list">
+                      {pendingQueueItems.map((item) => (
+                        <div className="composer-queue-item" key={item.entryId}>
+                          <span>{item.text || t("nonTextMessage")}</span>
+                          {isEditableQueueItem(item) && (
+                            <span className="queue-item-actions">
+                              <button
+                                type="button"
+                                className="icon-button"
+                                aria-label={t("editQueued")}
+                                title={t("editQueued")}
+                                onClick={() => editQueued(item)}
+                              >
+                                <SquarePen size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="icon-button"
+                                aria-label={t("cancelQueued")}
+                                title={t("cancelQueued")}
+                                onClick={() => void cancelQueued(item.entryId)}
+                              >
+                                <X size={13} />
+                              </button>
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
               <div className="composer">
+                <ProjectContext
+                  project={project}
+                  tick={settleTick}
+                  language={language}
+                  loadGit={actions.has("git_diff")}
+                  onOpen={() => {
+                    setSidebar(true);
+                    requestAnimationFrame(() =>
+                      document
+                        .querySelector<HTMLElement>(
+                          ".selected-project .project-name",
+                        )
+                        ?.focus(),
+                    );
+                  }}
+                />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  hidden
+                  onChange={(event) => void uploadFiles(event.target.files)}
+                />
+                {attachments.length > 0 && (
+                  <div
+                    className="composer-attachments"
+                    aria-label={t("attachedFiles")}
+                  >
+                    {attachments.map((file) => (
+                      <div className="composer-attachment" key={file.path}>
+                        {file.previewUrl ? (
+                          <img src={file.previewUrl} alt="" />
+                        ) : (
+                          <FileText size={13} />
+                        )}
+                        <span title={file.path}>{file.name}</span>
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label={`${t("removeAttachment")}: ${file.name}`}
+                          title={t("removeAttachment")}
+                          onClick={() => removeAttachment(file.path)}
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   ref={composerInputRef}
                   value={draft}
@@ -3288,35 +3465,58 @@ export default function App() {
                   placeholder={t("sendPlaceholder")}
                   disabled={!sessionId}
                   aria-label={t("sendPlaceholder")}
+                  aria-keyshortcuts="Shift+Enter"
                 />
-                <ProjectContext project={project} tick={settleTick} language={language}
-                  loadGit={actions.has("git_diff")} onOpen={() => {
-                    setSidebar(true);
-                    requestAnimationFrame(() => document.querySelector<HTMLElement>(".selected-project .project-name")?.focus());
-                  }} />
                 <div className="composer-footer">
                   <div className="composer-options">
-
-                    {supported.has("set_model") && (
-                      <ModelPicker
-                        language={language}
-                        runtime={runtime}
-                        models={models}
-                        supported={supported}
-                        pending={modelPending}
-                        onSelect={(entry) => void selectModel(entry)}
-                      />
-                    )}
-                    {supported.has("set_thinking_level") && (
-                      <ThinkingPicker
-                        language={language}
-                        runtime={runtime}
-                        levels={levels}
-                        supported={supported}
-                        pending={thinkingPending}
-                        onSelect={(level) => void selectThinkingLevel(level)}
-                      />
-                    )}
+                    <button
+                      type="button"
+                      className="composer-attach"
+                      aria-label={t("attachFiles")}
+                      title={t("attachFiles")}
+                      disabled={!sessionId || !projectId || uploading}
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      {uploading ? (
+                        <Loader2 className="spin" size={14} />
+                      ) : (
+                        <Paperclip size={14} />
+                      )}
+                      <span className="sr-only">
+                        {uploading ? t("uploading") : t("attachFiles")}
+                      </span>
+                    </button>
+                    <div className="composer-runtime-controls">
+                      {supported.has("set_model") && (
+                        <ModelPicker
+                          language={language}
+                          runtime={runtime}
+                          models={models}
+                          supported={supported}
+                          pending={modelPending}
+                          onSelect={(entry) => void selectModel(entry)}
+                        />
+                      )}
+                      {supported.has("set_thinking_level") && (
+                        <ThinkingPicker
+                          language={language}
+                          runtime={runtime}
+                          levels={levels}
+                          supported={supported}
+                          pending={thinkingPending}
+                          onSelect={(level) => void selectThinkingLevel(level)}
+                        />
+                      )}
+                    </div>
+                    <span
+                      className="composer-shortcut-hint"
+                      title={t("shiftEnterNewline")}
+                    >
+                      <kbd>Shift</kbd>
+                      <span aria-hidden="true">+</span>
+                      <kbd>Enter</kbd>
+                      <span>{t("shiftEnterNewline")}</span>
+                    </span>
                     {queueEditId && (
                       <button
                         type="button"
@@ -3355,7 +3555,9 @@ export default function App() {
                         </button>
                       )}
                     <button
-                      type={busy && supported.has("abort") ? "button" : "submit"}
+                      type={
+                        busy && supported.has("abort") ? "button" : "submit"
+                      }
                       className={`send-button${busy && supported.has("abort") ? " composer-action-stop" : ""}`}
                       aria-label={
                         busy && supported.has("abort") ? t("abort") : t("send")
@@ -3366,7 +3568,9 @@ export default function App() {
                       disabled={
                         busy && supported.has("abort")
                           ? false
-                          : !draft.trim() || !sessionId || sending
+                          : (!draft.trim() && attachments.length === 0) ||
+                            !sessionId ||
+                            sending
                       }
                       onClick={
                         busy && supported.has("abort")
@@ -3435,7 +3639,9 @@ export default function App() {
                           : "—"}
                       </strong>
                     </span>
-                    <span className="composer-metrics-more">{t("details")}</span>
+                    <span className="composer-metrics-more">
+                      {t("details")}
+                    </span>
                   </summary>
                   <div className="composer-metrics-detail">
                     <span
@@ -3463,39 +3669,48 @@ export default function App() {
                       </strong>
                     </span>
 
-
-                  <span
-                    className="composer-metric"
-                    title={t("toolCalls")}
-                    aria-label={`${t("toolCalls")}: ${rows.filter((row) => row.kind === "tool").length}`}
-                  >
-                    <Wrench size={12} aria-hidden="true" />
-                    <strong>{rows.filter((row) => row.kind === "tool").length}</strong>
-                  </span>
-                  <span
-                    className="composer-metric"
-                    title={t("operations")}
-                    aria-label={`${t("operations")}: ${runtime?.stats?.operationCount ?? historyData?.total ?? 0}`}
-                  >
-                    <History size={12} aria-hidden="true" />
-                    <strong>{runtime?.stats?.operationCount ?? historyData?.total ?? 0}</strong>
-                  </span>
-                  <span
-                    className="composer-metric"
-                    title={t("cost")}
-                    aria-label={`${t("cost")}: ${costTotal(displayStats) == null ? "—" : `$${costTotal(displayStats)!.toFixed(4)}`}`}
-                  >
-                    <CircleDollarSign size={12} aria-hidden="true" />
-                    <strong>{costTotal(displayStats) == null ? "—" : `$${costTotal(displayStats)!.toFixed(4)}`}</strong>
-                  </span>
-                  <span
-                    className="composer-metric"
-                    title={t("eventsObserved")}
-                    aria-label={`${t("eventsObserved")}: ${seen}`}
-                  >
-                    <Activity size={12} aria-hidden="true" />
-                    <strong>{seen}</strong>
-                  </span>
+                    <span
+                      className="composer-metric"
+                      title={t("toolCalls")}
+                      aria-label={`${t("toolCalls")}: ${rows.filter((row) => row.kind === "tool").length}`}
+                    >
+                      <Wrench size={12} aria-hidden="true" />
+                      <strong>
+                        {rows.filter((row) => row.kind === "tool").length}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={t("operations")}
+                      aria-label={`${t("operations")}: ${runtime?.stats?.operationCount ?? historyData?.total ?? 0}`}
+                    >
+                      <History size={12} aria-hidden="true" />
+                      <strong>
+                        {runtime?.stats?.operationCount ??
+                          historyData?.total ??
+                          0}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={t("cost")}
+                      aria-label={`${t("cost")}: ${costTotal(displayStats) == null ? "—" : `$${costTotal(displayStats)!.toFixed(4)}`}`}
+                    >
+                      <CircleDollarSign size={12} aria-hidden="true" />
+                      <strong>
+                        {costTotal(displayStats) == null
+                          ? "—"
+                          : `$${costTotal(displayStats)!.toFixed(4)}`}
+                      </strong>
+                    </span>
+                    <span
+                      className="composer-metric"
+                      title={t("eventsObserved")}
+                      aria-label={`${t("eventsObserved")}: ${seen}`}
+                    >
+                      <Activity size={12} aria-hidden="true" />
+                      <strong>{seen}</strong>
+                    </span>
                   </div>
                 </details>
               </div>
@@ -3649,9 +3864,7 @@ export default function App() {
                       ([name, value]) => {
                         const maximum = Math.max(
                           1,
-                          ...Object.values(
-                            displayStats.operationCounts ?? {},
-                          ),
+                          ...Object.values(displayStats.operationCounts ?? {}),
                         );
                         return (
                           <div className="stats-bar-row" key={name}>
@@ -3796,7 +4009,9 @@ export default function App() {
                         </button>
                       )}
                       {supported.has("clear_queue") &&
-                        queueItems.some((item) => isEditableQueueItem(item)) && (
+                        queueItems.some((item) =>
+                          isEditableQueueItem(item),
+                        ) && (
                           <button
                             type="button"
                             className="text-button"
@@ -4260,7 +4475,8 @@ function Dropdown({
       });
     });
     return () => cancelAnimationFrame(frame);
-  }, [align, open]);  function toggle() {
+  }, [align, open]);
+  function toggle() {
     if (!open && anchor.current) {
       const box = anchor.current.getBoundingClientRect();
       const width = Math.max(box.width, 224);
@@ -4488,15 +4704,45 @@ function toolIcon(name: string) {
   }
 }
 
+function ImagePreview({ image }: { image: ImageBlock }) {
+  const source =
+    image.url ??
+    (image.data
+      ? image.data.startsWith("data:")
+        ? image.data
+        : `data:${image.mimeType || "image/png"};base64,${image.data}`
+      : "");
+  const isSafeImage =
+    source.startsWith("data:image/") ||
+    source.startsWith("/") ||
+    source.startsWith("https://") ||
+    source.startsWith("http://");
+  if (
+    !source ||
+    !isSafeImage ||
+    (image.mimeType && !image.mimeType.startsWith("image/"))
+  )
+    return null;
+  return (
+    <figure className="transcript-image">
+      <img src={source} alt={image.alt ?? ""} loading="lazy" />
+    </figure>
+  );
+}
+
 const RowView = memo(function RowView({
   row,
   language,
-}: { row: Row; language: Language }) {
+}: {
+  row: Row;
+  language: Language;
+}) {
   const t = (key: MessageKey) => translate(language, key);
   if (row.kind === "note") {
     const values = row.translation?.values;
     const isRunStatus =
-      row.translation?.key === "liveRun" || row.translation?.key === "restoredRun";
+      row.translation?.key === "liveRun" ||
+      row.translation?.key === "restoredRun";
     return (
       <p className={`transcript-note muted${isRunStatus ? " run-status" : ""}`}>
         {row.translation
@@ -4520,6 +4766,9 @@ const RowView = memo(function RowView({
     );
   }
 
+  if (row.kind === "image") {
+    return <ImagePreview image={row.image} />;
+  }
   if (row.kind === "thinking") {
     return (
       <details className="thinking-row">
@@ -4564,13 +4813,20 @@ const RowView = memo(function RowView({
           </span>
         </summary>
         <div className="tool-detail">
+          {row.images?.map((image, index) => (
+            <ImagePreview key={`${row.id}-image-${index}`} image={image} />
+          ))}
           {showArgs ? (
             <>
               <h4>{t("input")}</h4>
               <pre>{safeJson(row.args)}</pre>
             </>
           ) : readResult ? (
-            <ReadCode path={readPath} text={readResultText ?? ""} language={language} />
+            <ReadCode
+              path={readPath}
+              text={readResultText ?? ""}
+              language={language}
+            />
           ) : resultText !== null ? (
             isMarkdownText(resultText) ? (
               <MarkdownBody text={resultText} language={language} />

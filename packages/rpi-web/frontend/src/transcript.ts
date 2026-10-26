@@ -84,6 +84,37 @@ export function eventsAfterSnapshot(
   );
 }
 
+export interface ImageBlock {
+  data?: string;
+  mimeType?: string;
+  url?: string;
+  alt?: string;
+}
+
+export function imageBlocksOf(value: unknown): ImageBlock[] {
+  if (!value || typeof value !== "object") return [];
+  const content = (value as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return [];
+  const images: ImageBlock[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const item = block as Record<string, unknown>;
+    if (item.type === "image_url" && item.image_url && typeof item.image_url === "object") {
+      const url = (item.image_url as Record<string, unknown>).url;
+      if (typeof url === "string") images.push({ url });
+      continue;
+    }
+    if (item.type !== "image") continue;
+    const data = typeof item.data === "string" ? item.data : undefined;
+    if (data) images.push({
+      data,
+      mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+      alt: typeof item.alt === "string" ? item.alt : undefined,
+    });
+  }
+  return images;
+}
+
 export interface ToolTiming {
   elapsedMs: number;
   running: boolean;
@@ -410,6 +441,7 @@ export type ToolStatus = "pending" | "running" | "done" | "error";
 
 export type Row =
   | { kind: "text"; id: string; role: "user" | "assistant"; text: string }
+  | { kind: "image"; id: string; role: "user" | "assistant"; image: ImageBlock }
   | { kind: "thinking"; id: string; text: string }
   | {
       kind: "tool";
@@ -417,6 +449,7 @@ export type Row =
       name: string;
       args?: unknown;
       result?: unknown;
+      images?: ImageBlock[];
       status: ToolStatus;
       timing?: ToolTiming;
     }
@@ -475,6 +508,9 @@ export function rowsFromAssistant(
           text: block.text,
         });
       }
+    } else if (block.type === "image") {
+      const image = imageBlocksOf({ content: [block] })[0];
+      if (image) rows.push({ kind: "image", id: `${prefix}:b${index}`, role: "assistant", image });
     } else if (block.type === "thinking") {
       const text =
         typeof block.thinking === "string"
@@ -551,6 +587,7 @@ export function rowsFromMessages(raw: unknown[]): Row[] {
           rows[existing] = {
             ...row,
             result: resultOf(message),
+            images: imageBlocksOf(message),
             status,
             timing: toolTiming(message.webTiming) ?? row.timing,
           };
@@ -562,6 +599,7 @@ export function rowsFromMessages(raw: unknown[]): Row[] {
         id,
         name: String(message.toolName ?? "tool"),
         result: resultOf(message),
+        images: imageBlocksOf(message),
         status,
         timing: toolTiming(message.webTiming),
       });
@@ -611,6 +649,7 @@ export function prependRows(older: Row[], current: Row[]): Row[] {
       name: row.name !== "tool" ? row.name : candidate.name,
       args: row.args ?? candidate.args,
       result: row.result ?? candidate.result,
+      images: row.images ?? candidate.images,
       timing: row.timing ?? candidate.timing,
       status:
         row.status === "error" || row.status === "done"
@@ -629,6 +668,7 @@ export function upsertTool(
     name?: string;
     args?: unknown;
     result?: unknown;
+    images?: ImageBlock[];
     status?: ToolStatus;
     timing?: ToolTiming;
   },
@@ -646,6 +686,7 @@ export function upsertTool(
         name: patch.name ?? "tool",
         args: patch.args,
         result: patch.result,
+        images: patch.images,
         status: patch.status ?? "running",
         timing: patch.timing,
       },
@@ -659,6 +700,7 @@ export function upsertTool(
       name: patch.name ?? row.name,
       args: patch.args ?? row.args,
       result: patch.result ?? row.result,
+      images: patch.images ?? row.images,
       status: patch.status ?? row.status,
       timing: patch.timing ?? row.timing,
     };

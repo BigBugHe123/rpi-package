@@ -30,9 +30,13 @@ impl Projects {
         let mut entries = configured;
         for item in &saved {
             if let Ok(mut project) = Project::new(&item.path) {
-                if project.root.starts_with(&root) && !entries.iter().any(|p| p.id == project.id) {
-                    project.name = item.name.clone();
-                    entries.push(project);
+                if project.root.starts_with(&root) {
+                    if let Some(existing) = entries.iter_mut().find(|p| p.id == project.id) {
+                        existing.name = item.name.clone();
+                    } else {
+                        project.name = item.name.clone();
+                        entries.push(project);
+                    }
                 }
             }
         }
@@ -108,6 +112,33 @@ impl Projects {
         Ok(project)
     }
 
+    pub async fn rename(&mut self, id: &str, name: &str) -> Result<Project, String> {
+        let name = project_name(name)?;
+        let index = self
+            .entries
+            .iter()
+            .position(|project| project.id == id)
+            .ok_or_else(|| "project is not configured".to_string())?;
+        let previous_name = self.entries[index].name.clone();
+        let previous_saved = self.saved.clone();
+        let path = self.entries[index].root.clone();
+        self.entries[index].name = name.clone();
+        if let Some(saved) = self.saved.iter_mut().find(|item| item.path == path) {
+            saved.name = name;
+        } else {
+            self.saved.push(SavedProject {
+                name: self.entries[index].name.clone(),
+                path,
+            });
+        }
+        if let Err(error) = self.save() {
+            self.entries[index].name = previous_name;
+            self.saved = previous_saved;
+            return Err(error);
+        }
+        Ok(self.entries[index].clone())
+    }
+
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.file.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -178,6 +209,27 @@ mod tests {
         assert_eq!(loaded.entries[1].id, recovered.id);
         std::fs::write(&file, b"broken JSON").unwrap();
         assert!(Projects::load(Vec::new(), temp.join("projects"), file).is_err());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+    #[tokio::test]
+    async fn project_names_can_be_renamed_without_moving_the_directory() {
+        let temp =
+            std::env::temp_dir().join(format!("rpi-project-rename-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("projects");
+        let file = temp.join("projects.json");
+        let mut store = Projects::load(Vec::new(), root, file.clone()).unwrap();
+        let project = store.add("before", None, false).await.unwrap();
+        let renamed = store.rename(&project.id, "after").await.unwrap();
+        assert_eq!(renamed.name, "after");
+        assert_eq!(renamed.root, project.root);
+        let loaded = Projects::load(
+            vec![Project::new(&project.root).unwrap()],
+            temp.join("projects"),
+            file,
+        )
+        .unwrap();
+        assert_eq!(loaded.entries[0].name, "after");
+        assert_eq!(loaded.entries[0].root, project.root);
         std::fs::remove_dir_all(temp).unwrap();
     }
     #[tokio::test]

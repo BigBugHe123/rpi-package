@@ -1,6 +1,6 @@
 use crate::security::{self, Security};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     middleware::from_fn_with_state,
     response::{
@@ -21,8 +21,8 @@ use rpi_extcore::{
     reply::{IntoReply, ReplyKind, ServiceReply},
     service::{
         self, AuthRefreshRequest, BackendConfig, CreateProjectRequest, CreateSessionRequest,
-        FileQuery, ForkRequest, MetadataRequest, ProjectFoldersQuery, RenameRequest, Service,
-        SessionListQuery,
+        FileQuery, ForkRequest, MetadataRequest, ProjectFoldersQuery, RenameProjectRequest,
+        RenameRequest, Service, SessionListQuery,
     },
 };
 use serde::{de::DeserializeOwned, Deserialize};
@@ -213,7 +213,12 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/capabilities", get(capabilities))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route("/api/v1/project-folders", get(list_project_folders))
+        .route("/api/v1/projects/{id}/rename", post(rename_project))
         .route("/api/v1/projects/{id}/files", get(project_files))
+        .route(
+            "/api/v1/projects/{id}/upload",
+            post(upload_project_file).layer(DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
         .route("/api/v1/projects/{id}/file", get(project_file))
         .route("/api/v1/projects/{id}/git/status", get(project_status))
         .route("/api/v1/projects/{id}/git/diff", get(project_diff))
@@ -243,6 +248,46 @@ fn routes(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn upload_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> HttpReply {
+    let Some(field) = (match multipart.next_field().await {
+        Ok(field) => field,
+        Err(error) => {
+            return HttpReply(
+                (
+                    ReplyKind::InvalidInput,
+                    json!({"error": format!("invalid upload: {error}")}),
+                )
+                    .into_reply(),
+            );
+        }
+    }) else {
+        return HttpReply(
+            (ReplyKind::InvalidInput, json!({"error":"file is required"})).into_reply(),
+        );
+    };
+    let filename = field.file_name().unwrap_or("upload").to_string();
+    let bytes = match field.bytes().await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(error) => {
+            return HttpReply(
+                (
+                    ReplyKind::InvalidInput,
+                    json!({"error": format!("cannot read upload: {error}")}),
+                )
+                    .into_reply(),
+            );
+        }
+    };
+    HttpReply(
+        service::upload_project_file(&state.backend, id, filename, bytes)
+            .await
+            .into_reply(),
+    )
+}
 fn configured_password(config: &AppConfig) -> Option<String> {
     let (primary, legacy) = if config.service_name == "rpi-web" {
         ("RPI_WEB_PASSWORD", "RPI_HTTP_PASSWORD")
@@ -342,6 +387,19 @@ async fn create_project(
 ) -> axum::response::Response {
     HttpReply(
         service::create_project(&state.backend, request)
+            .await
+            .into_reply(),
+    )
+    .into_response()
+}
+
+async fn rename_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<RenameProjectRequest>,
+) -> axum::response::Response {
+    HttpReply(
+        service::rename_project(&state.backend, id, request)
             .await
             .into_reply(),
     )

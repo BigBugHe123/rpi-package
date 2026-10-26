@@ -64,6 +64,11 @@ export interface FileEntry {
   kind: "directory" | "file";
   size: number;
 }
+export interface UploadedFile {
+  name: string;
+  path: string;
+  size: number;
+}
 export interface ChangedFile {
   path: string;
   originalPath?: string | null;
@@ -237,7 +242,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "x-rpi-web": "1",
-      ...(init?.body ? { "content-type": "application/json" } : {}),
+      ...(init?.body && !(init.body instanceof FormData)
+        ? { "content-type": "application/json" }
+        : {}),
       ...init?.headers,
     },
   });
@@ -304,6 +311,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name, initGit, ...(path ? { path } : {}) }),
     }),
+  renameProject: (id: string, name: string) =>
+    request<{ project: Project }>(`/projects/${id}/rename`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
   sessionMetadata: (
     id: string,
     metadata: { pinned?: boolean; archived?: boolean; tags?: string[] },
@@ -325,6 +337,14 @@ export const api = {
     request<{ path: string; content: string }>(
       `/projects/${projectId}/file?${new URLSearchParams({ path })}`,
     ),
+  upload: (projectId: string, file: File) => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    return request<{ name: string; path: string; size: number }>(
+      `/projects/${projectId}/upload`,
+      { method: "POST", body },
+    );
+  },
   gitStatus: (projectId: string) => gitStatus(projectId),
   diff: (projectId: string, path: string, staged: boolean) =>
     request<{ path: string; patch: string }>(

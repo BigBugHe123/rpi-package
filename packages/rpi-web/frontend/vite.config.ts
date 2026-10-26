@@ -23,12 +23,12 @@ export default defineConfig({
   },
   server: {
     host: "0.0.0.0",
+    allowedHosts: true,
     port: 18088,
     strictPort: true,
-    allowedHosts: ["work.bigfisharc.cn"],
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8080",
+        target: "http://127.0.0.1:3031",
         changeOrigin: true,
         configure(proxy) {
           proxy.on("proxyReq", (request) => {

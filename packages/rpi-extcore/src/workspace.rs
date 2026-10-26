@@ -9,9 +9,11 @@ use std::{
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
+use uuid::Uuid;
 
 const FILE_LIMIT: u64 = 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 2 * 1024 * 1024;
+const UPLOAD_LIMIT: usize = 20 * 1024 * 1024;
 pub type Reply = crate::reply::ServiceResult;
 
 #[derive(Clone, Debug, Serialize)]
@@ -197,6 +199,38 @@ pub async fn child_directories(
     }
     folders.sort_by_key(|a| a.0.to_lowercase());
     Ok(folders)
+}
+
+pub async fn upload(project: &Project, filename: &str, bytes: &[u8]) -> Reply {
+    if bytes.len() > UPLOAD_LIMIT {
+        return Err(failure(
+            ReplyKind::LimitExceeded,
+            "uploads are limited to 20 MiB",
+        ));
+    }
+    if filename.contains(['/', '\\', '\0']) {
+        return Err(failure(ReplyKind::InvalidInput, "invalid upload filename"));
+    }
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+        .ok_or_else(|| failure(ReplyKind::InvalidInput, "invalid upload filename"))?;
+    let directory = project.root.join(".rpi").join("uploads");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|_| failure(ReplyKind::AccessDenied, "cannot create upload directory"))?;
+    let stored_name = format!("{}-{name}", Uuid::new_v4());
+    let path = directory.join(&stored_name);
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|_| failure(ReplyKind::AccessDenied, "cannot save upload"))?;
+    Ok(json!({
+        "name": name,
+        "path": format!(".rpi/uploads/{stored_name}"),
+        "size": bytes.len(),
+    }))
 }
 
 pub async fn file(project: &Project, relative: &str) -> Reply {
@@ -560,6 +594,26 @@ mod tests {
         assert!(file(&p, "alias.txt").await.is_err());
         assert!(files(&p, "config").await.is_err());
         assert!(file(&p, "config/access").await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uploads_are_saved_under_project_metadata_without_overwriting_names() {
+        let root = fixture();
+        let project = Project::new(&root).unwrap();
+        let first = upload(&project, "photo.png", b"one").await.unwrap();
+        let second = upload(&project, "photo.png", b"two").await.unwrap();
+        assert_ne!(first["path"], second["path"]);
+        assert_eq!(first["name"], "photo.png");
+        assert_eq!(
+            std::fs::read(root.join(first["path"].as_str().unwrap())).unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(root.join(second["path"].as_str().unwrap())).unwrap(),
+            b"two"
+        );
+        assert!(upload(&project, "../secret.txt", b"nope").await.is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

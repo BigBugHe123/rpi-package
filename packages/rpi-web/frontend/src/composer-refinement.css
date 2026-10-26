@@ -1,0 +1,371 @@
+/* Composer refinement: keep context, writing area, tools, and send action
+   visually separate instead of letting every control compete in one row. */
+.workspace .composer {
+  padding: 0 0 7px;
+  background: var(--surface);
+}
+.workspace .composer-workspace {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  padding: 7px 14px 8px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--soft) 48%, transparent);
+}
+.composer-context-line,
+.composer-runtime-meta {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.composer-context-line {
+  gap: 12px;
+}
+.workspace .composer-workspace-path {
+  flex: 1 1 auto;
+  width: auto;
+  padding: 3px 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+.workspace .composer-workspace-path:hover:not(:disabled) {
+  color: var(--text);
+  background: transparent;
+}
+.workspace .composer-workspace-meta {
+  width: auto;
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  gap: 5px;
+}
+.workspace .composer-workspace-branch,
+.workspace .composer-workspace-worktree {
+  max-width: 150px;
+  padding: 3px 2px;
+  font-size: 10px;
+}
+.composer-runtime-meta {
+  gap: 6px;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+.composer-runtime-meta > .dropdown-anchor {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(250px, 42vw);
+}
+.composer-runtime-meta > .dropdown-anchor > button {
+  min-height: 27px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 10.5px;
+}
+.composer-runtime-meta > .dropdown-anchor > button:hover:not(:disabled),
+.composer-runtime-meta > .dropdown-anchor > button[aria-expanded="true"] {
+  border-color: var(--text);
+  background: var(--hover);
+}
+.workspace .composer-attachments {
+  margin: 9px 14px 0;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+}
+.workspace .composer-attachment {
+  border-radius: 6px;
+  background: var(--surface);
+}
+.workspace .composer textarea {
+  min-height: 84px;
+  padding: 15px 16px 9px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.workspace .composer-footer {
+  margin: 0 10px;
+  padding: 7px 4px 2px;
+  border-top: 0;
+  gap: 8px;
+}
+.workspace .composer-options {
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+}
+.workspace .composer-options button {
+  min-height: 27px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.workspace .composer-options button:hover:not(:disabled),
+.workspace .composer-options .dropdown-anchor > button[aria-expanded="true"] {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--text);
+}
+.workspace .composer-options .composer-thinking {
+  text-transform: capitalize;
+}
+.workspace .composer-queue-editing {
+  min-height: 27px;
+  border-color: color-mix(in srgb, var(--blue-text) 30%, var(--line));
+  background: var(--blue-soft);
+}
+.workspace .composer-controls {
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.workspace .composer-controls .composer-queue-button {
+  width: 29px;
+  height: 29px;
+  min-height: 29px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+}
+.workspace .send-button {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+}
+.workspace .composer-metrics {
+  margin-top: 4px;
+  border-top: 0;
+  padding: 4px 14px 2px;
+}
+
+/* The pending queue lives directly above the composer and can be folded into a
+   single compact preview row. */
+.workspace .composer-queue-panel {
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--soft);
+}
+.workspace .composer-queue-heading {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px 0 13px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: left;
+}
+.workspace .composer-queue-heading:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.workspace .composer-queue-heading > span {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+.workspace .composer-queue-heading > span > strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.workspace .composer-queue-heading > span > em {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--blue-text);
+  font-size: 10px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+.workspace .composer-queue-preview {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace .composer-queue-heading > svg {
+  flex: 0 0 auto;
+  transition: transform 160ms ease;
+}
+.workspace .composer-queue-panel.is-open .composer-queue-heading > svg {
+  transform: rotate(180deg);
+}
+.workspace .composer-queue-panel:not(.is-open) .composer-queue-list {
+  display: none;
+}
+.workspace .composer-shortcut-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+.workspace .composer-shortcut-hint kbd {
+  padding: 2px 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
+}
+
+/* Keep footer controls as a single quiet line; the input/footer divider is
+   intentionally removed so Provider and Thinking stay visually attached to
+   the composer actions. */
+.workspace .composer-footer {
+  border-top: 0;
+}
+.workspace .composer-options {
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+.workspace .composer-options .composer-model,
+.workspace .composer-options .composer-thinking {
+  border-color: transparent;
+  background: transparent;
+}
+.workspace .composer-options .composer-model:hover:not(:disabled),
+.workspace .composer-options .composer-thinking:hover:not(:disabled),
+.workspace .composer-options .composer-model[aria-expanded="true"],
+.workspace .composer-options .composer-thinking[aria-expanded="true"] {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+}
+
+/* Separate attachment/footer actions from runtime selectors without bringing
+   back a filled control group. */
+.workspace .composer-runtime-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  margin-left: 2px;
+  border-left: 0;
+  padding-left: 0;
+}
+
+/* Keep the usage/token strip separate from provider and thinking controls. */
+.workspace .composer-metrics {
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+
+/* Keep the token footer compact; it is supporting information, not a second
+   toolbar. */
+.workspace .composer-metrics {
+  margin-top: 2px;
+  padding: 2px 12px 1px;
+  font-size: 9px;
+  line-height: 1.2;
+}
+.workspace .composer-metrics-summary {
+  min-height: 19px;
+  gap: 7px;
+}
+.workspace .composer-metrics-summary .composer-metric {
+  gap: 3px;
+  font-size: 9px;
+}
+.workspace .composer-metrics-summary .composer-metric > svg {
+  width: 10px;
+  height: 10px;
+}
+.workspace .composer-metrics-detail {
+  gap: 2px 10px;
+  padding-top: 2px;
+}
+
+@media (max-width: 767px) {
+  .workspace .composer-runtime-controls {
+    padding-left: 0;
+  }
+  .workspace .composer-workspace {
+    gap: 3px;
+    padding: 7px 12px 6px;
+  }
+  .composer-context-line {
+    flex-wrap: nowrap;
+    gap: 3px 8px;
+    overflow: hidden;
+  }
+  .workspace .composer-workspace-path {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+  }
+  .workspace .composer-workspace-meta {
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 48%;
+    justify-content: flex-end;
+    overflow: hidden;
+  }
+  .workspace .composer-workspace-branch {
+    max-width: 32vw;
+  }
+  .workspace .composer-workspace-worktree {
+    max-width: none;
+  }
+  .composer-runtime-meta {
+    width: 100%;
+    gap: 5px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .composer-runtime-meta::-webkit-scrollbar {
+    display: none;
+  }
+  .composer-runtime-meta > .dropdown-anchor {
+    max-width: min(220px, 58vw);
+  }
+  .workspace .composer textarea {
+    min-height: 92px;
+    padding: 13px 14px 8px;
+  }
+  .workspace .composer-footer {
+    margin: 0 8px;
+    padding-top: 6px;
+  }
+  .workspace .composer-options {
+    max-width: calc(100% - 42px);
+  }
+  .workspace .composer-options button {
+    font-size: 10px;
+    padding-inline: 7px;
+  }
+  .workspace .composer-options .composer-thinking {
+    max-width: 105px;
+  }
+  .workspace .composer-options .composer-thinking > span {
+    max-width: 62px;
+  }
+  .workspace .composer-metrics {
+    padding-inline: 12px;
+  }
+  .workspace .composer-shortcut-hint {
+    display: none;
+  }
+}

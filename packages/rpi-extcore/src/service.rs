@@ -336,6 +336,23 @@ pub async fn create_project(state: &Service, request: CreateProjectRequest) -> (
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RenameProjectRequest {
+    pub name: String,
+}
+
+pub async fn rename_project(
+    state: &Service,
+    id: String,
+    request: RenameProjectRequest,
+) -> (ReplyKind, Value) {
+    let mut projects = state.projects.write().await;
+    match projects.rename(&id, &request.name).await {
+        Ok(project) => (ReplyKind::Success, json!({"project": project})),
+        Err(error) => (ReplyKind::InvalidInput, json!({"error": error})),
+    }
+}
+
 async fn session_project(state: &Service, id: &str) -> Result<Project, String> {
     let registry = state.registry.read().await;
     let project_id = registry
@@ -353,6 +370,15 @@ async fn session_project(state: &Service, id: &str) -> Result<Project, String> {
         .find(|p| p.id == project_id)
         .cloned()
         .ok_or_else(|| "session project is no longer configured".into())
+}
+
+pub async fn upload_project_file(
+    state: &Service,
+    id: String,
+    filename: String,
+    bytes: Vec<u8>,
+) -> workspace::Reply {
+    workspace::upload(&project_by_id(state, &id).await?, &filename, &bytes).await
 }
 
 #[derive(Default, Deserialize)]
