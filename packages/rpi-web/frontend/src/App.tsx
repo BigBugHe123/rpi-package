@@ -835,7 +835,10 @@ export default function App() {
             ...previous.filter(
               (row) =>
                 row.id !== "retry-note" &&
-                row.id !== `settled-${String(event.runId ?? seq)}`,
+                row.id !== `settled-${String(event.runId ?? seq)}` &&
+                (row.kind !== "note" ||
+                  row.translation?.key !== "restoredRun" ||
+                  String(row.translation.values?.outcome ?? "") !== outcome),
             ),
             {
               kind: "note",
@@ -1407,7 +1410,6 @@ export default function App() {
             (row) =>
               row.kind === "note" &&
               row.id !== "retry-note" &&
-              row.translation?.key !== "restoredRun" &&
               !restoredIds.has(row.id),
           ),
         ]);
@@ -1526,10 +1528,7 @@ export default function App() {
             return [
               ...restored,
               ...previous.filter(
-                (row) =>
-                  row.kind === "note" &&
-                  row.translation?.key !== "restoredRun" &&
-                  !ids.has(row.id),
+                (row) => row.kind === "note" && !ids.has(row.id),
               ),
             ];
           });
@@ -1773,7 +1772,9 @@ export default function App() {
         if (
           previous.some(
             (row) =>
-              row.kind === "note" && row.translation?.key === "restoredRun",
+              row.kind === "note" &&
+              (row.translation?.key === "restoredRun" ||
+                row.translation?.key === "liveRun"),
           )
         ) {
           return previous;
