@@ -104,6 +104,15 @@ async function mockHost(page: Page) {
         },
       });
     }
+    if (/\/projects\/[^/]+\/rename$/.test(path)) {
+      const body = request.postDataJSON() as { name: string };
+      const id = path.split("/")[4];
+      const project = projects.find((entry) => entry.id === id);
+      if (!project)
+        return route.fulfill({ status: 404, json: { error: "missing" } });
+      project.name = body.name;
+      return route.fulfill({ json: { project } });
+    }
     if (/\/projects\/[^/]+\/files$/.test(path)) {
       return route.fulfill({
         json: {
@@ -113,6 +122,14 @@ async function mockHost(page: Page) {
             { name: "README.md", path: "README.md", kind: "file", size: 30 },
           ],
         },
+      });
+    }
+    if (
+      /\/projects\/[^/]+\/upload$/.test(path) &&
+      request.method() === "POST"
+    ) {
+      return route.fulfill({
+        json: { name: "notes.txt", path: ".rpi/uploads/notes.txt", size: 5 },
       });
     }
     if (/\/projects\/[^/]+\/file$/.test(path)) {
@@ -371,7 +388,9 @@ test("capabilities gate the history and queue inspector", async ({ page }) => {
   );
 });
 
-test("failed queue cancellation restores the removed message", async ({ page }) => {
+test("failed queue cancellation restores the removed message", async ({
+  page,
+}) => {
   await mockHost(page);
   let release!: () => void;
   let cancelling = false;
@@ -380,19 +399,22 @@ test("failed queue cancellation restores the removed message", async ({ page }) 
   });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.route(`**/api/v1/sessions/${sessionId}/commands`, async (route) => {
-    const body = route.request().postDataJSON();
-    if (body.type !== "cancel_queued") return route.fallback();
-    cancelling = true;
-    await held;
-    return route.fulfill({
-      json: {
-        ...response({}, body.type),
-        success: false,
-        error: "Cancellation rejected",
-      },
-    });
-  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "cancel_queued") return route.fallback();
+      cancelling = true;
+      await held;
+      return route.fulfill({
+        json: {
+          ...response({}, body.type),
+          success: false,
+          error: "Cancellation rejected",
+        },
+      });
+    },
+  );
   await page.goto("/");
   await page.getByRole("button", { name: "Queue: 1", exact: true }).click();
   await page
@@ -403,7 +425,9 @@ test("failed queue cancellation restores the removed message", async ({ page }) 
   await expect(page.locator(".composer-queue-item")).toHaveCount(0);
   release();
   await expect(page.locator(".composer-queue-item")).toContainText("pending");
-  await expect(page.locator(".error-banner")).toContainText("Cancellation rejected");
+  await expect(page.locator(".error-banner")).toContainText(
+    "Cancellation rejected",
+  );
   expect(errors).toEqual([]);
 });
 
@@ -479,7 +503,7 @@ test("projects contain chats and a new project starts its own conversation", asy
   const dialog = page.getByRole("dialog", { name: "Add project" });
   await dialog
     .getByLabel("Project name", { exact: true })
-    .fill("New workspace");
+    .pressSequentially("New workspace");
   await expect(dialog).toContainText("/workspace/projects/New workspace");
   await dialog
     .getByRole("button", { name: "Add project and start chat" })
@@ -505,6 +529,33 @@ test("projects contain chats and a new project starts its own conversation", asy
   ).toBeVisible();
 });
 
+test("projects can be renamed from the project actions menu", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Project actions: pi-rust", exact: true })
+    .click();
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Rename project" });
+  await dialog
+    .getByLabel("Project name", { exact: true })
+    .pressSequentially("renamed-project");
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: "Open project: renamed-project",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Open project: pi-rust",
+      exact: true,
+    }),
+  ).not.toBeVisible();
+});
 test("opening an existing folder is searchable and fills its project name", async ({
   page,
 }) => {
@@ -737,15 +788,15 @@ test("mobile navigation opens without horizontal overflow", async ({
       .locator(".mobile-session-switcher svg")
       .evaluate((element) => getComputedStyle(element).width),
   ).toBe("16px");
-  await page.getByRole("button", { name: "Switch session", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Switch session", exact: true })
+    .click();
   await expect(page.locator(".mobile-session-sheet")).toBeVisible();
   await expect(page.locator(".mobile-session-search")).not.toBeFocused();
   await expect(
     page.locator(".mobile-session-option").filter({ hasText: "Mock session" }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Close panel", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Close panel", exact: true }).click();
   expect(
     await page
       .locator(".composer")
@@ -753,9 +804,9 @@ test("mobile navigation opens without horizontal overflow", async ({
       .evaluate((element) => getComputedStyle(element).borderRadius),
   ).toBe("14px");
   expect(
-    await page.locator(".toolbar").evaluate(
-      (element) => element.scrollWidth <= element.clientWidth,
-    ),
+    await page
+      .locator(".toolbar")
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
   ).toBe(true);
 
   await page
@@ -765,9 +816,9 @@ test("mobile navigation opens without horizontal overflow", async ({
     page.getByRole("button", { name: "Open project: pi-rust", exact: true }),
   ).toBeVisible();
   expect(
-    await page.locator(".project-tree").evaluate(
-      (element) => element.scrollWidth <= element.clientWidth,
-    ),
+    await page
+      .locator(".project-tree")
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
   ).toBe(true);
   await page.getByRole("button", { name: "Close sidebar" }).click();
 
@@ -1117,6 +1168,62 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await page.screenshot({ path: testInfo.outputPath("markdown-mobile.png") });
 });
 
+test("uploads a file and includes its workspace path in the prompt", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Mock session" }),
+  ).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("hello"),
+  });
+  await expect(page.locator(".composer-attachment")).toContainText("notes.txt");
+  await page.locator(".composer textarea").fill("Please inspect this file");
+  const request = page.waitForRequest(
+    (candidate) =>
+      candidate.url().includes(`/sessions/${sessionId}/commands`) &&
+      candidate.method() === "POST" &&
+      candidate.postDataJSON()?.type === "prompt",
+  );
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect((await request).postDataJSON()).toMatchObject({
+    message: expect.stringContaining(".rpi/uploads/notes.txt"),
+  });
+});
+
+test("renders image blocks returned in the transcript", async ({ page }) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        messages: [
+          {
+            role: "assistant",
+            entryId: "image-assistant",
+            content: [
+              {
+                type: "image",
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                mimeType: "image/png",
+              },
+            ],
+          },
+        ],
+        events: [],
+        lastSeq: 1,
+        total: 1,
+        hasMore: false,
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".transcript-image img")).toBeVisible();
+});
 test("streamed markdown handles incomplete fences and stays formatted in dark mode", async ({
   page,
 }, testInfo) => {
@@ -3089,7 +3196,9 @@ test("a failed chat creation does not hide rejection of the still-active prompt"
     "Prompt was rejected",
   );
   await expect(page.locator(".message.user")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("snapshot boundary status supersedes an earlier idle runtime read", async ({
@@ -3109,7 +3218,9 @@ test("snapshot boundary status supersedes an earlier idle runtime read", async (
     }),
   );
   await page.goto("/");
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
@@ -3309,12 +3420,16 @@ test("a rejected compact command releases the composer and restores its draft", 
   await input.press("Enter");
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Cannot compact yet",
   );
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
   await expect(input).toHaveValue("/compact keep recent context");
   await expect(page.locator(".connection")).toContainText("reconnecting");
 });
@@ -3371,7 +3486,9 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Resume unavailable",
@@ -3379,7 +3496,9 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await expect(
     page.getByRole("button", { name: "Continue", exact: true }),
   ).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("an executed slash command does not return as a draft after switching chats", async ({
@@ -3521,7 +3640,9 @@ test("an operation accepted in another tab stays busy without an agent_start eve
   );
   await page.goto("/");
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.getByRole("button", { name: "Abort", exact: true })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
@@ -3995,6 +4116,21 @@ test("bash card folds a multiline command into one line and strips ANSI output",
   ).toBe(true);
 });
 
+test("composer uses Shift+Enter for a newline without sending", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  const input = page.locator(".composer textarea");
+  await input.fill("first line");
+  await input.press("Shift+Enter");
+  await input.type("second line");
+  await expect(input).toHaveValue("first line\nsecond line");
+  await expect(page.locator(".composer-shortcut-hint")).toContainText(
+    "new line",
+  );
+});
+
 test("initial snapshot preserves slash feedback entered while history is loading", async ({
   page,
 }) => {
@@ -4024,7 +4160,7 @@ test("initial snapshot preserves slash feedback entered while history is loading
     page
       .locator(".transcript-note")
       .filter({ hasText: "restored from session history" }),
-  ).toBeVisible();
+  ).toHaveCount(1);
   await expect(
     page.locator(".transcript-note").filter({ hasText: "/help" }),
   ).toBeVisible();
@@ -4215,7 +4351,7 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
                 name: "powershell",
                 arguments: {
                   command:
-                    'rg -n -A120 -B30 "tool-row|tool-card|message-list|virtual-row|message-body" packages/rpi-web/frontend/src/styles.css packages/rpi-web/frontend/src/desktop.css | sed -n \'1,300p\'',
+                    "rg -n -A120 -B30 \"tool-row|tool-card|message-list|virtual-row|message-body\" packages/rpi-web/frontend/src/styles.css packages/rpi-web/frontend/src/desktop.css | sed -n '1,300p'",
                 },
               },
             ],
@@ -4383,28 +4519,58 @@ for (const mode of [
   });
 }
 
-test("composer shows the active project path, branch and linked worktree on narrow screens", async ({ page }) => {
+test("composer shows the active project path, branch and linked worktree on narrow screens", async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 375, height: 844 });
   await mockHost(page);
-  await page.route("**/api/v1/projects/project-a/git/status", (route) => route.fulfill({ json: {
-    isRepository: true, branch: "codex/a-long-worktree-branch", files: [],
-    isWorktree: true, worktreePath: "/workspace/pi-rust",
-  } }));
+  await page.route("**/api/v1/projects/project-a/git/status", (route) =>
+    route.fulfill({
+      json: {
+        isRepository: true,
+        branch: "codex/a-long-worktree-branch",
+        files: [],
+        isWorktree: true,
+        worktreePath: "/workspace/pi-rust",
+      },
+    }),
+  );
   await page.goto("/");
   const context = page.locator(".composer-workspace");
-  await expect(context.getByRole("button", { name: "/workspace/pi-rust", exact: true })).toBeVisible();
-  await expect(context.getByLabel("Branch: codex/a-long-worktree-branch", { exact: true })).toBeVisible();
+  await expect(
+    context.getByRole("button", { name: "/workspace/pi-rust", exact: true }),
+  ).toBeVisible();
+  await expect(
+    context.getByLabel("Branch: codex/a-long-worktree-branch", { exact: true }),
+  ).toBeVisible();
   await expect(context.getByText("worktree", { exact: true })).toBeVisible();
   for (const width of [320, 375, 1280]) {
     await page.setViewportSize({ width, height: 844 });
-    expect(await context.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(
+      await context.evaluate(
+        (element) => element.scrollWidth <= element.clientWidth,
+      ),
+    ).toBe(true);
   }
-  await page.screenshot({ path: test.info().outputPath("project-context.png") });
+  await page.screenshot({
+    path: test.info().outputPath("project-context.png"),
+  });
   await page.setViewportSize({ width: 375, height: 844 });
-  await page.getByRole("button", { name: "Toggle sidebar", exact: true }).click();
-  await page.getByRole("button", { name: "Open project: rpi-package", exact: true }).click();
-  await expect(context.getByRole("button", { name: "/workspace/rpi-package", exact: true })).toBeVisible();
-  await expect(context.getByLabel("Branch: main", { exact: true })).toBeVisible();
+  await page
+    .getByRole("button", { name: "Toggle sidebar", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Open project: rpi-package", exact: true })
+    .click();
+  await expect(
+    context.getByRole("button", {
+      name: "/workspace/rpi-package",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    context.getByLabel("Branch: main", { exact: true }),
+  ).toBeVisible();
   await expect(context.getByText("worktree", { exact: true })).toBeHidden();
   await expect(context).not.toContainText("codex/a-long-worktree-branch");
 });
@@ -4431,7 +4597,15 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
     if (body.type === "get_available_models") {
       return route.fulfill({
         json: response(
-          { models: [{ id: "mobile-model", name: "Mobile model", provider: "test-provider" }] },
+          {
+            models: [
+              {
+                id: "mobile-model",
+                name: "Mobile model",
+                provider: "test-provider",
+              },
+            ],
+          },
           body.type,
         ),
       });
@@ -4466,15 +4640,23 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   const metrics = page.locator(".composer-metrics");
   const footer = page.locator(".composer-footer");
   await expect(metrics.getByLabel(/^Context:/)).toBeVisible();
-  await expect(metrics.getByLabel("Context: 129k / 227k", { exact: true })).toContainText("129k / 227k");
+  await expect(
+    metrics.getByLabel("Context: 129k / 227k", { exact: true }),
+  ).toContainText("129k / 227k");
   await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
   await expect(metrics.getByLabel(/^Input tokens: 100$/)).toBeVisible();
   await expect(metrics.getByLabel(/^Output tokens: 252$/)).toBeVisible();
   await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
-  await expect(metrics.getByLabel("Total tokens: 352", { exact: true })).toBeHidden();
+  await expect(
+    metrics.getByLabel("Total tokens: 352", { exact: true }),
+  ).toBeHidden();
   await expect(metrics.getByLabel(/^Cached tokens:/)).toBeHidden();
   await expect(metrics.getByLabel(/^Cost:/)).toBeHidden();
-  expect(await metrics.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(
+    await metrics.evaluate(
+      (element) => element.scrollWidth <= element.clientWidth,
+    ),
+  ).toBe(true);
   await metrics.locator(":scope > summary").click();
   await expect(metrics.getByLabel(/^Cached tokens:/)).toBeVisible();
   const metricsBox = await metrics.boundingBox();
@@ -4489,15 +4671,20 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
     const summary = metrics.locator(":scope > summary");
     await expect(summary.locator(".composer-metric")).toHaveCount(4);
     const layout = await summary.evaluate((element) => {
-      const tops = Array.from(element.querySelectorAll(".composer-metric"),
-        (item) => item.getBoundingClientRect().top);
+      const tops = Array.from(
+        element.querySelectorAll(".composer-metric"),
+        (item) => item.getBoundingClientRect().top,
+      );
       return {
         singleLine: Math.max(...tops) - Math.min(...tops) < 1,
         fits: element.scrollWidth <= element.clientWidth,
       };
     });
     expect(layout).toEqual({ singleLine: true, fits: true });
-    if (width === 375) await metrics.screenshot({ path: test.info().outputPath("compact-footer-mobile.png") });
+    if (width === 375)
+      await metrics.screenshot({
+        path: test.info().outputPath("compact-footer-mobile.png"),
+      });
   }
 
   await model.click();
@@ -4512,5 +4699,4 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   expect(popoverBox!.y + popoverBox!.height).toBeLessThanOrEqual(844);
   await page.getByRole("option", { name: "Mobile model" }).click();
   await expect(popover).toBeHidden();
-
 });

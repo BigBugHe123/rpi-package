@@ -681,9 +681,45 @@ code {
     border-color 0.15s,
     box-shadow 0.15s;
 }
-.composer:focus-within {
-  border-color: var(--blue);
-  box-shadow: 0 0 0 3px #007aff0a;
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.composer-attachment {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: min(260px, 100%);
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  background: var(--soft);
+  font-size: 11px;
+}
+.composer-attachment img {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+}
+.composer-attachment > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+}
+.composer-attach:hover:not(:disabled) {
+  color: var(--text);
+}
+.composer-attach .spin {
+  animation: spin 0.9s linear infinite;
 }
 .composer textarea {
   display: block;
@@ -1087,6 +1123,22 @@ details[open] > summary:before {
   100% {
     background-position: -100% 0;
   }
+}
+
+.transcript-image {
+  margin: 8px 0;
+  max-width: min(100%, 720px);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--soft);
+}
+.transcript-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 520px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
 }
 
 .tool-card {
@@ -2383,10 +2435,14 @@ details[open] > summary:before {
     display: inline-flex;
   }
   .toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
     height: 60px;
     padding: 0 14px;
     padding-top: env(safe-area-inset-top);
     gap: 5px;
+    background: var(--bg);
   }
   .toolbar-left {
     flex: 1;

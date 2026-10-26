@@ -296,14 +296,18 @@
 .selected-project .project-name {
   color: var(--text);
 }
-.project-group-header .project-new-session {
+.project-group-header .project-new-session,
+.project-group-header .project-menu-trigger {
   height: 26px;
   width: 26px;
   padding: 0;
   opacity: 0;
 }
 .project-group-header:hover .project-new-session,
-.project-group-header:focus-within .project-new-session {
+.project-group-header:focus-within .project-new-session,
+.project-group-header:hover .project-menu-trigger,
+.project-group-header:focus-within .project-menu-trigger,
+.project-menu-trigger[aria-expanded="true"] {
   opacity: 1;
 }
 .project-session {
@@ -1276,8 +1280,19 @@
 .composer-workspace svg {
   flex-shrink: 0;
 }
+.workspace .composer-workspace {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
 .workspace .composer-workspace-path {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   justify-content: flex-start;
   padding: 2px 0;
   border: 0;
@@ -1285,6 +1300,25 @@
   color: inherit;
   font-size: inherit;
 }
+.composer-workspace-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.composer-workspace-meta > .dropdown-anchor {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.composer-workspace-meta > .dropdown-anchor > button {
+  min-width: 0;
+  max-width: 100%;
+}
+
+
 .composer-workspace-branch,
 .composer-workspace-worktree {
   display: inline-flex;

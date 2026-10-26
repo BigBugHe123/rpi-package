@@ -55,6 +55,8 @@ export function Modal({
   language?: Language;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const input = ref.current?.querySelector<HTMLInputElement>(
       'input:not([type="checkbox"])',
@@ -62,11 +64,11 @@ export function Modal({
     input?.focus();
     input?.select();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") onCloseRef.current();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, []);
   return createPortal(
     <div
       ref={ref}
@@ -577,6 +579,72 @@ export function RenameDialog({
   );
 }
 
+export function ProjectRenameDialog({
+  language,
+  project,
+  onClose,
+  onSave,
+}: {
+  language: Language;
+  project: Project;
+  onClose: () => void;
+  onSave: (name: string) => Promise<void>;
+}) {
+  const zh = language === "zh";
+  const [name, setName] = useState(project.name);
+  const mounted = useMountedFlag();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  return (
+    <Modal
+      language={language}
+      title={zh ? "重命名项目" : "Rename project"}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+    >
+      <form
+        className="project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!name.trim() || busy) return;
+          setBusy(true);
+          void onSave(name.trim())
+            .then(() => {
+              if (mounted.current) onClose();
+            })
+            .catch((cause: Error) => {
+              if (mounted.current) setError(cause.message);
+            })
+            .finally(() => {
+              if (mounted.current) setBusy(false);
+            });
+        }}
+      >
+        <label htmlFor="project-rename">{zh ? "项目名称" : "Project name"}</label>
+        <input
+          id="project-rename"
+          autoFocus
+          maxLength={80}
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          disabled={busy}
+        />
+        {error && <p role="alert" className="form-error">{error}</p>}
+        <div className="dialog-actions">
+          <button type="button" disabled={busy} onClick={onClose}>
+            {zh ? "取消" : "Cancel"}
+          </button>
+          <button className="primary" disabled={busy || !name.trim()}>
+            {busy ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+            {zh ? "保存" : "Save"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 export function TagsDialog({
   language,
   session,
@@ -677,6 +745,7 @@ interface SidebarProps {
   onNewSession: (projectId: string) => void;
   onNewProject: () => void;
   onRename: (session: SessionSummary) => void;
+  onRenameProject: (project: Project) => void;
   onEditTags: (session: SessionSummary) => void;
   onMetadata: (
     session: SessionSummary,
@@ -698,6 +767,7 @@ export function ProjectSidebar({
   onNewSession,
   onNewProject,
   onRename,
+  onRenameProject,
   onEditTags,
   onMetadata,
 }: SidebarProps) {
@@ -1025,6 +1095,47 @@ export function ProjectSidebar({
                   )}
                   <span>{project.name}</span>
                 </button>
+                {canManage && (
+                  <>
+                    <button
+                      className="icon-button project-menu-trigger"
+                      aria-label={`${zh ? "项目操作" : "Project actions"}: ${project.name}`}
+                      aria-expanded={menu === `project:${project.id}`}
+                      aria-haspopup="menu"
+                      onClick={(event) => {
+                        const box = event.currentTarget.getBoundingClientRect();
+                        setMenuPosition({
+                          top: Math.min(box.bottom + 4, window.innerHeight - 100),
+                          left: Math.max(8, Math.min(box.right - 165, window.innerWidth - 180)),
+                        });
+                        setMenu(menu === `project:${project.id}` ? "" : `project:${project.id}`);
+                      }}
+                    >
+                      <MoreHorizontal size={15} />
+                    </button>
+                    {menu === `project:${project.id}` &&
+                      createPortal(
+                        <div
+                          className="session-context-menu"
+                          role="menu"
+                          aria-label={project.name}
+                          style={menuPosition}
+                        >
+                          <button
+                            role="menuitem"
+                            onClick={() => {
+                              setMenu("");
+                              onRenameProject(project);
+                            }}
+                          >
+                            <SquarePen size={14} />
+                            {zh ? "重命名" : "Rename"}
+                          </button>
+                        </div>,
+                        document.body,
+                      )}
+                  </>
+                )}
                 <button
                   className="icon-button project-new-session"
                   aria-label={`${zh ? "项目内新建会话" : "New session in"}: ${project.name}`}

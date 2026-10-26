@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Folder, GitBranch, GitFork } from "lucide-react";
 import { api, type GitStatus, type Project } from "./api";
 import { translate, type Language } from "./i18n";
@@ -9,12 +9,14 @@ export function ProjectContext({
   language,
   loadGit,
   onOpen,
+  children,
 }: {
   project?: Project;
   tick: number;
   language: Language;
   loadGit: boolean;
   onOpen: () => void;
+  children?: ReactNode;
 }) {
   const [status, setStatus] = useState<{ id: string; git: GitStatus } | null>(
     null,
@@ -38,35 +40,40 @@ export function ProjectContext({
   const t = (key: Parameters<typeof translate>[1]) => translate(language, key);
   return (
     <div className="composer-workspace" aria-label={t("projectContext")}>
-      <button
-        type="button"
-        className="composer-workspace-path"
-        title={project?.path}
-        aria-label={project?.path ?? t("workspace")}
-        onClick={onOpen}
-      >
-        <Folder size={12} />
-        <span>{project?.path ?? t("workspace")}</span>
-      </button>
-      {git?.isRepository && git.branch && (
-        <span
-          className="composer-workspace-branch"
-          title={`${t("gitBranch")}: ${git.branch}`}
-          aria-label={`${t("gitBranch")}: ${git.branch}`}
+      <div className="composer-context-line">
+        <button
+          type="button"
+          className="composer-workspace-path"
+          title={project?.path}
+          aria-label={project?.path ?? t("workspace")}
+          onClick={onOpen}
         >
-          <GitBranch size={12} />
-          <span>{git.branch}</span>
-        </span>
-      )}
-      {git?.isWorktree && (
-        <span
-          className="composer-workspace-worktree"
-          title={git.worktreePath ?? project?.path}
-        >
-          <GitFork size={12} />
-          <span>worktree</span>
-        </span>
-      )}
+          <Folder size={12} />
+          <span>{project?.path ?? t("workspace")}</span>
+        </button>
+        <div className="composer-workspace-meta">
+          {git?.isRepository && git.branch && (
+            <span
+              className="composer-workspace-branch"
+              title={`${t("gitBranch")}: ${git.branch}`}
+              aria-label={`${t("gitBranch")}: ${git.branch}`}
+            >
+              <GitBranch size={12} />
+              <span>{git.branch}</span>
+            </span>
+          )}
+          {git?.isWorktree && (
+            <span
+              className="composer-workspace-worktree"
+              title={git.worktreePath ?? project?.path}
+            >
+              <GitFork size={12} />
+              <span>worktree</span>
+            </span>
+          )}
+        </div>
+      </div>
+      {children && <div className="composer-runtime-meta">{children}</div>}
     </div>
   );
 }
