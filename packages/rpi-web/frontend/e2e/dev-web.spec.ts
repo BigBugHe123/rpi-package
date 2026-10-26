@@ -3646,6 +3646,49 @@ test("an operation accepted in another tab stays busy without an agent_start eve
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
+test("a live settlement replaces the matching restored settlement", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        messages: [],
+        events: [],
+        lastSeq: 4,
+        history: {
+          records: [
+            {
+              type: "operation_finished",
+              seq: 4,
+              outcome: "aborted",
+              timestamp: 1_700_000_000_000,
+            },
+          ],
+          total: 1,
+          limit: 100,
+          hasMore: false,
+          firstSeq: 4,
+          lastSeq: 4,
+          openOperations: [],
+        },
+      },
+    }),
+  );
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'id: 5\\nevent: agent_settled\\ndata: {"type":"agent_settled","runId":"run-2","outcome":"aborted"}\\n\\n',
+    }),
+  );
+  await page.goto("/");
+  await expect(
+    page.locator(".transcript-note").filter({ hasText: "Run aborted" }),
+  ).toHaveCount(1);
+});
+
 test("live and restored settlement labels follow the selected language", async ({
   page,
 }) => {
