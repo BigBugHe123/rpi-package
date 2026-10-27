@@ -15,6 +15,7 @@ versioned prebuilt manifests for catalog extensions.
 | [rpi-mcp-adapter](packages/rpi-mcp-adapter/README.md) | Connect MCP servers with `mcp_list`, `mcp_call` and `mcp_request` |
 | [rpi-subagents](packages/rpi-subagents/README.md) | Delegate work with `delegate_task` |
 | [rpi-orchestrator](packages/rpi-orchestrator/README.md) | Bounded child agents and task graphs with `subagent`, `plan` and `dispatch` |
+| [rpi-durable](packages/rpi-durable/README.md) | Persist and resume workflow checkpoints with `durable` |
 | [rpi-lens](packages/rpi-lens/README.md) | Inspect code with `code_lens` |
 | [rpi-codegraph](packages/rpi-codegraph/README.md) | Query code relationships with `codegraph` |
 | [rpi-todo](packages/rpi-todo/README.md) | Track tasks with `todo` |
@@ -81,9 +82,22 @@ Download and extract a [Web release](https://github.com/pi-rust/rpi-package/rele
 
 Open [http://127.0.0.1:3030/](http://127.0.0.1:3030/), select a project, and create a session. On Windows, use `rpi-web.exe` and `rpi.exe`.
 
-The [Web user guide](packages/rpi-web/README.md) covers Windows / Linux / macOS setup, project creation, model credentials, password login, remote access, persistence, and upgrades. The source version adds `rpi --web` with embedded frontend resources; install it locally using `rpi install rpi-web --path packages/rpi-web`. This extension entry point will be available in the next release. Existing Web 0.1.1 archives provide the standalone program.
+The [Web user guide](packages/rpi-web/README.md) covers Windows / Linux / macOS setup, project creation, model credentials, password login, remote access, persistence, and upgrades. Web 0.1.7 uses `rpi --webserver` to start the native extension with embedded frontend resources; `--web` remains a compatibility alias. Install it with `rpi install rpi-web --github pi-rust/rpi-package`, or from a checkout using `rpi install rpi-web --path packages/rpi-web`.
 
 Web 0.1.1 supports `.rpi/web.json` startup settings. Run `rpi-web --init` once in a project directory, configure the host and assets paths, then use `rpi-web` for subsequent starts. Global defaults can be stored in `~/.rpi/web.json`, and CLI arguments provide temporary overrides. Users of Web 0.1.0 must upgrade to use configuration files.
+
+## Shared backend and HTTP API
+
+`rpi-extcore` now holds the common ACP/Web native RPC, run, session, history, event and workspace capabilities. `rpi-http` adapts those services to the existing HTTP/SSE API and provides an API-only executable. `rpi-web` adds the embedded browser frontend; `rpi-acp` maps the common runtime to ACP.
+
+```bash
+cargo run --locked -p rpi-http -- --project /path/to/project --rpi-bin /path/to/rpi --port 3030
+```
+
+`rpi-extcore` is also published as a reusable crates.io library. Applications
+can depend on the compatible minor line with `rpi-extcore = "0.1"`; it requires
+Rust 1.78+ and a compatible native `rpi --mode rpc` executable at runtime. See
+[rpi-extcore](packages/rpi-extcore/README.md), [rpi-http](packages/rpi-http/README.md) and the [architecture contract](docs/architecture/extension-core.md). The new packages are ordinary Rust libraries; existing extension installation and startup commands remain the same.
 
 ## Native ACP integration
 

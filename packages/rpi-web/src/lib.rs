@@ -5,15 +5,8 @@
 
 mod assets;
 pub mod config;
-mod host;
 mod plugin;
-mod projects;
-mod protocol;
-mod registry;
-mod security;
 mod server;
 mod startup;
-mod timing;
-mod workspace;
 
 pub use server::{run, AppConfig};

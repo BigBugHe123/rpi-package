@@ -84,6 +84,37 @@ export function eventsAfterSnapshot(
   );
 }
 
+export interface ImageBlock {
+  data?: string;
+  mimeType?: string;
+  url?: string;
+  alt?: string;
+}
+
+export function imageBlocksOf(value: unknown): ImageBlock[] {
+  if (!value || typeof value !== "object") return [];
+  const content = (value as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return [];
+  const images: ImageBlock[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const item = block as Record<string, unknown>;
+    if (item.type === "image_url" && item.image_url && typeof item.image_url === "object") {
+      const url = (item.image_url as Record<string, unknown>).url;
+      if (typeof url === "string") images.push({ url });
+      continue;
+    }
+    if (item.type !== "image") continue;
+    const data = typeof item.data === "string" ? item.data : undefined;
+    if (data) images.push({
+      data,
+      mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+      alt: typeof item.alt === "string" ? item.alt : undefined,
+    });
+  }
+  return images;
+}
+
 export interface ToolTiming {
   elapsedMs: number;
   running: boolean;
@@ -200,6 +231,35 @@ function blocksToText(value: unknown): string {
     .join("\n");
 }
 
+/** Extract text blocks returned by the read tool without rendering its transport envelope. */
+export function readOutput(result: unknown): string | null {
+  if (typeof result === "string") {
+    try {
+      const parsed: unknown = JSON.parse(result);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        Array.isArray((parsed as Record<string, unknown>).content) &&
+        ("details" in parsed || "usage" in parsed || "terminate" in parsed)
+      ) {
+        return readOutput(parsed);
+      }
+    } catch {
+      // A normal source file is not necessarily JSON.
+    }
+    return result;
+  }
+  if (!result || typeof result !== "object") return null;
+  const record = result as Record<string, unknown>;
+  if (Array.isArray(record.content)) {
+    const text = blocksToText(record.content);
+    return text || null;
+  }
+  for (const key of ["text", "output", "result"]) {
+    if (typeof record[key] === "string") return record[key] as string;
+  }
+  return null;
+}
 /** Shell results are text or `{stdout, stderr}` objects, not JSON payloads. */
 export function shellOutput(result: unknown): string {
   if (result === undefined || result === null) return "";
@@ -381,6 +441,7 @@ export type ToolStatus = "pending" | "running" | "done" | "error";
 
 export type Row =
   | { kind: "text"; id: string; role: "user" | "assistant"; text: string }
+  | { kind: "image"; id: string; role: "user" | "assistant"; image: ImageBlock }
   | { kind: "thinking"; id: string; text: string }
   | {
       kind: "tool";
@@ -388,6 +449,7 @@ export type Row =
       name: string;
       args?: unknown;
       result?: unknown;
+      images?: ImageBlock[];
       status: ToolStatus;
       timing?: ToolTiming;
     }
@@ -435,12 +497,20 @@ export function rowsFromAssistant(
   for (const [index, block] of blocksOf(message).entries()) {
     if (block.type === "text" && typeof block.text === "string") {
       if (!block.text.trim()) continue;
-      rows.push({
-        kind: "text",
-        id: `${prefix}:b${index}`,
-        role: "assistant",
-        text: block.text,
-      });
+      const previous = rows[rows.length - 1];
+      if (previous?.kind === "text" && previous.role === "assistant") {
+        previous.text = `${previous.text}\n\n${block.text}`;
+      } else {
+        rows.push({
+          kind: "text",
+          id: `${prefix}:b${index}`,
+          role: "assistant",
+          text: block.text,
+        });
+      }
+    } else if (block.type === "image") {
+      const image = imageBlocksOf({ content: [block] })[0];
+      if (image) rows.push({ kind: "image", id: `${prefix}:b${index}`, role: "assistant", image });
     } else if (block.type === "thinking") {
       const text =
         typeof block.thinking === "string"
@@ -517,6 +587,7 @@ export function rowsFromMessages(raw: unknown[]): Row[] {
           rows[existing] = {
             ...row,
             result: resultOf(message),
+            images: imageBlocksOf(message),
             status,
             timing: toolTiming(message.webTiming) ?? row.timing,
           };
@@ -528,6 +599,7 @@ export function rowsFromMessages(raw: unknown[]): Row[] {
         id,
         name: String(message.toolName ?? "tool"),
         result: resultOf(message),
+        images: imageBlocksOf(message),
         status,
         timing: toolTiming(message.webTiming),
       });
@@ -577,6 +649,7 @@ export function prependRows(older: Row[], current: Row[]): Row[] {
       name: row.name !== "tool" ? row.name : candidate.name,
       args: row.args ?? candidate.args,
       result: row.result ?? candidate.result,
+      images: row.images ?? candidate.images,
       timing: row.timing ?? candidate.timing,
       status:
         row.status === "error" || row.status === "done"
@@ -595,6 +668,7 @@ export function upsertTool(
     name?: string;
     args?: unknown;
     result?: unknown;
+    images?: ImageBlock[];
     status?: ToolStatus;
     timing?: ToolTiming;
   },
@@ -612,6 +686,7 @@ export function upsertTool(
         name: patch.name ?? "tool",
         args: patch.args,
         result: patch.result,
+        images: patch.images,
         status: patch.status ?? "running",
         timing: patch.timing,
       },
@@ -625,6 +700,7 @@ export function upsertTool(
       name: patch.name ?? row.name,
       args: patch.args ?? row.args,
       result: patch.result ?? row.result,
+      images: patch.images ?? row.images,
       status: patch.status ?? row.status,
       timing: patch.timing ?? row.timing,
     };

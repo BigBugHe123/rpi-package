@@ -1,3 +1,4 @@
+import { chooseMenuOption } from "./controls";
 import { test, expect, type Page, type Route } from "@playwright/test";
 
 const sessionId = "session-1";
@@ -43,6 +44,7 @@ const session = {
   sessionId,
   projectId: "project-a",
   title: "Mock session",
+  tags: ["frontend"],
   status: "ready",
   createdAt: 1_700_000_000_000,
   updatedAt: 1_700_000_000_100,
@@ -77,7 +79,7 @@ async function mockHost(page: Page) {
         const project = {
           id: `project-${projects.length + 1}`,
           name: body.name,
-          path: `/workspace/projects/${body.name}`,
+          path: body.path ?? `/workspace/projects/${body.name}`,
         };
         projects.push(project);
         return route.fulfill({ status: 201, json: { project } });
@@ -90,6 +92,27 @@ async function mockHost(page: Page) {
         },
       });
     }
+    if (path === "/api/v1/project-folders") {
+      return route.fulfill({
+        json: {
+          root: "/workspace/projects",
+          folders: [
+            { name: "demo-app", path: "demo-app" },
+            { name: "rpi-package", path: "rpi-package" },
+            { name: "zimt", path: "zimt" },
+          ],
+        },
+      });
+    }
+    if (/\/projects\/[^/]+\/rename$/.test(path)) {
+      const body = request.postDataJSON() as { name: string };
+      const id = path.split("/")[4];
+      const project = projects.find((entry) => entry.id === id);
+      if (!project)
+        return route.fulfill({ status: 404, json: { error: "missing" } });
+      project.name = body.name;
+      return route.fulfill({ json: { project } });
+    }
     if (/\/projects\/[^/]+\/files$/.test(path)) {
       return route.fulfill({
         json: {
@@ -99,6 +122,14 @@ async function mockHost(page: Page) {
             { name: "README.md", path: "README.md", kind: "file", size: 30 },
           ],
         },
+      });
+    }
+    if (
+      /\/projects\/[^/]+\/upload$/.test(path) &&
+      request.method() === "POST"
+    ) {
+      return route.fulfill({
+        json: { name: "notes.txt", path: ".rpi/uploads/notes.txt", size: 5 },
       });
     }
     if (/\/projects\/[^/]+\/file$/.test(path)) {
@@ -293,7 +324,18 @@ async function mockHost(page: Page) {
         case "get_stats":
           return route.fulfill({
             json: response(
-              { messageCount: 0, totalTokens: 0, costTotal: 0 },
+              {
+                messageCount: 1,
+                input: 100,
+                output: 252,
+                cacheRead: 20,
+                cacheWrite: 0,
+                totalTokens: 352,
+                cachedTokens: 20,
+                uncachedTokens: 80,
+                cost: 0.01,
+                costTotal: 0.01,
+              },
               body.type,
             ),
           });
@@ -329,6 +371,64 @@ test("capabilities gate the history and queue inspector", async ({ page }) => {
       .filter({ hasText: "Queue" })
       .first(),
   ).toBeVisible();
+  const queueToggle = page.getByRole("button", {
+    name: "Queue: 1",
+    exact: true,
+  });
+  await expect(queueToggle).toBeVisible();
+  await queueToggle.click();
+  await expect(page.locator(".composer-queue-panel")).toContainText("pending");
+  await page
+    .locator(".composer-queue-item")
+    .getByRole("button", { name: "Edit queued message" })
+    .click();
+  await expect(page.locator(".composer textarea")).toHaveValue("pending");
+  await expect(page.locator(".composer-queue-editing")).toContainText(
+    "Edit queued message",
+  );
+});
+
+test("failed queue cancellation restores the removed message", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let release!: () => void;
+  let cancelling = false;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "cancel_queued") return route.fallback();
+      cancelling = true;
+      await held;
+      return route.fulfill({
+        json: {
+          ...response({}, body.type),
+          success: false,
+          error: "Cancellation rejected",
+        },
+      });
+    },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Queue: 1", exact: true }).click();
+  await page
+    .locator(".composer-queue-item")
+    .getByRole("button", { name: "Cancel queued message" })
+    .click();
+  await expect.poll(() => cancelling).toBe(true);
+  await expect(page.locator(".composer-queue-item")).toHaveCount(0);
+  release();
+  await expect(page.locator(".composer-queue-item")).toContainText("pending");
+  await expect(page.locator(".error-banner")).toContainText(
+    "Cancellation rejected",
+  );
+  expect(errors).toEqual([]);
 });
 
 test("history records expand and queue history toggles", async ({ page }) => {
@@ -403,7 +503,7 @@ test("projects contain chats and a new project starts its own conversation", asy
   const dialog = page.getByRole("dialog", { name: "Add project" });
   await dialog
     .getByLabel("Project name", { exact: true })
-    .fill("New workspace");
+    .pressSequentially("New workspace");
   await expect(dialog).toContainText("/workspace/projects/New workspace");
   await dialog
     .getByRole("button", { name: "Add project and start chat" })
@@ -427,6 +527,79 @@ test("projects contain chats and a new project starts its own conversation", asy
       exact: true,
     }),
   ).toBeVisible();
+});
+
+test("projects can be renamed from the project actions menu", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Project actions: pi-rust", exact: true })
+    .click();
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Rename project" });
+  await dialog
+    .getByLabel("Project name", { exact: true })
+    .pressSequentially("renamed-project");
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: "Open project: renamed-project",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Open project: pi-rust",
+      exact: true,
+    }),
+  ).not.toBeVisible();
+});
+test("opening an existing folder is searchable and fills its project name", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let createdBody: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/projects", async (route) => {
+    if (route.request().method() === "POST") {
+      createdBody = route.request().postDataJSON();
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "New project", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Add project", exact: true });
+  await dialog
+    .getByRole("button", { name: "Open folder", exact: true })
+    .click();
+  const folderInput = dialog.getByLabel("Choose a folder", { exact: true });
+  await folderInput.fill("zim");
+  const zimt = dialog.getByRole("option", { name: /zimt/ });
+  await expect(zimt).toBeVisible();
+  await expect(dialog.getByRole("option", { name: /demo-app/ })).toHaveCount(0);
+  await zimt.click();
+  await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
+    "zimt",
+  );
+  await dialog
+    .getByLabel("Project name", { exact: true })
+    .fill("Zimt workspace");
+  await folderInput.fill("demo");
+  await dialog.getByRole("option", { name: /demo-app/ }).click();
+  await expect(dialog.getByLabel("Project name", { exact: true })).toHaveValue(
+    "Zimt workspace",
+  );
+  await dialog
+    .getByRole("button", { name: "Add project and start chat" })
+    .click();
+  await expect
+    .poll(() => createdBody)
+    .toEqual({
+      name: "Zimt workspace",
+      initGit: true,
+      path: "demo-app",
+    });
 });
 
 test("rename, pin, archive and restore survive reloads", async ({ page }) => {
@@ -489,7 +662,21 @@ test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("project navigation collapses, searches and remembers appearance", async ({
+test("session tags can be edited without sidebar filters", async ({ page }) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Session actions: Mock session", exact: true })
+    .click();
+  await page.getByRole("menuitem", { name: "Edit tags", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Edit tags" });
+  await dialog.getByLabel("Tags").fill("frontend, urgent, frontend");
+  await dialog.getByRole("button", { name: "Save tags", exact: true }).click();
+  await expect(
+    page.locator(".session-tag", { hasText: "urgent" }),
+  ).toBeVisible();
+});
+test("project navigation collapses and remembers appearance", async ({
   page,
 }) => {
   await mockHost(page);
@@ -503,15 +690,9 @@ test("project navigation collapses, searches and remembers appearance", async ({
     page.getByRole("button", { name: "Expand project: pi-rust", exact: true }),
   ).toBeVisible();
   await page
-    .getByRole("textbox", { name: "Search projects or chats" })
-    .fill("Mock");
+    .getByRole("button", { name: "Expand project: pi-rust", exact: true })
+    .click();
   await expect(page.locator(".project-session")).toHaveCount(1);
-  await expect(
-    page.getByRole("button", {
-      name: "Open project: rpi-package",
-      exact: true,
-    }),
-  ).toHaveCount(0);
   await page
     .getByRole("button", { name: "Toggle appearance", exact: true })
     .click();
@@ -599,16 +780,48 @@ test("mobile navigation opens without horizontal overflow", async ({
   await page.setViewportSize({ width: 390, height: 844 });
   await mockHost(page);
   await page.goto("/");
+  await expect(page.locator(".mobile-session-switcher small")).toHaveText(
+    "pi-rust",
+  );
+  expect(
+    await page
+      .locator(".mobile-session-switcher svg")
+      .evaluate((element) => getComputedStyle(element).width),
+  ).toBe("16px");
+  await page
+    .getByRole("button", { name: "Switch session", exact: true })
+    .click();
+  await expect(page.locator(".mobile-session-sheet")).toBeVisible();
+  await expect(page.locator(".mobile-session-search")).not.toBeFocused();
   await expect(
-    page.getByRole("heading", { name: "What shall we build?" }),
+    page.locator(".mobile-session-option").filter({ hasText: "Mock session" }),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Close panel", exact: true }).click();
+  expect(
+    await page
+      .locator(".composer")
+      .first()
+      .evaluate((element) => getComputedStyle(element).borderRadius),
+  ).toBe("14px");
+  expect(
+    await page
+      .locator(".toolbar")
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
+  ).toBe(true);
+
   await page
     .getByRole("button", { name: "Toggle sidebar", exact: true })
     .click();
   await expect(
     page.getByRole("button", { name: "Open project: pi-rust", exact: true }),
   ).toBeVisible();
+  expect(
+    await page
+      .locator(".project-tree")
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
+  ).toBe(true);
   await page.getByRole("button", { name: "Close sidebar" }).click();
+
   await page.getByRole("button", { name: "Toggle project files" }).click();
   await expect(
     page.getByRole("tab", { name: "Files", exact: true }),
@@ -618,6 +831,53 @@ test("mobile navigation opens without horizontal overflow", async ({
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page.locator(".composer").first()).toHaveCSS(
+    "border-radius",
+    "17px",
+  );
+});
+
+test("mobile session actions keep the ellipsis control compact", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Toggle sidebar", exact: true })
+    .click();
+  const row = page.locator(".project-session").first();
+  const trigger = row.getByRole("button", {
+    name: "Session actions: Mock session",
+    exact: true,
+  });
+  await expect(trigger).toBeVisible();
+  const timeAndMenu = await row.evaluate((element) => {
+    const time = element.querySelector("time")?.getBoundingClientRect();
+    const menu = element
+      .querySelector(".session-menu-trigger")
+      ?.getBoundingClientRect();
+    return {
+      timeRight: time?.right ?? 0,
+      menuLeft: menu?.left ?? 0,
+    };
+  });
+  expect(timeAndMenu.timeRight).toBeLessThanOrEqual(timeAndMenu.menuLeft);
+  expect(
+    await row
+      .locator(".session-menu")
+      .evaluate((element) => element.getBoundingClientRect().width),
+  ).toBeLessThanOrEqual(50);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await trigger.click();
+  await expect(
+    page.getByRole("menuitem", { name: "Rename", exact: true }),
+  ).toBeVisible();
 });
 
 test("messages sent during a run enter the follow-up queue", async ({
@@ -852,6 +1112,16 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await expect(prose.locator("ol ul > li")).toHaveCount(2);
   await expect(prose.locator('input[type="checkbox"]:checked')).toHaveCount(1);
   await expect(prose.locator("pre code")).toContainText('  return "long_code_');
+  await expect(prose.locator(".markdown-code-heading")).toContainText("Code");
+  await expect(prose.locator(".markdown-copy").first()).toHaveAttribute(
+    "aria-label",
+    "Copy code",
+  );
+  await prose.locator(".markdown-copy").first().click();
+  await expect(
+    page.locator(".message.assistant .message-copy").first(),
+  ).toHaveAttribute("aria-label", "Copy message");
+  await page.locator(".message.assistant .message-copy").first().click();
   const table = prose.getByRole("region", {
     name: "Table, scroll horizontally",
   });
@@ -875,6 +1145,10 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await page.setViewportSize({ width: 375, height: 812 });
   await page.reload();
   await expect(prose.locator("img")).toBeVisible();
+  await expect(
+    page.locator(".message.assistant .message-copy").first(),
+  ).toBeVisible();
+  await expect(page.locator(".message.user .message-body")).toBeVisible();
   expect(
     await page
       .locator(".transcript")
@@ -894,6 +1168,62 @@ test("markdown preserves chat line breaks, readable code and contained layouts",
   await page.screenshot({ path: testInfo.outputPath("markdown-mobile.png") });
 });
 
+test("uploads a file and includes its workspace path in the prompt", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Mock session" }),
+  ).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("hello"),
+  });
+  await expect(page.locator(".composer-attachment")).toContainText("notes.txt");
+  await page.locator(".composer textarea").fill("Please inspect this file");
+  const request = page.waitForRequest(
+    (candidate) =>
+      candidate.url().includes(`/sessions/${sessionId}/commands`) &&
+      candidate.method() === "POST" &&
+      candidate.postDataJSON()?.type === "prompt",
+  );
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect((await request).postDataJSON()).toMatchObject({
+    message: expect.stringContaining(".rpi/uploads/notes.txt"),
+  });
+});
+
+test("renders image blocks returned in the transcript", async ({ page }) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        messages: [
+          {
+            role: "assistant",
+            entryId: "image-assistant",
+            content: [
+              {
+                type: "image",
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                mimeType: "image/png",
+              },
+            ],
+          },
+        ],
+        events: [],
+        lastSeq: 1,
+        total: 1,
+        hasMore: false,
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".transcript-image img")).toBeVisible();
+});
 test("streamed markdown handles incomplete fences and stays formatted in dark mode", async ({
   page,
 }, testInfo) => {
@@ -1068,9 +1398,7 @@ test("narrow authenticated sidebar uses icons and all settings follow the chosen
     element.scrollTop = 0;
   });
   await page.screenshot({ path: testInfo.outputPath("sidebar-chinese.png") });
-  await page
-    .getByRole("combobox", { name: "语言", exact: true })
-    .selectOption("en");
+  await chooseMenuOption(page, "语言", "en");
   await expect(
     inspector.getByRole("heading", { name: "Provider auth" }),
   ).toBeVisible();
@@ -1080,15 +1408,11 @@ test("narrow authenticated sidebar uses icons and all settings follow the chosen
   await expect(
     page.getByRole("button", { name: "Sign out", exact: true }),
   ).toHaveText("");
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await page.getByRole("button", { name: "关闭面板", exact: true }).click();
   await page.getByRole("button", { name: "运行时设置", exact: true }).click();
   await expect(inspector.getByText("暂无可用工具列表。")).toBeVisible();
-  await page
-    .getByRole("combobox", { name: "思考深度", exact: true })
-    .selectOption({ label: "低" });
+  await chooseMenuOption(page, "思考深度", { label: "低" });
   await expect.poll(() => submittedLevel).toBe("low");
   expect(errors).toEqual([]);
   await logout.click();
@@ -1146,9 +1470,7 @@ test("delayed diagnostics from another chat cannot replace the active chat queue
   );
   release();
   await (await oldResponse).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".inspector h2")).toHaveText("会话诊断");
   await expect(page.locator(".queue-item")).toContainText("Current chat queue");
   await expect(page.locator(".queue-item")).not.toContainText("Old chat queue");
@@ -1383,9 +1705,7 @@ test("pagination from a previous chat does not prepend into the current chat", a
   );
   release();
   await (await completed).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".message.user")).toHaveCount(0);
 });
 
@@ -1427,9 +1747,7 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Thinking level", exact: true })
-    .selectOption("high");
+  await chooseMenuOption(page, "Thinking level", "high");
   await expect.poll(() => pending).toBe(true);
   await page
     .getByRole("button", { name: "New session", exact: false })
@@ -1445,14 +1763,51 @@ test("a pending runtime change cannot overwrite the next chat runtime", async ({
   );
   release();
   await (await completed).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".composer-thinking")).toHaveCount(1);
   await expect(page.locator(".composer-thinking")).toContainText("思考深度");
   await expect(
-    page.getByRole("combobox", { name: "思考深度", exact: true }),
+    page.getByRole("button", { name: "思考深度", exact: true }),
   ).toBeEnabled();
+});
+
+test("mobile composer keeps thinking level picker visible", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_thinking_levels",
+          "set_thinking_level",
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/sessions/*/commands", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type === "get_available_thinking_levels")
+      return route.fulfill({
+        json: response({ levels: ["low", "high"] }, body.type),
+      });
+    return route.fallback();
+  });
+  await page.goto("/");
+  const thinking = page.locator(".composer-thinking");
+  await expect(thinking).toBeVisible();
+  await expect(thinking).toContainText("Thinking level");
+  await thinking.click();
+  await expect(
+    page.getByRole("listbox", { name: "Choose thinking level", exact: true }),
+  ).toBeVisible();
+  await page.locator(".dropdown-popover .dropdown-item").first().click();
+  await expect(
+    page.getByRole("listbox", { name: "Choose thinking level", exact: true }),
+  ).toBeHidden();
 });
 
 test("snapshot replay keeps a closed dialog and completed recovery state closed", async ({
@@ -1619,7 +1974,6 @@ for (const action of ["fork", "clone"] as const) {
         });
       },
     );
-    page.on("dialog", (dialog) => dialog.accept("Derived chat"));
     await page.goto("/");
     await page
       .getByRole("button", {
@@ -1627,6 +1981,11 @@ for (const action of ["fork", "clone"] as const) {
           action === "fork" ? "Fork current session" : "Clone current session",
         exact: true,
       })
+      .click();
+    await page.getByRole("dialog").getByRole("textbox").fill("Derived chat");
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Submit", exact: true })
       .click();
     await expect.poll(() => pending).toBe(true);
     await page
@@ -1637,9 +1996,7 @@ for (const action of ["fork", "clone"] as const) {
     );
     release();
     await (await finished).finished();
-    await page
-      .getByRole("combobox", { name: "Language", exact: true })
-      .selectOption("zh");
+    await chooseMenuOption(page, "Language", "zh");
     expect(new URL(page.url()).searchParams.has("session")).toBe(false);
     await expect(page.locator(".toolbar .breadcrumb")).toContainText(
       "rpi-package",
@@ -1685,9 +2042,7 @@ test("late file contents cannot replace the newly selected project preview", asy
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.getByLabel("文件内容")).not.toContainText(
     "Stale project A contents",
   );
@@ -1744,9 +2099,7 @@ test("compaction notes survive pagination and update when language changes", asy
       .locator(".transcript-note")
       .filter({ hasText: "Conversation compacted" }),
   ).toHaveCount(2);
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page.locator(".transcript-note").filter({ hasText: "会话已压缩" }),
   ).toHaveCount(2);
@@ -1849,9 +2202,7 @@ test("provider changes clear secret drafts and an old save cannot clear a new dr
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator("input[type=password]")).toHaveValue(
     "test-only-new-draft",
   );
@@ -1911,7 +2262,6 @@ test("rewinding the current chat reloads its native transcript", async ({
     }
     return route.fallback();
   });
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
   await expect(page.locator(".message.user")).toContainText(
     "Original transcript",
@@ -1919,6 +2269,10 @@ test("rewinding the current chat reloads its native transcript", async ({
   await page.getByRole("button", { name: "Toggle inspector" }).click();
   await page.locator(".history-timeline-item summary").click();
   await page.getByRole("button", { name: "Rewind", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Submit", exact: true })
+    .click();
   await expect(page.locator(".message.user")).toContainText(
     "Rewound transcript",
   );
@@ -1976,6 +2330,128 @@ test("an old prompt acknowledgement does not block a new chat or unlock its pend
   releases[1]();
   await (await newFinished).finished();
   expect(pending).toEqual([sessionId, "session-2"]);
+});
+
+for (const kind of ["single", "input", "multiple", "cancel"] as const) {
+  test(`ask_user ${kind} returns a native structured answer`, async ({
+    page,
+  }) => {
+    await mockHost(page);
+    let submitted: Record<string, unknown> | undefined;
+    await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          status: "awaiting_input",
+          messages: [],
+          lastSeq: 4,
+          events: [],
+          pendingDialogs: [
+            {
+              requestId: "ask-native",
+              toolCallId: "ask-1",
+              ui: {
+                kind: kind === "input" ? "input" : "selector",
+                question: "Choose a target",
+                context: "Native ask_user test",
+                options:
+                  kind === "input"
+                    ? []
+                    : [
+                        { title: "Linux", description: "Server build" },
+                        { title: "Windows" },
+                      ],
+                allowMultiple: kind === "multiple",
+                allowComment: kind === "multiple",
+                allowFreeform: kind === "input",
+              },
+            },
+          ],
+        },
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "ui_dialog_response") return route.fallback();
+      submitted = body;
+      return route.fulfill({ json: response({ accepted: true }, body.type) });
+    });
+    await page.goto("/");
+    const dialog = page.getByRole("dialog");
+    await expect(
+      dialog.getByRole("heading", { name: "Choose a target" }),
+    ).toBeVisible();
+    if (kind === "cancel") {
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect
+        .poll(() => submitted)
+        .toMatchObject({ requestId: "ask-native", cancelled: true });
+      expect(submitted).not.toHaveProperty("answer");
+      return;
+    }
+    if (kind !== "input")
+      await dialog.getByRole("button", { name: "Linux Server build" }).click();
+    if (kind === "multiple") {
+      await dialog
+        .getByRole("button", { name: "Windows", exact: true })
+        .click();
+      await expect(
+        dialog.getByRole("button", { name: "Windows", exact: true }),
+      ).toHaveAttribute("aria-pressed", "true");
+    }
+    if (kind !== "single") {
+      await dialog.getByRole("textbox").fill("Deploy to staging");
+      await dialog.getByRole("button", { name: "Submit", exact: true }).click();
+    }
+    const answer =
+      kind === "single"
+        ? { values: ["Linux"] }
+        : kind === "input"
+          ? { values: ["Deploy to staging"], text: "Deploy to staging" }
+          : { values: ["Linux", "Windows"], text: "Deploy to staging" };
+    await expect.poll(() => submitted?.answer).toEqual(answer);
+  });
+}
+
+test("history renders before the model catalog finishes loading", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_models",
+        ],
+      },
+    }),
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      if (route.request().postDataJSON().type !== "get_available_models")
+        return route.fallback();
+      await held;
+      return route.fulfill({ json: response({ models: [] }) });
+    },
+  );
+  await page.goto("/");
+  try {
+    await expect(page.locator(".transcript-note")).toContainText(
+      "Run completed",
+    );
+    await expect(
+      page.getByRole("status", { name: "Loading conversation" }),
+    ).toBeHidden();
+  } finally {
+    release();
+  }
 });
 
 test("consecutive permission dialogs remain independent of delayed acknowledgements", async ({
@@ -2043,9 +2519,9 @@ test("consecutive permission dialogs remain independent of delayed acknowledgeme
   );
   releases[0]();
   await (await firstFinished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  // Keep interacting with the active permission modal; its backdrop correctly
+  // prevents changing the workspace language while a response is pending.
+  await page.setViewportSize({ width: 1100, height: 800 });
   await expect(
     page.getByRole("heading", { name: "Second question" }),
   ).toBeVisible();
@@ -2241,7 +2717,12 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
     timestamp: 42,
     content: [
       { type: "text", text: "Already committed" },
-      { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      {
+        type: "toolCall",
+        id: "call-1",
+        name: "read",
+        arguments: { path: "src/main.ts" },
+      },
     ],
   };
   await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
@@ -2256,7 +2737,17 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
             timestamp: 43,
             entryId: "durable-2",
             toolCallId: "call-1",
-            content: [{ type: "text", text: "Completed result" }],
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  content: [{ type: "text", text: "const value = 1;" }],
+                  details: null,
+                  usage: null,
+                  terminate: false,
+                }),
+              },
+            ],
           },
         ],
         history: {
@@ -2312,7 +2803,12 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".message.assistant")).toHaveCount(1);
   await expect(page.locator(".tool-card.tool-done")).toHaveCount(1);
   await page.locator(".tool-card summary").click();
-  await expect(page.locator(".tool-card")).toContainText("Completed result");
+  await expect(page.locator(".tool-card")).toContainText("const value = 1;");
+  await expect(page.locator(".tool-card")).not.toContainText('"content"');
+  await expect(page.locator(".read-code-path")).toHaveText("src/main.ts");
+  await expect(page.locator(".read-code pre code")).toHaveClass(
+    /language-typescript/,
+  );
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
@@ -2425,9 +2921,7 @@ test("a late failed chat creation does not mark the subsequently selected projec
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".toolbar .breadcrumb")).toContainText(
     "rpi-package",
   );
@@ -2702,7 +3196,9 @@ test("a failed chat creation does not hide rejection of the still-active prompt"
     "Prompt was rejected",
   );
   await expect(page.locator(".message.user")).toHaveCount(0);
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("snapshot boundary status supersedes an earlier idle runtime read", async ({
@@ -2722,7 +3218,9 @@ test("snapshot boundary status supersedes an earlier idle runtime read", async (
     }),
   );
   await page.goto("/");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
 });
 
@@ -2922,12 +3420,16 @@ test("a rejected compact command releases the composer and restores its draft", 
   await input.press("Enter");
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Cannot compact yet",
   );
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
   await expect(input).toHaveValue("/compact keep recent context");
   await expect(page.locator(".connection")).toContainText("reconnecting");
 });
@@ -2984,7 +3486,9 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect.poll(() => pending).toBe(true);
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   release();
   await expect(page.locator(".error-banner")).toContainText(
     "Resume unavailable",
@@ -2992,7 +3496,9 @@ test("a rejected resume keeps its recovery action and releases the busy composer
   await expect(
     page.getByRole("button", { name: "Continue", exact: true }),
   ).toBeEnabled();
-  await expect(page.locator(".composer button.danger")).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("an executed slash command does not return as a draft after switching chats", async ({
@@ -3097,13 +3603,16 @@ test("late message pagination from before rewind cannot enter the restored branc
       return route.fallback();
     },
   );
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
   await page.getByRole("button", { name: "Load earlier messages" }).click();
   await expect.poll(() => pending).toBe(true);
   await page.getByRole("button", { name: "Toggle inspector" }).click();
   await page.locator(".history-timeline-item summary").click();
   await page.getByRole("button", { name: "Rewind", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Submit", exact: true })
+    .click();
   await expect(page.locator(".message.user")).toContainText("Restored branch");
   const finished = page.waitForResponse(
     (res) =>
@@ -3112,9 +3621,7 @@ test("late message pagination from before rewind cannot enter the restored branc
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(page.locator(".message.user")).toHaveCount(1);
   await expect(page.locator(".message.user")).not.toContainText(
     "Stale branch message",
@@ -3133,8 +3640,53 @@ test("an operation accepted in another tab stays busy without an agent_start eve
   );
   await page.goto("/");
   await expect(page.locator(".connection")).toContainText("reconnecting");
-  await expect(page.locator(".composer button.danger")).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
   await expect(page.locator(".composer-queue-hint")).toBeVisible();
+});
+
+test("a live settlement replaces the matching restored settlement", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        messages: [],
+        events: [],
+        lastSeq: 4,
+        history: {
+          records: [
+            {
+              type: "operation_finished",
+              seq: 4,
+              outcome: "aborted",
+              timestamp: 1_700_000_000_000,
+            },
+          ],
+          total: 1,
+          limit: 100,
+          hasMore: false,
+          firstSeq: 4,
+          lastSeq: 4,
+          openOperations: [],
+        },
+      },
+    }),
+  );
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'id: 5\\nevent: agent_settled\\ndata: {"type":"agent_settled","runId":"run-2","outcome":"aborted"}\\n\\n',
+    }),
+  );
+  await page.goto("/");
+  await expect(
+    page.locator(".transcript-note").filter({ hasText: "Run aborted" }),
+  ).toHaveCount(1);
 });
 
 test("live and restored settlement labels follow the selected language", async ({
@@ -3153,9 +3705,7 @@ test("live and restored settlement labels follow the selected language", async (
       .locator(".transcript-note")
       .filter({ hasText: "Run failed · aborted" }),
   ).toHaveCount(1);
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page
       .locator(".transcript-note")
@@ -3164,9 +3714,7 @@ test("live and restored settlement labels follow the selected language", async (
   await expect(
     page.locator(".transcript-note").filter({ hasText: "运行状态：已完成" }),
   ).toHaveCount(1);
-  await page
-    .getByRole("combobox", { name: "语言", exact: true })
-    .selectOption("en");
+  await chooseMenuOption(page, "语言", "en");
   await expect(
     page
       .locator(".transcript-note")
@@ -3231,8 +3779,8 @@ test("same model IDs from different providers keep their identity in runtime sel
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  const model = page.getByRole("combobox", { name: "Model", exact: true });
-  await model.selectOption({ label: "Model Beta (beta)" });
+  const model = page.getByRole("button", { name: "Model", exact: true });
+  await chooseMenuOption(page, "Model", { label: "Model Beta (beta)" });
   await expect
     .poll(() => changes)
     .toEqual([
@@ -3242,7 +3790,7 @@ test("same model IDs from different providers keep their identity in runtime sel
         provider: "beta",
       }),
     ]);
-  await expect(model.locator("option:checked")).toHaveText("Model Beta (beta)");
+  await expect(model).toContainText("Model Beta (beta)");
   await expect(page.locator(".inspector")).toContainText("8k");
 });
 
@@ -3308,9 +3856,7 @@ test("a late tool change cannot replace the next chat tool catalog", async ({
   );
   release();
   await (await finished).finished();
-  await page
-    .getByRole("combobox", { name: "Language", exact: true })
-    .selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await expect(
     page.getByRole("checkbox", { name: "new-tool", exact: true }),
   ).toBeVisible();
@@ -3378,20 +3924,24 @@ test("model changes reload supported thinking levels and keep authoritative runt
   await page
     .getByRole("button", { name: "Runtime settings", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", {
+  const thinking = page.getByRole("button", {
     name: "Thinking level",
     exact: true,
   });
-  await thinking.selectOption("high");
-  await expect(thinking).toHaveValue("low");
-  await page
-    .getByRole("combobox", { name: "Model", exact: true })
-    .selectOption({ label: "Second model (test)" });
+  await chooseMenuOption(page, "Thinking level", "high");
+  await expect(thinking).toContainText("low");
+  await chooseMenuOption(page, "Model", { label: "Second model (test)" });
   await expect.poll(() => loadingSecondLevels).toBe(true);
   await expect(thinking).toBeDisabled();
   releaseLevels();
-  await expect(thinking).toHaveValue("off");
-  await expect(thinking.locator("option")).toHaveText(["—", "off"]);
+  await expect(thinking).toContainText("off");
+  await thinking.click();
+  const options = page
+    .getByRole("listbox", { name: "Thinking level", exact: true })
+    .getByRole("option");
+  await expect(options).toHaveCount(2);
+  await expect(options.nth(0)).toHaveAccessibleName("—");
+  await expect(options.nth(1)).toHaveAccessibleName("off");
 });
 
 test("slash model selection rejects ambiguous names and accepts provider qualified IDs", async ({
@@ -3537,9 +4087,7 @@ for (const outcome of ["done", "error", "closed"] as const) {
     await page.reload();
     await expect(timer).toHaveText("1.2s");
     await expect(page.locator(".shell-command")).toHaveText("sleep 1");
-    await page
-      .getByRole("combobox", { name: "Language", exact: true })
-      .selectOption("zh");
+    await chooseMenuOption(page, "Language", "zh");
     await expect(timer).toHaveAccessibleName("耗时 1.2s");
     await page.setViewportSize({ width: 390, height: 844 });
     expect(
@@ -3611,6 +4159,21 @@ test("bash card folds a multiline command into one line and strips ANSI output",
   ).toBe(true);
 });
 
+test("composer uses Shift+Enter for a newline without sending", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  const input = page.locator(".composer textarea");
+  await input.fill("first line");
+  await input.press("Shift+Enter");
+  await input.type("second line");
+  await expect(input).toHaveValue("first line\nsecond line");
+  await expect(page.locator(".composer-shortcut-hint")).toContainText(
+    "new line",
+  );
+});
+
 test("initial snapshot preserves slash feedback entered while history is loading", async ({
   page,
 }) => {
@@ -3640,7 +4203,7 @@ test("initial snapshot preserves slash feedback entered while history is loading
     page
       .locator(".transcript-note")
       .filter({ hasText: "restored from session history" }),
-  ).toBeVisible();
+  ).toHaveCount(1);
   await expect(
     page.locator(".transcript-note").filter({ hasText: "/help" }),
   ).toBeVisible();
@@ -3780,6 +4343,7 @@ test("composer model picker groups by provider and applies the selection", async
     .locator(".dropdown-item")
     .filter({ hasText: "Model Beta" })
     .click();
+  await expect(page.locator(".dropdown-popover")).toBeHidden();
   await expect
     .poll(() => changes)
     .toEqual([
@@ -3791,6 +4355,7 @@ test("composer model picker groups by provider and applies the selection", async
 test("edit tool renders a file diff and powershell renders as a terminal", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   await mockHost(page);
   await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
     route.fulfill({
@@ -3827,7 +4392,10 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
                 type: "toolCall",
                 id: "ps-1",
                 name: "powershell",
-                arguments: { command: "Get-ChildItem" },
+                arguments: {
+                  command:
+                    "rg -n -A120 -B30 \"tool-row|tool-card|message-list|virtual-row|message-body\" packages/rpi-web/frontend/src/styles.css packages/rpi-web/frontend/src/desktop.css | sed -n '1,300p'",
+                },
               },
             ],
           },
@@ -3843,14 +4411,335 @@ test("edit tool renders a file diff and powershell renders as a terminal", async
   );
   await page.goto("/");
   await expect(page.locator(".edit-card")).toBeVisible();
-  await page.locator(".edit-card summary").click();
+  await expect(page.locator(".edit-card")).toHaveCSS("border-radius", "0px");
+  await page.locator(".edit-card > summary").click();
   await expect(page.locator(".edit-path")).toContainText("src/app.ts");
+  await page.locator(".edit-content > summary").click();
   await expect(page.locator(".edit-line.remove")).toContainText("const a = 1;");
   await expect(page.locator(".edit-line.add")).toContainText("const a = 2;");
   await expect(page.locator(".shell-card")).toBeVisible();
-  await expect(page.locator(".shell-card .shell-command")).toHaveText(
-    "Get-ChildItem",
+  const transcriptBox = await page.locator(".transcript").boundingBox();
+  const shellBox = await page.locator(".shell-card").boundingBox();
+  expect(transcriptBox).not.toBeNull();
+  expect(shellBox).not.toBeNull();
+  expect(shellBox!.x).toBeGreaterThanOrEqual(transcriptBox!.x);
+  expect(shellBox!.x + shellBox!.width).toBeLessThanOrEqual(
+    transcriptBox!.x + transcriptBox!.width,
+  );
+  const status = page.locator(".shell-card .tool-status");
+  const statusBox = await status.boundingBox();
+  expect(statusBox).not.toBeNull();
+  expect(statusBox!.x + statusBox!.width).toBeLessThanOrEqual(
+    shellBox!.x + shellBox!.width,
+  );
+  await expect(page.locator(".shell-card .shell-command")).toContainText(
+    "rg -n",
   );
   await page.locator(".shell-card summary").click();
-  await expect(page.locator(".shell-card .shell-prompt")).toHaveText("PS> ");
+  await expect(page.locator(".shell-card .shell-branch")).toHaveText("└");
+});
+
+for (const mode of [
+  "legacy messages",
+  "live messages",
+  "native totals",
+] as const) {
+  test(`token metrics survive diagnostics and reload with ${mode}`, async ({
+    page,
+  }) => {
+    await mockHost(page);
+    const legacy = mode !== "native totals";
+    const live = mode === "live messages";
+    const stats = {
+      messageCount: 4,
+      cachedTokens: legacy ? 0 : 800,
+      uncachedTokens: legacy ? 0 : 200,
+      totalTokens: legacy ? 0 : 1050,
+      costTotal: 0,
+      cacheHitRatio: null,
+    };
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, (route) => {
+      const { type } = route.request().postDataJSON();
+      if (type === "get_stats")
+        return route.fulfill({ json: response(stats, type) });
+      if (type === "get_state")
+        return route.fulfill({ json: response({ sessionId, stats }, type) });
+      return route.fallback();
+    });
+    await page.route(`**/api/v1/sessions/${sessionId}/snapshot`, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          status: "ready",
+          lastSeq: 4,
+          events: [],
+          hasMore: true,
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "Earlier reply" }],
+              usage: { input: 10, output: 20, cacheRead: 0, totalTokens: 30 },
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "Latest reply" }],
+              usage: {
+                input: 1530,
+                output: 1182,
+                cacheRead: 158208,
+                cacheWrite: 0,
+                totalTokens: 160920,
+              },
+            },
+          ],
+        },
+      }),
+    );
+    if (live)
+      await page.route(`**/api/v1/sessions/${sessionId}/events**`, (route) => {
+        const events = [
+          { input: 100, output: 50, cacheRead: 100, totalTokens: 250 },
+          { input: 400, output: 120, cacheRead: 600, totalTokens: 1120 },
+        ]
+          .map(
+            (usage, index) =>
+              `id: ${5 + index}\nevent: message_end\ndata: ${JSON.stringify({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "Live reply" }],
+                  usage,
+                },
+              })}\n\n`,
+          )
+          .join("");
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: events,
+        });
+      });
+    for (const reload of [false, true]) {
+      const diagnostics = page.waitForResponse(
+        (res) =>
+          res.url().endsWith("/commands") &&
+          res.request().postDataJSON()?.type === "get_stats",
+      );
+      if (reload) await page.reload();
+      else await page.goto("/");
+      await diagnostics;
+      const metrics = page.locator(".composer-metrics");
+      await expect(
+        metrics.getByLabel(
+          `Cache hit: ${live ? "60%" : legacy ? "99%" : "80%"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(
+        metrics.getByLabel(
+          `Input tokens: ${live ? "1.0k" : legacy ? "160k" : "1.0k"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(
+        metrics.getByLabel(
+          `Output tokens: ${live ? "120" : legacy ? "1.2k" : "50"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await metrics.locator(":scope > summary").click();
+      await expect(
+        metrics.getByLabel(
+          `Cached tokens: ${live ? "600" : legacy ? "158k" : "800"}`,
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(metrics).not.toContainText("Usage from the latest response");
+      if (reload)
+        await metrics.screenshot({
+          path: test.info().outputPath("token-metrics.png"),
+        });
+    }
+  });
+}
+
+test("composer shows the active project path, branch and linked worktree on narrow screens", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/projects/project-a/git/status", (route) =>
+    route.fulfill({
+      json: {
+        isRepository: true,
+        branch: "codex/a-long-worktree-branch",
+        files: [],
+        isWorktree: true,
+        worktreePath: "/workspace/pi-rust",
+      },
+    }),
+  );
+  await page.goto("/");
+  const context = page.locator(".composer-workspace");
+  await expect(
+    context.getByRole("button", { name: "/workspace/pi-rust", exact: true }),
+  ).toBeVisible();
+  await expect(
+    context.getByLabel("Branch: codex/a-long-worktree-branch", { exact: true }),
+  ).toBeVisible();
+  await expect(context.getByText("worktree", { exact: true })).toBeVisible();
+  for (const width of [320, 375, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(
+      await context.evaluate(
+        (element) => element.scrollWidth <= element.clientWidth,
+      ),
+    ).toBe(true);
+  }
+  await page.screenshot({
+    path: test.info().outputPath("project-context.png"),
+  });
+  await page.setViewportSize({ width: 375, height: 844 });
+  await page
+    .getByRole("button", { name: "Toggle sidebar", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Open project: rpi-package", exact: true })
+    .click();
+  await expect(
+    context.getByRole("button", {
+      name: "/workspace/rpi-package",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    context.getByLabel("Branch: main", { exact: true }),
+  ).toBeVisible();
+  await expect(context.getByText("worktree", { exact: true })).toBeHidden();
+  await expect(context).not.toContainText("codex/a-long-worktree-branch");
+});
+
+test("mobile composer footer keeps model picker usable beside session metrics", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [
+          ...capabilities.supportedCommands,
+          "get_available_models",
+          "set_model",
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/sessions/*/commands", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.type === "get_available_models") {
+      return route.fulfill({
+        json: response(
+          {
+            models: [
+              {
+                id: "mobile-model",
+                name: "Mobile model",
+                provider: "test-provider",
+              },
+            ],
+          },
+          body.type,
+        ),
+      });
+    }
+    if (body.type === "get_state") {
+      return route.fulfill({
+        json: response(
+          {
+            sessionId,
+            leafId: "leaf-1",
+            modelId: "mobile-model",
+            provider: "test-provider",
+            context: { tokens: 129000, window: 227000, percent: 57 },
+          },
+          body.type,
+        ),
+      });
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+
+  const model = page.getByRole("button", {
+    name: "Choose model",
+    exact: true,
+  });
+  await expect(model).toBeVisible();
+  const modelBox = await model.boundingBox();
+  expect(modelBox).not.toBeNull();
+  expect(modelBox!.x + modelBox!.width).toBeLessThanOrEqual(390);
+
+  const metrics = page.locator(".composer-metrics");
+  const footer = page.locator(".composer-footer");
+  await expect(metrics.getByLabel(/^Context:/)).toBeVisible();
+  await expect(
+    metrics.getByLabel("Context: 129k / 227k", { exact: true }),
+  ).toContainText("129k / 227k");
+  await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Input tokens: 100$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Output tokens: 252$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
+  await expect(
+    metrics.getByLabel("Total tokens: 352", { exact: true }),
+  ).toBeHidden();
+  await expect(metrics.getByLabel(/^Cached tokens:/)).toBeHidden();
+  await expect(metrics.getByLabel(/^Cost:/)).toBeHidden();
+  expect(
+    await metrics.evaluate(
+      (element) => element.scrollWidth <= element.clientWidth,
+    ),
+  ).toBe(true);
+  await metrics.locator(":scope > summary").click();
+  await expect(metrics.getByLabel(/^Cached tokens:/)).toBeVisible();
+  const metricsBox = await metrics.boundingBox();
+  const footerBox = await footer.boundingBox();
+  expect(metricsBox).not.toBeNull();
+  expect(footerBox).not.toBeNull();
+  expect(metricsBox!.y).toBeGreaterThan(footerBox!.y + footerBox!.height - 1);
+
+  await metrics.locator(":scope > summary").click();
+  for (const width of [320, 375, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    const summary = metrics.locator(":scope > summary");
+    await expect(summary.locator(".composer-metric")).toHaveCount(4);
+    const layout = await summary.evaluate((element) => {
+      const tops = Array.from(
+        element.querySelectorAll(".composer-metric"),
+        (item) => item.getBoundingClientRect().top,
+      );
+      return {
+        singleLine: Math.max(...tops) - Math.min(...tops) < 1,
+        fits: element.scrollWidth <= element.clientWidth,
+      };
+    });
+    expect(layout).toEqual({ singleLine: true, fits: true });
+    if (width === 375)
+      await metrics.screenshot({
+        path: test.info().outputPath("compact-footer-mobile.png"),
+      });
+  }
+
+  await model.click();
+  const popover = page.getByRole("listbox", {
+    name: "Choose model",
+    exact: true,
+  });
+  await expect(popover).toBeVisible();
+  const popoverBox = await popover.boundingBox();
+  expect(popoverBox).not.toBeNull();
+  expect(popoverBox!.y).toBeGreaterThanOrEqual(0);
+  expect(popoverBox!.y + popoverBox!.height).toBeLessThanOrEqual(844);
+  await page.getByRole("option", { name: "Mobile model" }).click();
+  await expect(popover).toBeHidden();
 });

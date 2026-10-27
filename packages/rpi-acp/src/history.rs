@@ -1,8 +1,8 @@
 //! Durable native rpi sessions and ACP replay of the backend's active branch.
 use crate::session::translate_event;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn session_directory(id: &str) -> Result<PathBuf, String> {
@@ -33,87 +33,26 @@ pub(crate) fn saved_session(id: &str) -> Result<PathBuf, String> {
 }
 
 fn find_saved_session(directory: &Path, id: &str) -> Result<PathBuf, String> {
-    let mut found = None;
-    let directories = std::fs::read_dir(directory)
-        .map_err(|_| "unknown sessionId: no saved ACP session".to_string())?;
-    for entry in directories {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            continue;
-        }
-        for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
-            let file = file.map_err(|e| e.to_string())?;
-            if !file.file_type().map_err(|e| e.to_string())?.is_file()
-                || !file
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(&format!("_{id}.jsonl"))
-            {
-                continue;
-            }
-            let path = file.path();
-            let mut reader = BufReader::new(std::fs::File::open(&path).map_err(|e| e.to_string())?);
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(|e| e.to_string())?;
-            let header: Value =
-                serde_json::from_str(&line).map_err(|e| format!("invalid session header: {e}"))?;
-            if header["kind"] != "header" || header["version"] != 4 || header["id"] != id {
-                return Err("invalid saved session header".into());
-            }
-            if found.replace(path).is_some() {
-                return Err("multiple saved files for sessionId".into());
-            }
-        }
-    }
-    found.ok_or_else(|| "unknown sessionId: no saved ACP session".into())
+    rpi_extcore::history::find_saved_session(directory, id)
+        .map_err(|error| error.replace("no saved native session", "no saved ACP session"))
 }
-
 pub(crate) fn replay(path: &Path, leaf: Option<&str>) -> Result<Vec<Value>, String> {
-    let reader = BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
-    let mut entries = HashMap::new();
-    for line in reader.lines().skip(1) {
-        let line = line.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: Value =
-            serde_json::from_str(&line).map_err(|e| format!("invalid session history: {e}"))?;
-        if entry["kind"] == "entry" {
-            let id = entry["id"]
-                .as_str()
-                .ok_or("history entry has no id")?
-                .to_owned();
-            if entries.insert(id, entry).is_some() {
-                return Err("duplicate history entry id".into());
-            }
-        }
-    }
-    branch_updates(&entries, leaf)
+    Ok(rpi_extcore::history::branch_messages(path, leaf)?
+        .iter()
+        .flat_map(message_updates)
+        .collect())
 }
-
-fn branch_updates<'a>(
-    entries: &'a HashMap<String, Value>,
-    mut leaf: Option<&'a str>,
+#[cfg(test)]
+fn branch_updates(
+    entries: &HashMap<String, Value>,
+    leaf: Option<&str>,
 ) -> Result<Vec<Value>, String> {
-    let mut path = Vec::new();
-    let mut visited = HashSet::new();
-    while let Some(id) = leaf {
-        if !visited.insert(id) {
-            return Err("cycle in saved session history".into());
-        }
-        let entry = entries
-            .get(id)
-            .ok_or("saved session history is missing a branch entry")?;
-        path.push(entry);
-        leaf = entry["parentId"].as_str();
-    }
-    let mut updates = Vec::new();
-    for entry in path.into_iter().rev() {
-        if entry["type"] == "message" {
-            updates.extend(message_updates(&entry["message"]));
-        }
-    }
-    Ok(updates)
+    Ok(
+        rpi_extcore::history::branch_messages_from_entries(entries, leaf)?
+            .iter()
+            .flat_map(message_updates)
+            .collect(),
+    )
 }
 
 fn message_updates(message: &Value) -> Vec<Value> {

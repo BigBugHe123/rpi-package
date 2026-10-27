@@ -2,6 +2,103 @@
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.11...rpi-web-v0.1.12) - 2026-10-26
+
+### Fixed
+
+- *(web)* deduplicate restored settlement notes
+
+### Other
+
+- Merge pull request #81 from pi-rust/fix/web-settlement-dedupe
+
+## [0.1.11](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.10...rpi-web-v0.1.11) - 2026-10-26
+
+### Added
+
+- *(web)* refine workspace composer and tool output
+
+## [0.1.10](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.9...rpi-web-v0.1.10) - 2026-10-25
+
+### Added
+
+- *(durable)* add branch-backed durable runtime
+
+## [0.1.9](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.8...rpi-web-v0.1.9) - 2026-10-25
+
+### Other
+
+- *(snapshot)* parallelize messages and history requests
+- add architecture boundary guidance
+
+## [0.1.8](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.7...rpi-web-v0.1.8) - 2026-10-24
+
+### Fixed
+
+- *(web)* improve session loading and workspace UI
+
+### Other
+
+- extract shared extension core and HTTP adapter
+
+### Fixed
+
+- Show the session's project directory and Git branch beside the composer, with linked-worktree detection and compact path truncation on narrow screens.
+- Load the latest 80 messages for the initial snapshot and fetch model catalogs after history, while retaining native pagination for earlier messages.
+- Return native structured `ask_user` answers, including multiple choices and comments, without changing permission dialog responses.
+- Keep the mobile composer at its intended 14px corner radius instead of inheriting the desktop's 17px radius.
+- Use square corners for fenced code blocks and remove the nested preformatted border that doubled the frame and heading separator.
+- Restore token and cache metrics from the latest historical response when legacy session totals are unavailable, retain them across diagnostic refreshes, and derive input/output counts from native aggregate statistics.
+- Keep the composer footer on one line with input, output, cache hit rate and context usage/capacity; move total/cached tokens and secondary metrics into the expandable details.
+
+## [0.1.7] - 2026-10-24
+
+### Changed
+
+- Prefer `rpi --webserver` for starting the Web server, including `=init`, `=help`, explicit configuration paths, and host `--port` / `--bind` overrides. Keep `--web` as a compatibility alias with the same configuration and session storage.
+- Reject different values supplied to `--webserver` and `--web` together, and retain service-entry conflict checks and inactive RPC child behavior.
+- Document how React/Vite assets are built, embedded in the extension, and served without a separate frontend process.
+
+### Fixed
+
+- Allow the generated, ignored frontend bundle to be included during crate publication, fixing the release failure caused by Cargo's dirty-file check.
+
+## [0.1.6](https://github.com/pi-rust/rpi-package/compare/rpi-web-v0.1.5...rpi-web-v0.1.6) - 2026-10-23
+
+### Added
+
+- *(e2e)* mock stats data and update shell card assertions
+- *(rpi-web)* add MenuSelect component and background process helper
+
+### Fixed
+
+- *(web)* restore desktop chrome after the mobile responsive pass
+- *(rpi-web)* prevent console windows in background processes
+- fix queued message editing
+
+### Other
+
+- *(web)* note the desktop chrome and toolbar fixes in the changelog
+- *(web)* stop tracking generated frontend bundle
+- *(release)* bump workspace to 0.1.9
+- *(rpi-web)* add session tags and sidebar filters`
+
+### Fixed
+
+- Restore the desktop workspace chrome after the responsive pass: keep the rounded buttons, cards, popovers and composer instead of the global square-corner override, and restore the missing `--radius` token.
+- Hide the mobile-only session switcher and its backdrop on desktop, and keep the connection status chip in the toolbar.
+- Keep the model and thinking (provider) pickers in the composer only instead of duplicating them in the top-right toolbar.
+- Prevent background RPC, Git and authentication refresh processes from opening console windows on Windows while preserving their standard I/O and shutdown behavior.
+
+### Added
+
+- Add durable session tags, server-side session list filters, and sidebar tag/status filtering.
+- Add a session tag editor with bounded, normalized tag persistence.
+
+### Notes
+
+- Session search currently indexes project names, session titles, IDs, and tags without opening offline native hosts. Transcript full-text search remains a follow-up feature.
+
 ## [0.1.5] - 2026-10-21
 
 ### Changed

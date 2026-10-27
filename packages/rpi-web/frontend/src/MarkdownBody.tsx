@@ -1,14 +1,78 @@
-import { memo, useMemo, type ComponentProps } from "react";
+import {
+  isValidElement,
+  memo,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
+import { Check, Copy } from "lucide-react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
-import type { Language } from "./i18n";
+import { translate, type Language } from "./i18n";
 
 const remarkPlugins = [remarkGfm, remarkBreaks];
 const rehypePlugins: ComponentProps<typeof Markdown>["rehypePlugins"] = [
   [rehypeHighlight, { ignoreMissing: true }],
 ];
+
+function codeText(value: ReactNode): string {
+  if (typeof value === "string" || typeof value === "number")
+    return String(value);
+  if (Array.isArray(value)) return value.map(codeText).join("");
+  if (isValidElement(value))
+    return codeText((value.props as { children?: ReactNode }).children);
+  return "";
+}
+
+function CodeBlock({
+  children,
+  language,
+}: {
+  children?: ReactNode;
+  language: Language;
+}) {
+  const [copied, setCopied] = useState(false);
+  const text = codeText(children).replace(/\n$/, "");
+
+  async function copyCode() {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard access can be denied; the code remains selectable.
+    }
+  }
+
+  return (
+    <div className="markdown-code-block">
+      <div className="markdown-code-heading">
+        <span>{translate(language, "code")}</span>
+        <button
+          type="button"
+          className="markdown-copy"
+          onClick={() => void copyCode()}
+          disabled={!text}
+          aria-label={
+            copied
+              ? translate(language, "copied")
+              : translate(language, "copyCode")
+          }
+        >
+          {copied ? <Check size={12} /> : <Copy size={12} />}
+          {copied
+            ? translate(language, "copied")
+            : translate(language, "copyCode")}
+        </button>
+      </div>
+      <pre>{children}</pre>
+    </div>
+  );
+}
 
 /** Chat Markdown preserves authored line breaks without changing code whitespace. */
 export const MarkdownBody = memo(function MarkdownBody({
@@ -33,6 +97,9 @@ export const MarkdownBody = memo(function MarkdownBody({
         >
           <table>{children}</table>
         </div>
+      ),
+      pre: ({ children }) => (
+        <CodeBlock language={language}>{children}</CodeBlock>
       ),
     }),
     [language],

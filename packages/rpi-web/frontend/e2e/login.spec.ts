@@ -1,3 +1,4 @@
+import { chooseMenuOption } from "./controls";
 import { test, expect } from "@playwright/test";
 
 test("login supports retry, password reveal, pending state and successful access", async ({
@@ -71,7 +72,7 @@ test("mobile login localizes errors and preserves appearance preferences", async
         }),
   );
   await page.goto("/");
-  await page.getByRole("combobox", { name: "Language" }).selectOption("zh");
+  await chooseMenuOption(page, "Language", "zh");
   await page.getByRole("button", { name: "切换到深色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page

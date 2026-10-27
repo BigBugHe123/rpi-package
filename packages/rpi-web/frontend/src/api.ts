@@ -22,6 +22,7 @@ export interface SessionSummary {
   projectId?: string;
   pinned?: boolean;
   archived?: boolean;
+  tags?: string[];
   title: string | null;
   status: string;
   createdAt: number;
@@ -39,6 +40,14 @@ export interface SessionSummary {
   } | null;
 }
 
+export interface SessionListFilters {
+  q?: string;
+  projectId?: string;
+  tag?: string;
+  status?: string;
+  archived?: boolean;
+  pinned?: boolean;
+}
 export interface AuthState {
   required: boolean;
   authenticated: boolean;
@@ -55,6 +64,11 @@ export interface FileEntry {
   kind: "directory" | "file";
   size: number;
 }
+export interface UploadedFile {
+  name: string;
+  path: string;
+  size: number;
+}
 export interface ChangedFile {
   path: string;
   originalPath?: string | null;
@@ -65,6 +79,10 @@ export interface ChangedFile {
 export interface GitStatus {
   isRepository: boolean;
   branch: string | null;
+  isDetached?: boolean;
+  isWorktree?: boolean | null;
+  repositoryRoot?: string | null;
+  worktreePath?: string | null;
   files: ChangedFile[];
 }
 
@@ -99,6 +117,15 @@ export interface RuntimeStats {
   cachedTokens: number;
   uncachedTokens: number;
   totalTokens: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  input?: number | null;
+  output?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  cost?: number | null;
   provider?: string | null;
   modelId?: string | null;
   operationCount?: number;
@@ -215,7 +242,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "x-rpi-web": "1",
-      ...(init?.body ? { "content-type": "application/json" } : {}),
+      ...(init?.body && !(init.body instanceof FormData)
+        ? { "content-type": "application/json" }
+        : {}),
       ...init?.headers,
     },
   });
@@ -253,6 +282,17 @@ export async function commandData<T>(
   return (response.data ?? {}) as T;
 }
 
+const gitRequests = new Map<string, Promise<GitStatus>>();
+function gitStatus(projectId: string) {
+  const existing = gitRequests.get(projectId);
+  if (existing) return existing;
+  const job = request<GitStatus>(`/projects/${projectId}/git/status`).finally(() => {
+    if (gitRequests.get(projectId) === job) gitRequests.delete(projectId);
+  });
+  gitRequests.set(projectId, job);
+  return job;
+}
+
 export const api = {
   projects: () =>
     request<{
@@ -260,20 +300,32 @@ export const api = {
       defaultProjectId: string;
       projectsRoot?: string;
     }>("/projects"),
-  projectFolders: () =>
-    request<{ root: string; folders: { name: string; path: string }[] }>(
-      "/project-folders",
-    ),
+  projectFolders: (path = "") =>
+    request<{
+      root: string;
+      path: string;
+      folders: { name: string; path: string }[];
+    }>(`/project-folders?${new URLSearchParams({ path })}`),
   createProject: (name: string, initGit: boolean, path?: string) =>
     request<{ project: Project }>("/projects", {
       method: "POST",
       body: JSON.stringify({ name, initGit, ...(path ? { path } : {}) }),
     }),
+  renameProject: (id: string, name: string) =>
+    request<{ project: Project }>(`/projects/${id}/rename`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
   sessionMetadata: (
     id: string,
-    metadata: { pinned?: boolean; archived?: boolean },
+    metadata: { pinned?: boolean; archived?: boolean; tags?: string[] },
   ) =>
-    request<{ sessionId: string; pinned: boolean; archived: boolean }>(
+    request<{
+      sessionId: string;
+      pinned: boolean;
+      archived: boolean;
+      tags: string[];
+    }>(
       `/sessions/${id}/metadata`,
       { method: "POST", body: JSON.stringify(metadata) },
     ),
@@ -285,8 +337,15 @@ export const api = {
     request<{ path: string; content: string }>(
       `/projects/${projectId}/file?${new URLSearchParams({ path })}`,
     ),
-  gitStatus: (projectId: string) =>
-    request<GitStatus>(`/projects/${projectId}/git/status`),
+  upload: (projectId: string, file: File) => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    return request<{ name: string; path: string; size: number }>(
+      `/projects/${projectId}/upload`,
+      { method: "POST", body },
+    );
+  },
+  gitStatus: (projectId: string) => gitStatus(projectId),
   diff: (projectId: string, path: string, staged: boolean) =>
     request<{ path: string; patch: string }>(
       `/projects/${projectId}/git/diff?${new URLSearchParams({ path, staged: String(staged) })}`,
@@ -310,7 +369,16 @@ export const api = {
       body: JSON.stringify({ provider }),
     }),
 
-  listSessions: () => request<{ sessions: SessionSummary[] }>("/sessions"),
+  listSessions: (filters: SessionListFilters = {}) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    const query = params.toString();
+    return request<{ sessions: SessionSummary[] }>(
+      `/sessions${query ? `?${query}` : ""}`,
+    );
+  },
   createSession: (projectId?: string) =>
     request<{ sessionId: string; status: string }>("/sessions", {
       method: "POST",
@@ -391,6 +459,7 @@ export const api = {
   openSession: (id: string) =>
     request<SessionSummary>(`/sessions/${id}/open`, { method: "POST" }),
   runtimeState: (id: string) => commandData<RuntimeState>(id, "get_state"),
+  stats: (id: string) => commandData<unknown>(id, "get_stats"),
   models: (id: string) =>
     commandData<{ models: ModelDescriptor[] }>(id, "get_available_models"),
   thinkingLevels: (id: string) =>

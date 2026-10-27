@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.18...rpi-acp-v0.1.19) - 2026-10-26
+
+### Other
+
+- updated the following local packages: rpi-extcore
+
+## [0.1.18](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.17...rpi-acp-v0.1.18) - 2026-10-26
+
+### Fixed
+
+- remove rpi-acp changelog conflict markers and an orchestrator -D warnings error ([#77](https://github.com/pi-rust/rpi-package/pull/77))
+
+## [0.1.17](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.16...rpi-acp-v0.1.17) - 2026-10-25
+
+### Added
+
+- *(durable)* add branch-backed durable runtime
+
+### Added
+
+- Add the optional ACP `session/durable` extension for branch-backed durable
+  state, run recovery and queue coordination; hosts without branch support
+  continue to serve ordinary ACP sessions.
+- Add the optional `session/durable_update` notification after durable state is
+  successfully persisted, including its revision and complete branch-backed
+  state snapshot.
+
+## [0.1.16](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.15...rpi-acp-v0.1.16) - 2026-10-25
+
+### Other
+
+- updated the following local packages: rpi-extcore
+
+## [0.1.15](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.14...rpi-acp-v0.1.15) - 2026-10-24
+
+### Other
+
+- extract shared extension core and HTTP adapter
+
+## [0.1.14](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.13...rpi-acp-v0.1.14) - 2026-10-23
+
+### Fixed
+
+- *(acp)* hide todo tool JSON from Zed cards
+- *(acp)* refresh Zed plan from todo updates
+
+### Other
+
+- Merge branch 'main' of github.com:pi-rust/rpi-package into feature/web-session-search
+- *(release)* bump workspace to 0.1.9
+
+## [0.1.13](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.12...rpi-acp-v0.1.13) - 2026-10-23
+
+### Fixed
+
+- *(acp)* publish todo cards and live Zed plan updates ([#62](https://github.com/pi-rust/rpi-package/pull/62))
+
+### Fixed
+
+- Hide the `todo` tool's structured arguments and result envelope from ACP tool-call cards, showing a concise action title instead of raw JSON.
+- Forward `todo` result snapshots as ACP plan updates so Zed's plan panel reflects pending, in-progress, and completed task states immediately.
+
 ## [0.1.12](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.1.11...rpi-acp-v0.1.12) - 2026-10-22
 
 ### Fixed

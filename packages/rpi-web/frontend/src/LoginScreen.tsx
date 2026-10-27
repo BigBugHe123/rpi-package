@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   Sun,
 } from "lucide-react";
+import { MenuSelect } from "./MenuSelect";
 import { translate, type Language } from "./i18n";
 
 type Props = {
@@ -52,16 +53,15 @@ export function LoginScreen(props: Props) {
         <div className="login-preferences">
           <label className="login-language">
             <Languages size={16} aria-hidden="true" />
-            <select
-              aria-label={t("language")}
+            <MenuSelect
+              label={t("language")}
               value={props.language}
-              onChange={(event) =>
-                props.onLanguage(event.target.value as Language)
-              }
-            >
-              <option value="zh">简体中文</option>
-              <option value="en">English</option>
-            </select>
+              onChange={(value) => props.onLanguage(value as Language)}
+              options={[
+                { value: "zh", label: "简体中文" },
+                { value: "en", label: "English" },
+              ]}
+            />
           </label>
           <button
             type="button"
