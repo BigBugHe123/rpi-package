@@ -6,7 +6,17 @@ pub mod proxy;
 mod registration;
 mod transport;
 
-rpi_plugin_sdk::export_plugin!(|api| {
+/// Register the provider bundle with the host's SDK ABI checks.
+///
+/// # Safety
+/// `api` must satisfy `rpi_plugin_sdk::register_entrypoint`'s host vtable contract.
+#[no_mangle]
+pub unsafe extern "C" fn rpi_plugin_register(api: *const rpi_plugin_sdk::PluginApi) -> i32 {
+    // SAFETY: the loading host supplies the vtable required by this entrypoint.
+    unsafe { rpi_plugin_sdk::register_entrypoint(api, register) }
+}
+
+fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     for register in [
         deepseek::register,
         openrouter::register,
@@ -19,4 +29,4 @@ rpi_plugin_sdk::export_plugin!(|api| {
         }
     }
     0
-});
+}

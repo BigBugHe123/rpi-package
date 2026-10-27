@@ -3,7 +3,7 @@ use rpi_ai::{
     types::{Content, Message, UserMessage},
     Context, Provider, SimpleStreamOptions,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -28,7 +28,7 @@ fn load() -> (rpi_extensions::ExtensionSession, Vec<Arc<dyn Provider>>) {
         .expect("first cargo build -p rpi-providers");
     let session = rpi_extensions::load_session_mixed(
         &[],
-        &[PathBuf::from(library)],
+        &[library],
         Arc::new(rpi_extensions::NullDiagnostics),
         None,
     );
@@ -37,6 +37,107 @@ fn load() -> (rpi_extensions::ExtensionSession, Vec<Arc<dyn Provider>>) {
         tokio::runtime::Handle::current(),
     );
     (session, providers)
+}
+
+// Exercise the actual host envelope, DLL SDK parser and shared HTTP transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_choice_crosses_the_dll_for_every_provider_without_leaking_between_requests() {
+    use serde_json::{json, Value};
+    let (_session, providers) = load();
+    let cases = [
+        (Some(json!("auto")), Some(json!("auto"))),
+        (Some(json!("none")), Some(json!("none"))),
+        (Some(json!("required")), Some(json!("required"))),
+        (
+            Some(json!({"name":"read"})),
+            Some(json!({"type":"function","function":{"name":"read"}})),
+        ),
+        (
+            Some(json!({"type":"allowed_tools","mode":"required","tools":[{"name":"read"}]})),
+            Some(
+                json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"read"}}]}}),
+            ),
+        ),
+        (
+            Some(json!({"type":"function","function":{"name":"read"},"fixture":"preserved"})),
+            Some(json!({"type":"function","function":{"name":"read"},"fixture":"preserved"})),
+        ),
+        (None, None),
+    ];
+    for provider in providers {
+        for (choice, expected) in &cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut model = provider.models()[0].clone();
+            model.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let body = loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|v| v.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break serde_json::from_slice::<Value>(
+                                &request[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let reply = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+                body
+            });
+            let mut context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+            context.tools = ["read", "write"].into_iter().map(|name| {
+                serde_json::from_value(json!({"name":name,"description":name,"parameters":{"type":"object","properties":{}}})).unwrap()
+            }).collect();
+            let options = SimpleStreamOptions {
+                api_key: Some("fixture-key".into()),
+                tool_choice: choice
+                    .clone()
+                    .map(|value| serde_json::from_value(value).unwrap()),
+                max_retries: Some(0),
+                timeout: Some(Duration::from_secs(5)),
+                ..Default::default()
+            };
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = provider.stream_simple(&model, &context, &options).await;
+                while stream.next().await.is_some() {}
+                stream.result().await.unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result.stop_reason,
+                rpi_ai::StopReason::Stop,
+                "{}: {choice:?}: {:?}",
+                provider.id(),
+                result.error_message
+            );
+            let body = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                body.get("tool_choice"),
+                expected.as_ref(),
+                "{}",
+                provider.id()
+            );
+            assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        }
+    }
 }
 
 #[tokio::test]
